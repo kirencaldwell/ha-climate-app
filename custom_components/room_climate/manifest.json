@@ -1,0 +1,10 @@
+{
+  "domain": "room_climate",
+  "name": "Room Climate",
+  "version": "0.1.0",
+  "documentation": "https://github.com/OWNER/ha-climate-app",
+  "dependencies": ["http", "websocket_api"],
+  "codeowners": [],
+  "config_flow": false,
+  "iot_class": "local_polling"
+}

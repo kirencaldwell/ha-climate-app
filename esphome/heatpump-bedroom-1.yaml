@@ -1,0 +1,38 @@
+# One file per unit; copy for first-floor air handler and bedroom 2.
+# ASSUMPTION: uses the community CN105 component (echavet/MitsubishiCN105ESPHome) and the
+# unit's CN105 port. Verify option names against that project's README when the boards arrive.
+substitutions:
+  name: bedroom-1-heatpump
+
+esphome:
+  name: ${name}
+
+esp32:
+  board: esp32dev   # change to match the actual ESP32 board
+  framework:
+    type: arduino
+
+external_components:
+  - source: github://echavet/MitsubishiCN105ESPHome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+api:
+  encryption:
+    key: !secret api_key
+ota:
+  - platform: esphome
+
+uart:
+  id: hp_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 2400
+
+climate:
+  - platform: cn105
+    name: "Bedroom 1"
+    uart_id: hp_uart
+    update_interval: 2s
+    # Wide range so Room Climate can set 61-88F setpoints; remote sensor control stays in HA.

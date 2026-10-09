@@ -1,0 +1,16 @@
+{
+  "_comment": "Seed config. Copy into .storage/room_climate (or set via the card). Entity ids are placeholders until hardware arrives.",
+  "enabled": true,
+  "settings": {"deadband": 1.0},
+  "units": [
+    {"id": "air_handler", "entity": "climate.first_floor"},
+    {"id": "minisplit_1", "entity": "climate.bedroom_1"},
+    {"id": "minisplit_2", "entity": "climate.bedroom_2"}
+  ],
+  "rooms": [
+    {"id": "first_floor", "name": "First floor", "unit": "air_handler", "sensor": "sensor.first_floor_temperature", "priority": 3, "default_temp": 68, "floor": 1, "shape": {"x": 5, "y": 5, "w": 90, "h": 40}},
+    {"id": "bedroom_1", "name": "Bedroom 1", "unit": "minisplit_1", "sensor": "sensor.bedroom_1_temperature", "priority": 4, "default_temp": 67, "floor": 2, "shape": {"x": 5, "y": 55, "w": 43, "h": 40},
+     "schedule": [{"days": [0,1,2,3,4,5,6], "start": "07:00", "temp": 68}, {"days": [0,1,2,3,4,5,6], "start": "21:30", "temp": 65}]},
+    {"id": "bedroom_2", "name": "Bedroom 2", "unit": "minisplit_2", "sensor": "sensor.bedroom_2_temperature", "priority": 3, "default_temp": 67, "floor": 2, "shape": {"x": 52, "y": 55, "w": 43, "h": 40}}
+  ]
+}
