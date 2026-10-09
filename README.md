@@ -37,5 +37,5 @@ Instead of waiting for a room to leave its band, the app predicts where each roo
 4. Add resource `/room_climate_static/room-map-card.js` (module), then a card `type: custom:room-map-card` (optional `floorplan: /local/floorplan.svg`).
 
 ## Status
-Core logic and simulator are tested . The HA integration and card are written but **not yet run inside Home Assistant**; no hardware yet.
+Core logic and simulator are tested (42 tests). The HA integration and card are written but **not yet run inside Home Assistant**; no hardware yet.
 Not built yet: editing rooms/units from the UI, outdoor-temperature awareness, away mode.
