@@ -122,3 +122,10 @@ def test_sim_mixed_zones_never_opposing_and_priority_room_held():
         assert len(active) <= 1
         worst_down = max(worst_down, abs(h.sim["down"].temp - 68)) if _ > 180 else worst_down
     assert worst_down < 2.0
+
+
+def test_tie_goes_to_cool():
+    rs = [Room("down", "Down", "ah", priority=3, default_temp=68), Room("b1", "B1", "ms1", priority=3, default_temp=68)]
+    rd = {"down": (66.0, T0), "b1": (70.0, T0)}  # 3*2 heat vs 3*2 cool
+    cmds, st = core.decide_system(UNITS, rs, rd, {}, SystemState(), T0)
+    assert st.mode == "cool" and cmds["b1"].mode == "cool" and cmds["ah"].mode == "off"

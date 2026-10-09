@@ -238,7 +238,7 @@ def decide_system(units: list[Unit], rooms: list[Room], readings: dict[str, tupl
         if opp > settings.switch_ratio * own_stay and sys_held >= settings.min_run_s:
             M, why = None, f"yielding {state.mode} to higher-priority {'cool' if M == 'heat' else 'heat'} demand"
     elif start_h or start_c:
-        want = "heat" if start_h >= start_c else "cool"
+        want = "heat" if start_h > start_c else "cool"  # ties go to cool
         if sys_held < settings.min_off_s:
             why = "waiting out min off time"
         elif state.last_run not in (None, want) and sys_held < settings.mode_switch_s:
