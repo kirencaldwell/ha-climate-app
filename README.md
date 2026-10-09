@@ -23,6 +23,13 @@ All three indoor units share one outdoor unit, so they must all be in the same m
 - Units that don't need the winning mode coast (`idle_mode`: `off` by default, or `fan_only`), they never run the opposite mode.
 - A room with no fresh sensor reading doesn't vote.
 
+## Predictive control
+Instead of waiting for a room to leave its band, the app predicts where each room is heading and acts early.
+- **Model:** each room learns `dT/dt = a·(T_out − T) + heat/cool effect + s·sun` online (recursive least squares, 5 min samples, forgets old data over a few days) from its own sensor history. It is saved with the integration's storage and needs about 12 h of data before it is used; until then (or without a weather entity) control is exactly the reactive behaviour above.
+- **Inputs:** the weather entity's hourly forecast (`weather_entity` in the config; temperature and cloud cover), the real sun position at the house (from HA's configured location, i.e. your address, or `site: {lat, lon}`), and each room's `windows: [{facing: compass degrees, area: relative size}]`. Sunrise/sunset are computed from the same position (`predict.sun_times`).
+- **Use:** the temperature the room would reach in `precompensate_min` (60) with its unit idle is blended into the error (`pred_weight` 0.6). A room that will leave the band starts heating or cooling early, and votes for the shared mode on the blend. While running it carries on up to `preheat_max` (0.5°F) past target to coast through the swing. A room already ≥ `pred_guard` (3°F) off ignores prediction.
+- **Not covered yet:** schedule changes are not anticipated (only drift), so a setback never triggers active cooling. Floorplan-derived window positions will replace the hand-entered `windows` once the plan is uploaded.
+
 ## Install
 1. Copy `custom_components/room_climate` into HA's `config/custom_components/`.
 2. Add `room_climate:` to `configuration.yaml`, restart.
@@ -30,5 +37,5 @@ All three indoor units share one outdoor unit, so they must all be in the same m
 4. Add resource `/room_climate_static/room-map-card.js` (module), then a card `type: custom:room-map-card` (optional `floorplan: /local/floorplan.svg`).
 
 ## Status
-Core logic and simulator are tested (13 tests). The HA integration and card are written but **not yet run inside Home Assistant**; no hardware yet.
+Core logic and simulator are tested (42 tests). The HA integration and card are written but **not yet run inside Home Assistant**; no hardware yet.
 Not built yet: editing rooms/units from the UI, outdoor-temperature awareness, away mode.

@@ -14,12 +14,14 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from . import core
+from . import core, predict
 
 DOMAIN = "room_climate"
 _LOGGER = logging.getLogger(__name__)
 STORE_VERSION = 1
 INTERVAL = timedelta(seconds=60)
+FORECAST_TTL = timedelta(minutes=30)
+SAVE_EVERY = timedelta(minutes=15)
 F, C = UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
 
 CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({vol.Optional("enabled", default=True): bool})}, extra=vol.ALLOW_EXTRA)
@@ -32,7 +34,7 @@ def _room_from_dict(d: dict) -> core.Room:
         schedule=[core.ScheduleEntry(list(e["days"]), e["start"], float(e["temp"])) for e in d.get("schedule", [])],
         hold_temp=d.get("hold_temp"),
         hold_until=dt_util.parse_datetime(d["hold_until"]) if d.get("hold_until") else None,
-        floor=int(d.get("floor", 1)), shape=d.get("shape", {}))
+        floor=int(d.get("floor", 1)), shape=d.get("shape", {}), windows=d.get("windows", []))
 
 
 def _unit_from_dict(d: dict) -> core.Unit:
@@ -48,6 +50,11 @@ class Manager:
         self.store = Store(hass, STORE_VERSION, DOMAIN)
         self.data: dict = {"rooms": [], "units": [], "settings": {}, "enabled": True, "floorplan": None}
         self.sys_state = core.SystemState()
+        self.models: dict[str, predict.RoomModel] = {}
+        self.preds: dict[str, float] = {}
+        self._forecast_at = None
+        self._forecast: list[tuple] = []  # (datetime, temp F, cloud 0..1)
+        self._saved_at = None
         self.last: dict[str, core.Command] = {}
         self._unsub = []
 
@@ -59,8 +66,14 @@ class Manager:
             loaded = await self.hass.async_add_executor_job(lambda: json.loads(seed.read_text()))
             loaded.pop("_comment", None)
         self.data = loaded
+        for rid, d in (loaded.get("models") or {}).items():
+            try:
+                self.models[rid] = predict.RoomModel.from_dict(d)
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning("Discarding unreadable model for %s", rid)
 
     async def async_save(self):
+        self.data["models"] = {rid: m.to_dict() for rid, m in self.models.items()}
         await self.store.async_save(self.data)
 
     def _f(self, entity_id: str):
@@ -80,6 +93,72 @@ class Manager:
         cur = st.attributes.get("current_temperature") if st else None
         return None if cur is None else TemperatureConverter.convert(float(cur), self.hass.config.units.temperature_unit, F)
 
+    def _site(self) -> predict.Site:
+        """House location: HA's configured location (set it to the home address), or data["site"]."""
+        o = self.data.get("site") or {}
+        cfg = self.hass.config
+        off = dt_util.now().utcoffset()
+        return predict.Site(float(o.get("lat", cfg.latitude)), float(o.get("lon", cfg.longitude)),
+                            (off.total_seconds() / 3600) if off else 0.0)
+
+    async def _refresh_forecast(self, now):
+        """Hourly forecast from the configured weather entity (HA `weather.get_forecasts`)."""
+        ent = self.data.get("weather_entity")
+        if not ent or (self._forecast_at and now - self._forecast_at < FORECAST_TTL):
+            return
+        self._forecast_at = now
+        try:
+            resp = await self.hass.services.async_call("weather", "get_forecasts", {"entity_id": ent, "type": "hourly"},
+                                                       blocking=True, return_response=True)
+            st = self.hass.states.get(ent)
+            unit = (st.attributes.get("temperature_unit") if st else None) or self.hass.config.units.temperature_unit
+            pts = []
+            for f in resp[ent]["forecast"]:
+                when = dt_util.parse_datetime(f["datetime"]) if isinstance(f["datetime"], str) else f["datetime"]
+                if f.get("temperature") is None or when is None:
+                    continue
+                cloud = f.get("cloud_coverage")
+                pts.append((dt_util.as_local(when), TemperatureConverter.convert(float(f["temperature"]), unit, F),
+                            None if cloud is None else float(cloud) / 100.0))
+            self._forecast = pts
+        except Exception as err:  # weather is optional: log and fall back to the current outdoor temperature
+            _LOGGER.warning("Weather forecast unavailable (%s); predictions use current outdoor temperature", err)
+
+    def _outdoor_now(self):
+        ent = self.data.get("weather_entity")
+        st = self.hass.states.get(ent) if ent else None
+        if st is None or st.attributes.get("temperature") is None:
+            return None
+        unit = st.attributes.get("temperature_unit") or self.hass.config.units.temperature_unit
+        return TemperatureConverter.convert(float(st.attributes["temperature"]), unit, F)
+
+    def _learn_and_predict(self, now, rooms, readings):
+        """Update each room's model from this tick's data; return idle-drift predictions for ready models."""
+        out_now = self._outdoor_now()
+        if out_now is None:
+            self.preds = {}  # no outdoor data: no learning, no prediction -> reactive control
+            return None
+        site = self._site()
+        outdoor_at = predict.interpolator([(t, v) for t, v, _ in self._forecast], out_now)
+        cloud_pts = [(t, c) for t, _, c in self._forecast if c is not None]
+        cloud_at = predict.interpolator(cloud_pts, 0.0) if cloud_pts else None
+        lead = core.Settings(**self.data.get("settings", {})).precompensate_min
+        preds = {}
+        for r in rooms:
+            if r.id not in readings:
+                continue
+            temp = readings[r.id][0]
+            ust = self.hass.states.get(next((u["entity"] for u in self.data["units"] if u["id"] == r.unit), ""))
+            action = ust.attributes.get("hvac_action") if ust else None
+            running = 1 if action == "heating" else -1 if action == "cooling" else 0
+            cloud = cloud_at(now) if cloud_at else 0.0
+            model = self.models.setdefault(r.id, predict.RoomModel())
+            model.update(now, temp, out_now, running, predict.sun_factor(r.windows, site, now, cloud))
+            if model.ready:
+                preds[r.id] = predict.predict_temp(model, temp, now, lead, outdoor_at, r.windows, site, cloud_at)
+        self.preds = preds
+        return preds
+
     async def async_tick(self, _now=None):
         if not self.data.get("enabled", True):
             return
@@ -93,13 +172,18 @@ class Manager:
                 val, ts = self._f(r.sensor)
                 if val is not None:
                     readings[r.id] = (val, ts)
+        await self._refresh_forecast(now)
+        preds = self._learn_and_predict(now, rooms, readings)
         unit_temps = {u.id: self._unit_temp(u.entity) for u in units}
         # One outdoor unit: all indoor units must share a mode, so decide them together.
-        cmds, self.sys_state = core.decide_system(units, rooms, readings, unit_temps, self.sys_state, now, settings)
+        cmds, self.sys_state = core.decide_system(units, rooms, readings, unit_temps, self.sys_state, now, settings, preds)
         self.last = cmds
         for u in units:
             await self._send(u, cmds[u.id])
         self._publish(now, rooms)
+        if self._saved_at is None or now - self._saved_at >= SAVE_EVERY:
+            self._saved_at = now
+            await self.async_save()
 
     async def _send(self, unit: core.Unit, cmd: core.Command):
         cur = self.hass.states.get(unit.entity)
@@ -122,12 +206,13 @@ class Manager:
             val, _ = self._f(r.sensor) if r.sensor else (None, None)
             self.hass.states.async_set(f"{DOMAIN}.{r.id}", "ok" if val is not None else "no_sensor", {
                 "friendly_name": r.name, "temperature": val, "target": core.target_temp(r, now),
-                "priority": r.priority, "unit": r.unit,
+                "priority": r.priority, "unit": r.unit, "predicted": self.preds.get(r.id),
+                "model_ready": bool(self.models.get(r.id) and self.models[r.id].ready),
                 "action": self.last.get(r.unit, core.Command("off", None)).mode})
 
     def snapshot(self) -> dict:
         now = dt_util.now()
-        out = dict(self.data)
+        out = {k: v for k, v in self.data.items() if k != "models"}  # models are big and not for the card
         out["live"] = {}
         for rd in self.data["rooms"]:
             r = _room_from_dict(rd)
