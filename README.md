@@ -16,6 +16,13 @@ deadband (±1°F), stops at target, and respects minimum run/off times and a hea
 `target + (unit sensor − room sensor) ± 1`, so the unit's own thermostat chases the *room* temperature. Stale/missing
 sensors are ignored; with none, the unit is left alone.
 
+## Shared mode (2-zone system)
+All three indoor units share one outdoor unit, so they must all be in the same mode (heat or cool). `decide_system` handles that:
+- Every room votes: priority x degrees off target, past the 1°F deadband, for heat or cool. Higher total wins; a tie goes to cool.
+- The running mode is only displaced when the opposite vote exceeds the running mode's *remaining* shortfall by 1.5x (`switch_ratio`), after the 5 min minimum run. It then goes fully off and the new mode waits out the 15 min heat/cool lockout.
+- Units that don't need the winning mode coast (`idle_mode`: `off` by default, or `fan_only`), they never run the opposite mode.
+- A room with no fresh sensor reading doesn't vote.
+
 ## Install
 1. Copy `custom_components/room_climate` into HA's `config/custom_components/`.
 2. Add `room_climate:` to `configuration.yaml`, restart.

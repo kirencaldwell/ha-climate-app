@@ -19,7 +19,7 @@ class SimRoom:
 class SimHouse:
     """Rooms sharing a unit split its output evenly. Unit sensor reads +`bias` F off the room average."""
 
-    def __init__(self, rooms, units, outdoor, start, unit_bias=3.0):
+    def __init__(self, rooms, units, outdoor, start, unit_bias=3.0, shared_mode=False):
         self.rooms: dict[str, core.Room] = {r.id: r for r in rooms}
         self.units: dict[str, core.Unit] = {u.id: u for u in units}
         self.sim = {r.id: SimRoom(temp=68.0) for r in rooms}
@@ -30,6 +30,8 @@ class SimHouse:
         self.bias = unit_bias
         self.settings = core.Settings()
         self.log = []
+        self.shared_mode = shared_mode
+        self.sys = core.SystemState()
 
     def unit_temp(self, uid):
         rs = [self.sim[r.id].temp for r in self.rooms.values() if r.unit == uid]
@@ -55,6 +57,15 @@ class SimHouse:
                 self.control()
 
     def control(self):
+        if self.shared_mode:
+            readings = {r.id: (self.sim[r.id].temp, self.now) for r in self.rooms.values()}
+            temps = {u: self.unit_temp(u) for u in self.units}
+            cmds, self.sys = core.decide_system(list(self.units.values()), list(self.rooms.values()),
+                                                readings, temps, self.sys, self.now, self.settings)
+            for uid, c in cmds.items():
+                self.cmd[uid] = c
+                self.log.append((self.now, uid, c.mode))
+            return
         for uid, unit in self.units.items():
             rooms = [r for r in self.rooms.values() if r.unit == uid]
             readings = {r.id: (self.sim[r.id].temp, self.now) for r in rooms}

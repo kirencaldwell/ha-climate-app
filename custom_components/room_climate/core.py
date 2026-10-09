@@ -59,6 +59,8 @@ class Settings:
     stale_s: int = 900  # reading older than this is ignored
     allow_cool: bool = True
     allow_heat: bool = True
+    switch_ratio: float = 1.5  # opposite mode must outweigh the active one by this factor to take over
+    idle_mode: str = "off"  # what a unit that isn't needed does while the system runs the other units: "off" | "fan_only"
 
 
 @dataclass
@@ -73,6 +75,7 @@ class Command:
     mode: str
     setpoint: Optional[float]
     reason: str = ""
+    hvac_mode: str = ""  # what to send to the climate entity ("heat"/"cool"/"off"/"fan_only"); "" = same as mode
 
 
 def _hold_active(room: Room, now: datetime) -> bool:
@@ -160,16 +163,19 @@ def decide(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float, datet
     if mode == "off":
         return Command("off", None, reason)
 
-    # Make the unit's own thermostat chase the *room* temperature: shift the setpoint by
-    # how far the unit's sensor disagrees with ours.
+    setpoint = _setpoint(unit, mode, target, avg, unit_temp, settings)
+    return Command(mode, setpoint, reason)
+
+
+def _setpoint(unit: Unit, mode: str, target: float, avg: float, unit_temp: Optional[float],
+              settings: Settings) -> float:
+    """Make the unit's own thermostat chase the *room* temperature: shift the setpoint by how far
+    the unit's sensor disagrees with ours, then push 1F past target so it keeps running until we stop it."""
     offset = 0.0
     if unit_temp is not None:
         offset = max(-settings.max_offset, min(settings.max_offset, unit_temp - avg))
-    setpoint = target + offset
-    # Push past target a little so the unit actually runs until we say stop.
-    setpoint += 1.0 if mode == "heat" else -1.0
-    setpoint = max(unit.min_setpoint, min(unit.max_setpoint, round(setpoint)))
-    return Command(mode, float(setpoint), reason)
+    sp = target + offset + (1.0 if mode == "heat" else -1.0)
+    return float(max(unit.min_setpoint, min(unit.max_setpoint, round(sp))))
 
 
 def apply(state: UnitState, cmd: Command, now: datetime) -> UnitState:
@@ -177,3 +183,114 @@ def apply(state: UnitState, cmd: Command, now: datetime) -> UnitState:
     if cmd.mode == state.mode:
         return state
     return UnitState(cmd.mode, now, cmd.mode if cmd.mode != "off" else state.last_run)
+
+
+# --- Multi-zone systems: one outdoor unit, so every indoor unit shares one mode -------------------
+
+@dataclass
+class SystemState:
+    mode: str = "off"  # "heat"/"cool" while any unit is running, else "off"
+    since: Optional[datetime] = None
+    last_run: Optional[str] = None
+    units: dict[str, UnitState] = field(default_factory=dict)
+
+
+def _votes(rooms: list[Room], readings, now: datetime, settings: Settings):
+    """Priority-weighted need to heat / cool across all rooms.
+
+    start_*: rooms past the deadband (what can start a mode). stay_*: any shortfall at all
+    (what keeps the running mode alive), which is what gives the vote hysteresis."""
+    start_h = start_c = stay_h = stay_c = 0.0
+    for r in rooms:
+        got = readings.get(r.id)
+        if not got or (now - got[1]).total_seconds() > settings.stale_s:
+            continue
+        w = max(MIN_PRIORITY, min(MAX_PRIORITY, r.priority))
+        err = got[0] - target_temp(r, now)
+        if err <= -settings.deadband and settings.allow_heat:
+            start_h += w * -err
+        if err >= settings.deadband and settings.allow_cool:
+            start_c += w * err
+        stay_h += w * max(0.0, -err - settings.stop_margin)
+        stay_c += w * max(0.0, err - settings.stop_margin)
+    return start_h, start_c, stay_h, stay_c
+
+
+def decide_system(units: list[Unit], rooms: list[Room], readings: dict[str, tuple[float, datetime]],
+                  unit_temps: dict[str, Optional[float]], state: SystemState, now: datetime,
+                  settings: Settings = Settings()) -> tuple[dict[str, Command], SystemState]:
+    """Decide every unit's command when all units must share one heat/cool mode.
+
+    1. Rooms vote (priority x how far off target) for heat vs cool. The higher total wins.
+    2. The running mode is only displaced when the opposite vote beats the running mode's remaining
+       need by `switch_ratio`, after min run time, and the new mode then waits out `mode_switch_s`.
+    3. Within the chosen mode each unit runs its own start/stop hysteresis. Units that don't need it
+       coast (`idle_mode`) rather than fight the shared mode.
+    """
+    start_h, start_c, stay_h, stay_c = _votes(rooms, readings, now, settings)
+    sys_held = (now - state.since).total_seconds() if state.since else 1e9
+    why = ""
+
+    M: Optional[str] = None
+    if state.mode != "off":
+        M = state.mode
+        own_stay, opp = (stay_h, start_c) if M == "heat" else (stay_c, start_h)
+        if opp > settings.switch_ratio * own_stay and sys_held >= settings.min_run_s:
+            M, why = None, f"yielding {state.mode} to higher-priority {'cool' if M == 'heat' else 'heat'} demand"
+    elif start_h or start_c:
+        want = "heat" if start_h > start_c else "cool"  # ties go to cool
+        if sys_held < settings.min_off_s:
+            why = "waiting out min off time"
+        elif state.last_run not in (None, want) and sys_held < settings.mode_switch_s:
+            why = "waiting out heat/cool switch lockout"
+        else:
+            M = want
+
+    cmds: dict[str, Command] = {}
+    new_units: dict[str, UnitState] = {}
+    for u in units:
+        mine = [r for r in rooms if r.unit == u.id]
+        us = state.units.get(u.id, UnitState())
+        res = weighted_error(mine, readings, now, settings)
+        uheld = (now - us.since).total_seconds() if us.since else 1e9
+        mode = us.mode if us.mode == M else "off"  # a unit running the old mode is dropped on a switch
+        reason = why or "idle"
+        if res is None:
+            if mode != "off":
+                cmds[u.id] = Command(mode, None, "no fresh sensor readings; holding")
+                new_units[u.id] = us
+                continue
+        elif M is not None:
+            err, avg = res
+            need = -err if M == "heat" else err
+            if mode == M:
+                if need <= -settings.stop_margin and uheld >= settings.min_run_s:
+                    mode, reason = "off", "reached target"
+                else:
+                    reason = "heating" if M == "heat" else "cooling"
+            elif need >= settings.deadband and uheld >= settings.min_off_s:
+                mode, reason = M, "heating" if M == "heat" else "cooling"
+            elif M and not why:
+                reason = f"coasting; system is in {M} mode"
+        if mode == "off" or res is None:
+            coasting = state.mode != "off" and M is not None
+            hv = settings.idle_mode if coasting else "off"
+            cmds[u.id] = Command("off", None, reason, hv)
+        else:
+            err, avg = res
+            cmds[u.id] = Command(mode, _setpoint(u, mode, avg - err, avg, unit_temps.get(u.id), settings), reason)
+        new_units[u.id] = apply(us, cmds[u.id], now)
+
+    running = [c.mode for c in cmds.values() if c.mode != "off"]
+    new_mode = running[0] if running else "off"
+    if new_mode == state.mode:
+        new = SystemState(state.mode, state.since, state.last_run, new_units)
+    else:
+        new = SystemState(new_mode, now, new_mode if new_mode != "off" else state.mode, new_units)
+    # System that is still running keeps every idle unit coasting, not hard off.
+    if new_mode != "off":
+        for u in units:
+            c = cmds[u.id]
+            if c.mode == "off":
+                c.hvac_mode = settings.idle_mode
+    return cmds, new
