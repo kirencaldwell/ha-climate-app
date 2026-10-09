@@ -38,6 +38,7 @@ class Room:
     hold_until: Optional[datetime] = None  # ... until this time (None = until next schedule change)
     floor: int = 1
     shape: dict = field(default_factory=dict)  # {"x","y","w","h"} on a 0-100 map grid
+    windows: list = field(default_factory=list)  # [{"facing": compass deg, "area": relative size}], for solar gain
 
 
 @dataclass
@@ -60,6 +61,10 @@ class Settings:
     allow_cool: bool = True
     allow_heat: bool = True
     switch_ratio: float = 1.5  # opposite mode must outweigh the active one by this factor to take over
+    precompensate_min: int = 60  # look this far ahead (free-drift prediction) when deciding to start
+    pred_weight: float = 0.6  # how much the predicted error counts against the current error when starting
+    pred_guard: float = 3.0  # a room already this far off ignores prediction: act on what is happening now
+    preheat_max: float = 0.5  # run up to this far past target to bank heat/cool ahead of a predicted swing
     idle_mode: str = "off"  # what a unit that isn't needed does while the system runs the other units: "off" | "fan_only"
 
 
@@ -195,7 +200,42 @@ class SystemState:
     units: dict[str, UnitState] = field(default_factory=dict)
 
 
-def _votes(rooms: list[Room], readings, now: datetime, settings: Settings):
+def room_errors(room: Room, temp: float, now: datetime, settings: Settings, pred_temp: Optional[float]):
+    """(start, stop_heat, stop_cool) errors, each reading minus target, for one room.
+
+    `pred_temp` is the free-drift (unit idle) temperature predicted `precompensate_min` ahead, or None
+    to behave exactly as before. Prediction makes the room start early (it will leave the band) and,
+    while running, carry on a little past target (`preheat_max`) so it can coast through the swing.
+    Only drift is anticipated, not schedule changes, so a setback never triggers active cooling."""
+    e_now = temp - target_temp(room, now)
+    if pred_temp is None:
+        return e_now, e_now, e_now
+    e_pred = pred_temp - target_temp(room, now)
+    if abs(e_now) >= settings.pred_guard:
+        start = e_now
+    else:
+        start = (1 - settings.pred_weight) * e_now + settings.pred_weight * e_pred
+    cap = settings.preheat_max
+    return start, e_now - min(cap, max(0.0, -e_pred)), e_now + min(cap, max(0.0, e_pred))
+
+
+def _unit_errs(rooms: list[Room], readings, now: datetime, settings: Settings, preds):
+    """Priority-weighted (e_now, avg_reading, start, stop_heat, stop_cool) for a unit, or None."""
+    tot = [0.0] * 5
+    den = 0.0
+    for r in rooms:
+        got = readings.get(r.id)
+        if not got or (now - got[1]).total_seconds() > settings.stale_s:
+            continue
+        w = max(MIN_PRIORITY, min(MAX_PRIORITY, r.priority))
+        start, sh, sc = room_errors(r, got[0], now, settings, (preds or {}).get(r.id))
+        for i, v in enumerate((got[0] - target_temp(r, now), got[0], start, sh, sc)):
+            tot[i] += w * v
+        den += w
+    return None if not den else tuple(v / den for v in tot)
+
+
+def _votes(rooms: list[Room], readings, now: datetime, settings: Settings, preds=None):
     """Priority-weighted need to heat / cool across all rooms.
 
     start_*: rooms past the deadband (what can start a mode). stay_*: any shortfall at all
@@ -206,28 +246,30 @@ def _votes(rooms: list[Room], readings, now: datetime, settings: Settings):
         if not got or (now - got[1]).total_seconds() > settings.stale_s:
             continue
         w = max(MIN_PRIORITY, min(MAX_PRIORITY, r.priority))
-        err = got[0] - target_temp(r, now)
-        if err <= -settings.deadband and settings.allow_heat:
-            start_h += w * -err
-        if err >= settings.deadband and settings.allow_cool:
-            start_c += w * err
-        stay_h += w * max(0.0, -err - settings.stop_margin)
-        stay_c += w * max(0.0, err - settings.stop_margin)
+        start, sh, sc = room_errors(r, got[0], now, settings, (preds or {}).get(r.id))
+        if start <= -settings.deadband and settings.allow_heat:
+            start_h += w * -start
+        if start >= settings.deadband and settings.allow_cool:
+            start_c += w * start
+        stay_h += w * max(0.0, -sh - settings.stop_margin)
+        stay_c += w * max(0.0, sc - settings.stop_margin)
     return start_h, start_c, stay_h, stay_c
 
 
 def decide_system(units: list[Unit], rooms: list[Room], readings: dict[str, tuple[float, datetime]],
                   unit_temps: dict[str, Optional[float]], state: SystemState, now: datetime,
-                  settings: Settings = Settings()) -> tuple[dict[str, Command], SystemState]:
+                  settings: Settings = Settings(), preds: Optional[dict[str, float]] = None) -> tuple[dict[str, Command], SystemState]:
     """Decide every unit's command when all units must share one heat/cool mode.
 
     1. Rooms vote (priority x how far off target) for heat vs cool. The higher total wins.
     2. The running mode is only displaced when the opposite vote beats the running mode's remaining
        need by `switch_ratio`, after min run time, and the new mode then waits out `mode_switch_s`.
-    3. Within the chosen mode each unit runs its own start/stop hysteresis. Units that don't need it
+    3. If `preds` (room id -> predicted idle temperature `precompensate_min` ahead) is given, rooms vote
+       and units start on a blend of current and predicted error, and run a little past target (see `room_errors`).
+    4. Within the chosen mode each unit runs its own start/stop hysteresis. Units that don't need it
        coast (`idle_mode`) rather than fight the shared mode.
     """
-    start_h, start_c, stay_h, stay_c = _votes(rooms, readings, now, settings)
+    start_h, start_c, stay_h, stay_c = _votes(rooms, readings, now, settings, preds)
     sys_held = (now - state.since).total_seconds() if state.since else 1e9
     why = ""
 
@@ -251,7 +293,7 @@ def decide_system(units: list[Unit], rooms: list[Room], readings: dict[str, tupl
     for u in units:
         mine = [r for r in rooms if r.unit == u.id]
         us = state.units.get(u.id, UnitState())
-        res = weighted_error(mine, readings, now, settings)
+        res = _unit_errs(mine, readings, now, settings, preds)
         uheld = (now - us.since).total_seconds() if us.since else 1e9
         mode = us.mode if us.mode == M else "off"  # a unit running the old mode is dropped on a switch
         reason = why or "idle"
@@ -261,14 +303,15 @@ def decide_system(units: list[Unit], rooms: list[Room], readings: dict[str, tupl
                 new_units[u.id] = us
                 continue
         elif M is not None:
-            err, avg = res
-            need = -err if M == "heat" else err
+            e_now, avg, e_start, e_sh, e_sc = res
+            start_need = -e_start if M == "heat" else e_start
+            stop_need = -e_sh if M == "heat" else e_sc
             if mode == M:
-                if need <= -settings.stop_margin and uheld >= settings.min_run_s:
+                if stop_need <= -settings.stop_margin and uheld >= settings.min_run_s:
                     mode, reason = "off", "reached target"
                 else:
                     reason = "heating" if M == "heat" else "cooling"
-            elif need >= settings.deadband and uheld >= settings.min_off_s:
+            elif start_need >= settings.deadband and uheld >= settings.min_off_s:
                 mode, reason = M, "heating" if M == "heat" else "cooling"
             elif M and not why:
                 reason = f"coasting; system is in {M} mode"
@@ -277,8 +320,9 @@ def decide_system(units: list[Unit], rooms: list[Room], readings: dict[str, tupl
             hv = settings.idle_mode if coasting else "off"
             cmds[u.id] = Command("off", None, reason, hv)
         else:
-            err, avg = res
-            cmds[u.id] = Command(mode, _setpoint(u, mode, avg - err, avg, unit_temps.get(u.id), settings), reason)
+            e_now, avg, _s, e_sh, e_sc = res
+            carry = (e_now - e_sh) if mode == "heat" else -(e_sc - e_now)  # extra reach for pre-heat/pre-cool
+            cmds[u.id] = Command(mode, _setpoint(u, mode, avg - e_now + carry, avg, unit_temps.get(u.id), settings), reason)
         new_units[u.id] = apply(us, cmds[u.id], now)
 
     running = [c.mode for c in cmds.values() if c.mode != "off"]
