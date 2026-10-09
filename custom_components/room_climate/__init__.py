@@ -47,7 +47,7 @@ class Manager:
         self.hass = hass
         self.store = Store(hass, STORE_VERSION, DOMAIN)
         self.data: dict = {"rooms": [], "units": [], "settings": {}, "enabled": True, "floorplan": None}
-        self.states: dict[str, core.UnitState] = {}
+        self.sys_state = core.SystemState()
         self.last: dict[str, core.Command] = {}
         self._unsub = []
 
@@ -86,29 +86,28 @@ class Manager:
         now = dt_util.now()
         settings = core.Settings(**self.data.get("settings", {}))
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
-        for ud in self.data["units"]:
-            unit = _unit_from_dict(ud)
-            mine = [r for r in rooms if r.unit == unit.id]
-            readings = {}
-            for r in mine:
-                if r.sensor:
-                    val, ts = self._f(r.sensor)
-                    if val is not None:
-                        readings[r.id] = (val, ts)
-            state = self.states.setdefault(unit.id, core.UnitState())
-            cmd = core.decide(unit, mine, readings, self._unit_temp(unit.entity), state, now, settings)
-            self.last[unit.id] = cmd
-            await self._send(unit, state, cmd)
-            self.states[unit.id] = core.apply(state, cmd, now)
+        units = [_unit_from_dict(u) for u in self.data["units"]]
+        readings = {}
+        for r in rooms:
+            if r.sensor:
+                val, ts = self._f(r.sensor)
+                if val is not None:
+                    readings[r.id] = (val, ts)
+        unit_temps = {u.id: self._unit_temp(u.entity) for u in units}
+        # One outdoor unit: all indoor units must share a mode, so decide them together.
+        cmds, self.sys_state = core.decide_system(units, rooms, readings, unit_temps, self.sys_state, now, settings)
+        self.last = cmds
+        for u in units:
+            await self._send(u, cmds[u.id])
         self._publish(now, rooms)
 
-    async def _send(self, unit: core.Unit, state: core.UnitState, cmd: core.Command):
+    async def _send(self, unit: core.Unit, cmd: core.Command):
         cur = self.hass.states.get(unit.entity)
         if cur is None or cur.state == "unavailable":
             return
-        mode = "off" if cmd.mode == "off" else cmd.mode
-        if cmd.setpoint is None and cmd.mode == state.mode:
-            return  # nothing to say (e.g. holding with no sensors)
+        mode = cmd.hvac_mode or cmd.mode
+        if cmd.setpoint is None and cmd.reason.startswith("no fresh sensor"):
+            return  # no data: leave the unit alone
         if cur.state != mode:
             await self.hass.services.async_call(CLIMATE, SERVICE_SET_HVAC_MODE,
                                                 {"entity_id": unit.entity, ATTR_HVAC_MODE: mode}, blocking=True)
