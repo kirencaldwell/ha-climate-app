@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
+import pathlib
 from datetime import datetime, timedelta
 
 import voluptuous as vol
 from homeassistant.components import websocket_api
+from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.climate import ATTR_HVAC_MODE, DOMAIN as CLIMATE, SERVICE_SET_HVAC_MODE, SERVICE_SET_TEMPERATURE
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
@@ -55,7 +58,6 @@ class Manager:
     async def async_load(self):
         loaded = await self.store.async_load()
         if loaded is None:  # first run: seed from the bundled example layout
-            import json, pathlib
             seed = pathlib.Path(__file__).parent / "default_config.json"
             loaded = await self.hass.async_add_executor_job(lambda: json.loads(seed.read_text()))
             loaded.pop("_comment", None)
@@ -74,7 +76,9 @@ class Manager:
         except ValueError:
             return None, None
         unit = st.attributes.get("unit_of_measurement") or self.hass.config.units.temperature_unit
-        return TemperatureConverter.convert(val, unit, F), st.last_updated
+        # last_reported moves on every report; last_updated only when the value changes, which would make a
+        # steady sensor look stale.
+        return TemperatureConverter.convert(val, unit, F), getattr(st, "last_reported", None) or st.last_updated
 
     def _unit_temp(self, entity_id: str):
         st = self.hass.states.get(entity_id)
@@ -162,6 +166,10 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     from homeassistant.components.http import StaticPathConfig
     www = hass.config.path("custom_components/room_climate/www")
     await hass.http.async_register_static_paths([StaticPathConfig("/room_climate_static", www, False)])
+    # Load the card on every dashboard automatically; the version query busts the browser cache on updates.
+    manifest = await hass.async_add_executor_job(
+        lambda: json.loads((pathlib.Path(__file__).parent / "manifest.json").read_text()))
+    add_extra_js_url(hass, f"/room_climate_static/room-map-card.js?v={manifest['version']}")
 
     @websocket_api.websocket_command({"type": f"{DOMAIN}/get"})
     @websocket_api.async_response

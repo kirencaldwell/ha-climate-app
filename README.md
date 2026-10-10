@@ -16,12 +16,17 @@ deadband (±1°F), stops at target, and respects minimum run/off times and a hea
 `target + (unit sensor − room sensor) ± 1`, so the unit's own thermostat chases the *room* temperature. Stale/missing
 sensors are ignored; with none, the unit is left alone.
 
-## Install
-1. Copy `custom_components/room_climate` into HA's `config/custom_components/`.
-2. Add `room_climate:` to `configuration.yaml`, restart.
-3. Edit rooms/units (entity ids, floorplan rectangles) – seeded from `default_config.json` on first run.
-4. Add resource `/room_climate_static/room-map-card.js` (module), then a card `type: custom:room-map-card` (optional `floorplan: /local/floorplan.svg`).
+## Install (HACS)
+1. HACS → ⋮ → **Custom repositories** → add `https://github.com/kirencaldwell/ha-climate-app`, category **Integration**, then download **Room Climate**.
+2. Add `room_climate:` to `configuration.yaml` and restart Home Assistant.
+3. Add the card to a dashboard: `type: custom:room-map-card` (the integration loads the card's JavaScript itself; no resource to add).
+   Optional card keys: `theme: tech`, `north: left`, `floorplan`, `image_size`, `floor_views` (see the header of `room-map-card.js`).
+4. Rooms/units are seeded from `default_config.json` on first run and then stored in `.storage/room_climate`; the entity ids in the seed are placeholders until the hardware exists.
+
+**Updating:** push to GitHub; HACS shows an update, click **Update**, then restart HA (Python changes) and refresh the browser (card changes). Bump `version` in `manifest.json` so browsers pick up a new card.
+
+Manual install also works: copy `custom_components/room_climate` into HA's `config/custom_components/`.
 
 ## Status
-Core logic and simulator are tested (13 tests). The HA integration and card are written but **not yet run inside Home Assistant**; no hardware yet.
+Core logic and simulator are tested (13 tests). The integration loads in a real Home Assistant container and its websocket API was exercised end to end with fake sensors; it has not driven real climate entities, and there is no hardware yet.
 Not built yet: editing rooms/units from the UI, outdoor-temperature awareness, away mode.
