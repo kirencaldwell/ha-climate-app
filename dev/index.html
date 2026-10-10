@@ -23,12 +23,11 @@
   const hass = { callWS: msg => call(msg) };
   await import("/room-map-card.js");
   const card = document.createElement("room-map-card");
-  card.setConfig({
-    theme: "tech", image_size: [1280, 960], north: "left",
-    floor_views: {1: {x: 20, y: 140, w: 390, h: 620}, 2: {x: 440, y: 70, w: 400, h: 690}, 3: {x: 870, y: 125, w: 390, h: 635}},
-  });
+  // Same config as the real dashboard: no geometry, the card fits each floor itself.
+  card.setConfig({ theme: "tech", north: "left" });
   card._floor = +(new URLSearchParams(location.search).get("floor") || 0);
-  document.getElementById("mount").append(card);
+  const mount = document.getElementById("mount");  // ?shadow=1 mounts inside a shadow root, as HA does
+  (new URLSearchParams(location.search).has("shadow") ? mount.attachShadow({ mode: "open" }) : mount).append(card);
   const out = document.getElementById("out"), spd = document.getElementById("spd");
   async function tick() {
     const d = await call({type: "room_climate/get"});

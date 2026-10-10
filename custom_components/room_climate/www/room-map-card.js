@@ -115,10 +115,8 @@ class RoomMapCard extends HTMLElement {
     return d < -1 ? "#4a90d9" : d > 1 ? "#e0763a" : "#4caf7d";
   }
   _build() {
-    if (!document.getElementById("rc-style")) {
-      const st = document.createElement("style"); st.id = "rc-style"; st.textContent = CSS; document.head.append(st);
-    }
-    this.innerHTML = `<ha-card header="Room climate"><div class="rc"></div></ha-card>`;
+    // Styles are inlined: HA renders cards inside shadow DOM, where <head> stylesheets don't apply.
+    this.innerHTML = `<style>${CSS}</style><ha-card header="Room climate"><div class="rc"></div></ha-card>`;
     this._wrap = this.querySelector(".rc");
     this._wrap.addEventListener("click", e => this._click(e));
   }
@@ -151,7 +149,9 @@ class RoomMapCard extends HTMLElement {
     const floors = [...new Set(d.rooms.map(r => r.floor || 1))].sort();
     if (!floors.includes(this._floor)) this._floor = floors[0];
     const rooms = d.rooms.filter(r => (r.floor || 1) === this._floor);
-    const view = (this._config.floor_views || {})[this._floor], [iw, ih] = this._config.image_size || [100, 100];
+    let view = (this._config.floor_views || {})[this._floor];
+    const [iw, ih] = this._config.image_size || [100, 100];
+    if (!view && this._config.theme === "tech") view = this._fit(rooms);  // no geometry needed in the card config
     const vb = view ? [view.x, view.y, view.w, view.h] : [0, 0, 100, 100];
     const k = vb[2] / 100;  // 1 on the legacy 0-100 grid; scales text/strokes on a pixel-space crop
     const tech = this._config.theme === "tech";
@@ -205,6 +205,16 @@ class RoomMapCard extends HTMLElement {
       <div class="rc-map"><svg viewBox="${vb.join(" ")}" style="${tech ? "border-radius:10px" : ""}">${bg}${shapes}${compass}</svg></div>
       <div class="rc-panel"></div></div>`;
     this._panel();
+  }
+
+  // Bounding box of a floor's room shapes plus margin (extra on top for the north arrow).
+  _fit(rooms) {
+    const sh = rooms.map(r => r.shape).filter(s => s && s.w);
+    if (!sh.length) return undefined;
+    const x0 = Math.min(...sh.map(s => s.x)), x1 = Math.max(...sh.map(s => s.x + s.w));
+    const y0 = Math.min(...sh.map(s => s.y)), y1 = Math.max(...sh.map(s => s.y + s.h));
+    const pad = .08 * Math.max(x1 - x0, y1 - y0);
+    return { x: x0 - pad, y: y0 - pad * 1.7, w: x1 - x0 + pad * 2, h: y1 - y0 + pad * 2.7 };
   }
 
   _panel() {
@@ -268,7 +278,7 @@ class RoomMapCard extends HTMLElement {
     this._closeSchedule();
     const m = this._modal = document.createElement("div");
     m.className = "rc-modal";
-    m.innerHTML = `<div class="rc-sheet" role="dialog" aria-label="Diagnostics">
+    m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="Diagnostics">
       <header><h3>Diagnostics</h3><button data-x="close" aria-label="Close">✕</button></header>
       <div class="rc-body" data-slot="diag"></div>
       <footer><button data-x="close" class="on">Close</button></footer></div>`;
@@ -337,7 +347,7 @@ class RoomMapCard extends HTMLElement {
     this._ed = { room, days, day: todayIdx(), sel: null, selEnd: false, drag: false };
     const m = this._modal = document.createElement("div");
     m.className = "rc-modal";
-    m.innerHTML = `<div class="rc-sheet" role="dialog" aria-label="Schedule">
+    m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="Schedule">
       <header><h3>Schedule · ${room.name}</h3><button data-x="cancel" aria-label="Close">✕</button></header>
       <div class="rc-body">
         <div class="rc-seg" data-slot="days"></div>
