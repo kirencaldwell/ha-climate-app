@@ -1,0 +1,103 @@
+<!doctype html><meta charset="utf-8"><body style="width:700px"><pre id="out">running</pre><div id="m"></div>
+<script type="module">
+const out = [], ok = (n, c) => out.push((c ? "PASS " : "FAIL ") + n);
+let saved = null;
+const room = { id: "r", name: "R", unit: "u", default_temp: 68, priority: 3, floor: 1, shape: {x:0,y:0,w:10,h:10},
+  schedule: [{days:[0,1,2,3,4,5,6], start:"07:00", temp:68}, {days:[0,1,2,3,4,5,6], start:"21:30", temp:65}] };
+const snap = () => ({ rooms: [room], live: { r: { temp: 68, target: 68, mode: "off", reason: "" } },
+  units: [{ id: "u", name: "U air handler" }], settings_effective: { deadband: 1 },
+  units_live: { u: { mode: "off", setpoint: null, reason: "in deadband", error: 0, driver: null,
+    rooms: [{ id: "r", name: "R", priority: 3, temp: 68, target: 68, fresh: true, delta: 0, weight_pct: 100, pull: 0 }] } } });
+const hass = { callWS: async m => { if (m.type === "room_climate/set_room") saved = m; return snap(); } };
+await import("/room-map-card.js");
+const card = document.createElement("room-map-card"); card.setConfig({}); document.getElementById("m").append(card);
+card.hass = hass; await new Promise(r => setTimeout(r, 200));
+card._sel = "r"; card._render();
+card._openSchedule(room);
+const svg = document.querySelector(".rc-chart"), ed = card._ed;
+const at = (x, y) => { const r = svg.getBoundingClientRect(), s = r.width / 640; return { clientX: r.left + x * s, clientY: r.top + y * s, pointerId: 1, bubbles: true }; };
+// chart coords: x(m)=46+580*m/1440 ; y(t)=14+276*(1-(t-55)/30)
+const X = m => 46 + 580 * m / 1440, Y = t => 14 + 276 * (1 - (t - 55) / 30);
+ed.day = 0; card._edRender();
+ok("Monday = start point + 2 saved points", ed.days[0].length === 3 && ed.days[0][0].m === 0 && ed.days[0][0].t === 65);
+// tap empty area at 12:00, 72 -> adds a point
+const plot = svg.querySelector("[data-plot]");
+plot.dispatchEvent(new PointerEvent("pointerdown", at(X(720), Y(72))));
+svg.dispatchEvent(new PointerEvent("pointerup", at(X(720), Y(72))));
+ok("tap adds point (4 points)", ed.days[0].length === 4);
+ok("new point snapped 12:00 @72", ed.sel.m === 720 && ed.sel.t === 72);
+// tap BELOW the line (inside the shaded area) at 10:00, 58 -> also adds a point
+const n0 = ed.days[0].length, hit = document.elementFromPoint(at(X(600), Y(58)).clientX, at(X(600), Y(58)).clientY);
+ok("below-line tap lands on the plot rect (hit: " + (hit && (hit.tagName + " " + (hit.getAttribute("d") ? "path" : hit.getAttribute("data-plot") ? "plot" : ""))) + ")", hit && hit.hasAttribute("data-plot"));
+hit.dispatchEvent(new PointerEvent("pointerdown", at(X(600), Y(58))));
+svg.dispatchEvent(new PointerEvent("pointerup", at(X(600), Y(58))));
+ok("tap below the line adds a point", ed.days[0].length === n0 + 1 && ed.sel.m === 600 && ed.sel.t === 58);
+document.querySelector('[data-x="del"]').click();
+// drag it to 15:15 @ 70
+ed.sel = null; const g = svg.querySelector(`[data-i="1"]`);
+g.dispatchEvent(new PointerEvent("pointerdown", at(X(720), Y(72))));
+svg.dispatchEvent(new PointerEvent("pointermove", at(X(915), Y(70))));
+svg.dispatchEvent(new PointerEvent("pointerup", at(X(915), Y(70))));
+ok("drag moves to 15:15 @70", ed.sel.m === 915 && ed.sel.t === 70);
+// drag past last point reorders
+svg.querySelector(`[data-i="1"]`).dispatchEvent(new PointerEvent("pointerdown", at(X(915), Y(70))));
+svg.dispatchEvent(new PointerEvent("pointermove", at(X(1380), Y(70))));
+svg.dispatchEvent(new PointerEvent("pointerup", at(X(1380), Y(70))));
+ok("points stay sorted after drag past neighbor", ed.days[0].every((p, i, a) => !i || a[i-1].m < p.m));
+// can't stack on an existing minute
+svg.querySelector(`[data-i="1"]`).dispatchEvent(new PointerEvent("pointerdown", at(X(420), Y(68))));
+svg.dispatchEvent(new PointerEvent("pointermove", at(X(1380), Y(68))));
+svg.dispatchEvent(new PointerEvent("pointerup", at(X(1380), Y(68))));
+ok("no two points share a minute", new Set(ed.days[0].map(p => p.m)).size === ed.days[0].length);
+// start point: vertical-only, can't be deleted; interior drags never move the ends
+const start0 = ed.days[0][0], end0 = ed.days[1][0], snapT = [start0.t, end0.t];
+svg.querySelector(`[data-i="0"]`).dispatchEvent(new PointerEvent("pointerdown", at(X(0), Y(65))));
+svg.dispatchEvent(new PointerEvent("pointermove", at(X(600), Y(70))));
+svg.dispatchEvent(new PointerEvent("pointerup", at(X(600), Y(70))));
+ok("start point moves vertically only", start0.m === 0 && start0.t === 70 && ed.days[0][0] === start0);
+document.querySelector('[data-x="del"]').click();
+ok("start point cannot be deleted", ed.days[0][0] === start0);
+ok("time buttons disabled for start point", document.querySelector('[data-x="m"]').disabled);
+start0.t = snapT[0];
+// end handle edits next day's (Tue) start temp
+svg.querySelector(`[data-end]`).dispatchEvent(new PointerEvent("pointerdown", at(X(1440), Y(65))));
+svg.dispatchEvent(new PointerEvent("pointermove", at(X(1000), Y(62))));
+svg.dispatchEvent(new PointerEvent("pointerup", at(X(1000), Y(62))));
+ok("end handle sets next day's start temp", ed.selEnd && ed.sel === ed.days[1][0] && ed.days[1][0].t === 62 && ed.days[1][0].m === 0);
+ed.days[1][0].t = snapT[1]; ed.sel = null; ed.selEnd = false;
+// moving interior points leaves both ends untouched
+const before = [ed.days[0][0].t, ed.days[1][0].t];
+svg.querySelector(`[data-i="1"]`).dispatchEvent(new PointerEvent("pointerdown", at(X(420), Y(68))));
+svg.dispatchEvent(new PointerEvent("pointermove", at(X(300), Y(78))));
+svg.dispatchEvent(new PointerEvent("pointerup", at(X(300), Y(78))));
+ok("interior drag leaves start & end temps alone", ed.days[0][0].t === before[0] && ed.days[1][0].t === before[1]);
+// delete selected, then copy to weekends
+document.querySelector('[data-x="del"]').click();
+ok("delete removes selected", ed.days[0].length === 3 && ed.sel === null);
+document.querySelector('[data-x="copy"][data-to="weekends"]').click();
+ok("copy to weekends", JSON.stringify(ed.days[5]) === JSON.stringify(ed.days[0]) && ed.days[6].length === ed.days[0].length);
+// carry-in: Tue has points, so Wed carry == Tue last temp
+ed.day = 2; ok("carry-in = previous day's last temp", card._carry() === ed.days[1].at(-1).t);
+// Save -> entries merge identical points across days
+document.querySelector('[data-x="save"]').click(); await new Promise(r => setTimeout(r, 50));
+ok("save sent schedule", saved && saved.room_id === "r" && Array.isArray(saved.schedule));
+const sched = saved.schedule;
+ok("modal closed", !document.querySelector(".rc-modal"));
+ok("unchanged days merged (Tue..Fri share an entry)", sched.some(e => [1,2,3,4].every(d => e.days.includes(d))));
+// Round-trip untouched schedule is lossless
+card._openSchedule(room);
+const rt = card._toSchedule(card._ed.days);
+const want = [{days:[0,1,2,3,4,5,6], start:"00:00", temp:65}, ...room.schedule].map(e => ({...e}));
+ok("untouched schedule round-trips (plus explicit 00:00 start at the carried-in temp)", JSON.stringify(rt) === JSON.stringify(want));
+card._closeSchedule();
+// diagnostics view
+card._sel = null; card._render();
+ok("home panel is minimal (tiles + button, no room list)", !card.querySelector(".rc-rm") && !!card.querySelector('[data-act="diag"]'));
+card.querySelector('[data-act="diag"]').click();
+ok("Diagnostics button opens the modal", !!document.querySelector(".rc-modal") && card._diag === true);
+const dr = document.querySelector('.rc-modal .rc-rm');
+ok("diagnostics lists the room row", !!dr);
+if (dr) dr.click();
+ok("tapping a row closes diagnostics and selects the room", !document.querySelector(".rc-modal") && card._sel === "r");
+document.getElementById("out").textContent = out.join("\n");
+</script>

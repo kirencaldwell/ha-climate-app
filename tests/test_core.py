@@ -116,3 +116,35 @@ def test_sim_follows_overnight_setback():
     assert abs(h.sim["bed"].temp - 69) < 1.5
     h.step(16 * 60)  # to 24:00
     assert abs(h.sim["bed"].temp - 65) < 1.5
+
+
+def _diag(rooms, readings, **kw):
+    u = Unit("u", "climate.u")
+    return core.diagnose(u, rooms, readings, kw.get("unit_temp"), UnitState(), core.Command("heat", 68.0, "heating"), MON)
+
+
+def test_diagnose_weights_and_driver():
+    a = Room("a", "A", "u", priority=4, default_temp=68)
+    b = Room("b", "B", "u", priority=1, default_temp=68)
+    d = _diag([a, b], {"a": (64.0, MON), "b": (70.0, MON)}, unit_temp=69.0)
+    assert [r["id"] for r in d["rooms"]] == ["a", "b"]  # highest priority first
+    assert d["rooms"][0]["weight_pct"] == 80.0 and d["rooms"][1]["weight_pct"] == 20.0
+    assert d["rooms"][0]["delta"] == -4.0
+    assert d["driver"] == "a"
+    assert d["error"] == round((4 * -4 + 1 * 2) / 5, 2)
+    assert d["offset"] == round(69.0 - d["avg"], 1)
+    assert d["mode"] == "off" and d["setpoint"] == 68.0 and d["reason"] == "heating"
+
+
+def test_diagnose_ignores_stale_and_missing_sensors():
+    a = Room("a", "A", "u", priority=3)
+    b = Room("b", "B", "u", priority=3)
+    d = _diag([a, b], {"a": (66.0, MON - timedelta(hours=2))})  # a stale, b missing
+    assert d["error"] is None and d["driver"] is None
+    assert all(not r["fresh"] and r["weight_pct"] == 0 for r in d["rooms"])
+
+
+def test_diagnose_skips_other_units_rooms():
+    a = Room("a", "A", "u"); other = Room("x", "X", "other")
+    d = _diag([a, other], {"a": (68.0, MON), "x": (60.0, MON)})
+    assert [r["id"] for r in d["rooms"]] == ["a"]

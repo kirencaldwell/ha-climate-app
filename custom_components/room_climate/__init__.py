@@ -1,6 +1,7 @@
 """Room Climate: hold each room at its own target using room sensors to drive Mitsubishi units."""
 from __future__ import annotations
 
+import dataclasses
 import logging
 from datetime import datetime, timedelta
 
@@ -27,7 +28,7 @@ CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({vol.Optional("enabled", default=
 
 def _room_from_dict(d: dict) -> core.Room:
     return core.Room(
-        id=d["id"], name=d.get("name", d["id"]), unit=d["unit"], sensor=d.get("sensor"),
+        id=d["id"], name=d.get("name", d["id"]), unit=d.get("unit"), sensor=d.get("sensor"),
         priority=int(d.get("priority", 3)), default_temp=float(d.get("default_temp", 68)),
         schedule=[core.ScheduleEntry(list(e["days"]), e["start"], float(e["temp"])) for e in d.get("schedule", [])],
         hold_temp=d.get("hold_temp"),
@@ -129,6 +130,20 @@ class Manager:
     def snapshot(self) -> dict:
         now = dt_util.now()
         out = dict(self.data)
+        settings = core.Settings(**self.data.get("settings", {}))
+        rooms = [_room_from_dict(r) for r in self.data["rooms"]]
+        readings = {}
+        for r in rooms:
+            if r.sensor:
+                val, ts = self._f(r.sensor)
+                if val is not None:
+                    readings[r.id] = (val, ts)
+        out["now"] = now.isoformat()
+        out["settings_effective"] = dataclasses.asdict(settings)
+        out["units_live"] = {
+            ud["id"]: core.diagnose(_unit_from_dict(ud), rooms, readings, self._unit_temp(ud["entity"]),
+                                    self.states.get(ud["id"], core.UnitState()), self.last.get(ud["id"]), now, settings)
+            for ud in self.data["units"]}
         out["live"] = {}
         for rd in self.data["rooms"]:
             r = _room_from_dict(rd)

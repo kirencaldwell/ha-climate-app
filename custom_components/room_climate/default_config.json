@@ -1,16 +1,229 @@
 {
   "_comment": "Seed config. Copy into .storage/room_climate (or set via the card). Entity ids are placeholders until hardware arrives.",
   "enabled": true,
-  "settings": {"deadband": 1.0},
+  "settings": {
+    "deadband": 1.0
+  },
   "units": [
-    {"id": "air_handler", "entity": "climate.first_floor"},
-    {"id": "minisplit_1", "entity": "climate.bedroom_1"},
-    {"id": "minisplit_2", "entity": "climate.bedroom_2"}
+    {
+      "id": "air_handler",
+      "entity": "climate.first_floor",
+      "name": "Main floor air handler"
+    },
+    {
+      "id": "minisplit_1",
+      "entity": "climate.primary_bedroom",
+      "name": "Primary bedroom minisplit"
+    },
+    {
+      "id": "minisplit_2",
+      "entity": "climate.bedroom",
+      "name": "Bedroom 3 minisplit"
+    }
   ],
   "rooms": [
-    {"id": "first_floor", "name": "First floor", "unit": "air_handler", "sensor": "sensor.first_floor_temperature", "priority": 3, "default_temp": 68, "floor": 1, "shape": {"x": 5, "y": 5, "w": 90, "h": 40}},
-    {"id": "bedroom_1", "name": "Bedroom 1", "unit": "minisplit_1", "sensor": "sensor.bedroom_1_temperature", "priority": 4, "default_temp": 67, "floor": 2, "shape": {"x": 5, "y": 55, "w": 43, "h": 40},
-     "schedule": [{"days": [0,1,2,3,4,5,6], "start": "07:00", "temp": 68}, {"days": [0,1,2,3,4,5,6], "start": "21:30", "temp": 65}]},
-    {"id": "bedroom_2", "name": "Bedroom 2", "unit": "minisplit_2", "sensor": "sensor.bedroom_2_temperature", "priority": 3, "default_temp": 67, "floor": 2, "shape": {"x": 52, "y": 55, "w": 43, "h": 40}}
+    {
+      "id": "basement",
+      "name": "Basement",
+      "sensor": "sensor.basement_temperature",
+      "priority": 3,
+      "default_temp": 68,
+      "floor": 1,
+      "shape": {
+        "x": 40,
+        "y": 195,
+        "w": 347,
+        "h": 545
+      }
+    },
+    {
+      "id": "living_room",
+      "name": "Living room",
+      "sensor": "sensor.living_room_temperature",
+      "priority": 4,
+      "default_temp": 68,
+      "floor": 2,
+      "shape": {
+        "x": 470,
+        "y": 558,
+        "w": 215,
+        "h": 182
+      },
+      "unit": "air_handler"
+    },
+    {
+      "id": "dining_area",
+      "name": "Dining area",
+      "sensor": "sensor.dining_area_temperature",
+      "priority": 3,
+      "default_temp": 68,
+      "floor": 2,
+      "shape": {
+        "x": 688,
+        "y": 558,
+        "w": 127,
+        "h": 182
+      },
+      "unit": "air_handler"
+    },
+    {
+      "id": "kitchen",
+      "name": "Kitchen",
+      "sensor": "sensor.kitchen_temperature",
+      "priority": 2,
+      "default_temp": 68,
+      "floor": 2,
+      "shape": {
+        "x": 688,
+        "y": 300,
+        "w": 127,
+        "h": 255
+      },
+      "unit": "air_handler"
+    },
+    {
+      "id": "bedroom_1",
+      "name": "Bedroom 1",
+      "sensor": "sensor.bedroom_1_temperature",
+      "priority": 3,
+      "default_temp": 67,
+      "floor": 2,
+      "shape": {
+        "x": 470,
+        "y": 185,
+        "w": 165,
+        "h": 160
+      },
+      "unit": "air_handler"
+    },
+    {
+      "id": "bedroom_2",
+      "name": "Bedroom 2",
+      "sensor": "sensor.bedroom_2_temperature",
+      "priority": 3,
+      "default_temp": 67,
+      "floor": 2,
+      "shape": {
+        "x": 470,
+        "y": 388,
+        "w": 165,
+        "h": 162
+      },
+      "unit": "air_handler"
+    },
+    {
+      "id": "bath_2",
+      "name": "Bath",
+      "sensor": "sensor.bath_2_temperature",
+      "priority": 3,
+      "default_temp": 68,
+      "floor": 2,
+      "shape": {
+        "x": 640,
+        "y": 185,
+        "w": 95,
+        "h": 110
+      }
+    },
+    {
+      "id": "primary_bedroom",
+      "name": "Primary bedroom",
+      "sensor": "sensor.primary_bedroom_temperature",
+      "priority": 4,
+      "default_temp": 67,
+      "floor": 3,
+      "shape": {
+        "x": 895,
+        "y": 180,
+        "w": 200,
+        "h": 165
+      },
+      "unit": "minisplit_1",
+      "schedule": [
+        {
+          "days": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "start": "07:00",
+          "temp": 68
+        },
+        {
+          "days": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "start": "21:30",
+          "temp": 65
+        }
+      ]
+    },
+    {
+      "id": "bedroom_3",
+      "name": "Bedroom 3",
+      "sensor": "sensor.bedroom_3_temperature",
+      "priority": 3,
+      "default_temp": 67,
+      "floor": 3,
+      "shape": {
+        "x": 895,
+        "y": 352,
+        "w": 160,
+        "h": 193
+      },
+      "unit": "minisplit_2"
+    },
+    {
+      "id": "bath_3",
+      "name": "Bath",
+      "sensor": "sensor.bath_3_temperature",
+      "priority": 3,
+      "default_temp": 68,
+      "floor": 3,
+      "shape": {
+        "x": 1120,
+        "y": 185,
+        "w": 115,
+        "h": 165
+      }
+    },
+    {
+      "id": "loft",
+      "name": "Loft / office",
+      "sensor": "sensor.loft_temperature",
+      "priority": 3,
+      "default_temp": 68,
+      "floor": 3,
+      "shape": {
+        "x": 1062,
+        "y": 355,
+        "w": 175,
+        "h": 190
+      }
+    },
+    {
+      "id": "attic",
+      "name": "Attic",
+      "sensor": "sensor.attic_temperature",
+      "priority": 3,
+      "default_temp": 68,
+      "floor": 3,
+      "shape": {
+        "x": 895,
+        "y": 550,
+        "w": 340,
+        "h": 190
+      }
+    }
   ]
 }

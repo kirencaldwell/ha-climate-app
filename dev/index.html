@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Room Climate dev harness</title>
+<style>
+  :root { --primary-color:#03a9f4; --primary-text-color:#e6edf7; --secondary-text-color:#9aa7b8;
+          --card-background-color:#151d2c; --secondary-background-color:#263146; --divider-color:#ffffff24; color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 0 auto; padding: 8px 12px; background:#0d131d; color: var(--primary-text-color); }
+  ha-card { display:block; background: var(--card-background-color); border-radius:12px; }
+  ha-card::before { content: attr(header); display:block; font-size:1.4em; padding:16px 12px 8px; }
+  .sim { display:flex; gap:8px 20px; align-items:center; flex-wrap:wrap; margin-bottom:10px; font-size:15px; }
+  .sim label { display:flex; align-items:center; gap:8px; }
+  .sim input[type=range] { width: 160px; height: 32px; }
+  .sim select { min-height: 36px; font-size: 15px; }
+</style>
+<div class="sim">
+  <b id="clock">…</b>
+  <label>Outdoor <input id="out" type="range" min="-10" max="100" value="40"> <span id="outv"></span>°F</label>
+  <label>Speed <select id="spd"><option>1</option><option selected>10</option><option>60</option><option>240</option></select> sim min/s</label>
+</div>
+<div id="mount"></div>
+<script type="module">
+  const call = async msg => (await fetch("/ws", {method:"POST", body: JSON.stringify(msg)})).json();
+  // The server handles POST on any path.
+  const hass = { callWS: msg => call(msg) };
+  await import("/room-map-card.js");
+  const card = document.createElement("room-map-card");
+  card.setConfig({
+    theme: "tech", image_size: [1280, 960], north: "left",
+    floor_views: {1: {x: 20, y: 140, w: 390, h: 620}, 2: {x: 440, y: 70, w: 400, h: 690}, 3: {x: 870, y: 125, w: 390, h: 635}},
+  });
+  card._floor = +(new URLSearchParams(location.search).get("floor") || 0);
+  document.getElementById("mount").append(card);
+  const out = document.getElementById("out"), spd = document.getElementById("spd");
+  async function tick() {
+    const d = await call({type: "room_climate/get"});
+    document.getElementById("clock").textContent = "Sim time: " + d.sim.time;
+    document.getElementById("outv").textContent = d.sim.outdoor;
+    card._last = 0; card.hass = hass;
+  }
+  out.oninput = () => call({type: "sim/set", outdoor: out.value});
+  spd.onchange = () => call({type: "sim/set", speed: spd.value});
+  card.hass = hass;
+  const q = new URLSearchParams(location.search);
+  if (q.get("room") || q.get("diag")) {   // dev shortcut: ?room=living_room[&edit=1]
+    await tick(); card._sel = q.get("room") || null; card._render();
+    if (q.get("diag")) card._openDiag();
+    if (q.get("edit")) card._openSchedule(card._data.rooms.find(r => r.id === card._sel));
+  }
+  setInterval(tick, 2000); tick();
+</script>

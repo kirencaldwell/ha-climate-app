@@ -29,7 +29,7 @@ class ScheduleEntry:
 class Room:
     id: str
     name: str
-    unit: str
+    unit: Optional[str]  # None = monitor-only (sensor shown, never drives a unit)
     sensor: Optional[str] = None
     priority: int = 3
     default_temp: float = 68.0
@@ -177,3 +177,41 @@ def apply(state: UnitState, cmd: Command, now: datetime) -> UnitState:
     if cmd.mode == state.mode:
         return state
     return UnitState(cmd.mode, now, cmd.mode if cmd.mode != "off" else state.last_run)
+
+
+def diagnose(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float, datetime]],
+             unit_temp: Optional[float], state: UnitState, cmd: Optional[Command], now: datetime,
+             settings: Settings = Settings()) -> dict:
+    """Why a unit is doing what it's doing: its mode/setpoint plus each served room's weight and pull on the error."""
+    mine = [r for r in rooms if r.unit == unit.id]
+    items, den = [], 0.0
+    for r in mine:
+        got = readings.get(r.id)
+        fresh = bool(got) and (now - got[1]).total_seconds() <= settings.stale_s
+        w = max(MIN_PRIORITY, min(MAX_PRIORITY, r.priority))
+        items.append({"id": r.id, "name": r.name, "priority": r.priority, "temp": got[0] if got else None,
+                      "target": target_temp(r, now), "fresh": fresh, "w": w})
+        if fresh:
+            den += w
+    for it in items:
+        w = it.pop("w")
+        if it["fresh"]:
+            it["delta"] = round(it["temp"] - it["target"], 2)
+            it["weight_pct"] = round(100 * w / den, 1)
+            it["pull"] = round(w * (it["temp"] - it["target"]) / den, 2)  # this room's share of the weighted error
+        else:
+            it["delta"], it["weight_pct"], it["pull"] = None, 0.0, 0.0
+    items.sort(key=lambda i: (-i["priority"], i["name"]))
+    res = weighted_error(mine, readings, now, settings)
+    driver = max((i for i in items if i["fresh"]), key=lambda i: abs(i["pull"]), default=None)
+    return {
+        "unit": unit.id, "mode": state.mode,
+        "setpoint": cmd.setpoint if cmd else None, "reason": cmd.reason if cmd else "",
+        "held_s": int((now - state.since).total_seconds()) if state.since else None,
+        "error": None if res is None else round(res[0], 2),
+        "avg": None if res is None else round(res[1], 2),
+        "target": None if res is None else round(res[1] - res[0], 2),
+        "unit_temp": None if unit_temp is None else round(unit_temp, 1),
+        "offset": None if (res is None or unit_temp is None) else round(unit_temp - res[1], 1),
+        "rooms": items, "driver": driver["id"] if driver and abs(driver["pull"]) > 0 else None,
+    }
