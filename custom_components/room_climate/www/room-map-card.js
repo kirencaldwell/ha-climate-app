@@ -87,7 +87,10 @@ const CSS = `
 `;
 
 class RoomMapCard extends HTMLElement {
-  setConfig(config) { this._config = config; this._sel = null; this._floor = 1; this._data = null; this._build(); }
+  setConfig(config) {
+    this._config = config; this._sel = null; this._floor = 1; this._data = null;
+    try { this._build(); } catch (e) { this._fail("setConfig", e); }
+  }
   set hass(hass) {
     this._hass = hass;
     if (!this._data && !this._loading) this._refresh();
@@ -101,13 +104,27 @@ class RoomMapCard extends HTMLElement {
     this._loading = true;
     try {
       this._data = await this._hass.callWS({ type: "room_climate/get" });
+      this._failed = null;
       if (!this._modal) this._render();  // don't rebuild the page under an open editor
       else if (this._diag) this._diagUpdate();  // diagnostics stay live
-    } finally { this._loading = false; }
+    } catch (e) { this._fail("refresh", e); }
+    finally { this._loading = false; }
   }
   async _set(patch) {
-    this._data = await this._hass.callWS({ type: "room_climate/set_room", room_id: this._sel, ...patch });
-    this._render();
+    try {
+      this._data = await this._hass.callWS({ type: "room_climate/set_room", room_id: this._sel, ...patch });
+      this._render();
+    } catch (e) { this._fail("set_room", e); }
+  }
+  // Show the problem in the card (instead of a blank page) and send it to the HA log so it can be diagnosed remotely.
+  _fail(where, e) {
+    const msg = `${where}: ${(e && e.message) || (e && e.code) || JSON.stringify(e) || e}`;
+    console.error("[room-map-card]", msg, e);
+    if (this._failed !== msg) {  // report each distinct failure once, not on every 15s retry
+      this._failed = msg;
+      try { this._hass.callWS({ type: "room_climate/log_client", message: msg, stack: String((e && e.stack) || "").slice(0, 1500), ua: navigator.userAgent, where: location.pathname }).catch(() => {}); } catch (_) { /* hass not ready */ }
+    }
+    if (this._wrap && !this._data) this._wrap.innerHTML = `<div style="padding:16px;color:#ff8a5c;font-family:monospace;font-size:13px;white-space:pre-wrap">Room Climate could not load\n${msg.replace(/[<&]/g, "")}\nRetrying every 15 s.</div>`;
   }
   _color(t, target) {
     if (t == null) return "#888";
@@ -512,5 +529,10 @@ class RoomMapCard extends HTMLElement {
     return [...by.values()].sort((a, b) => toMin(a.start) - toMin(b.start));
   }
 }
+// Any render/click handler that throws is caught and reported rather than leaving the card blank.
+["_render", "_click", "_panel", "_edRender", "_diagUpdate"].forEach(m => {
+  const f = RoomMapCard.prototype[m];
+  if (typeof f === "function") RoomMapCard.prototype[m] = function (...a) { try { return f.apply(this, a); } catch (e) { this._fail(m, e); } };
+});
 customElements.define("room-map-card", RoomMapCard);
 window.customCards = (window.customCards || []).concat([{ type: "room-map-card", name: "Room map card" }]);

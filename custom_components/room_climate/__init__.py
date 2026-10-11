@@ -170,6 +170,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     manifest = await hass.async_add_executor_job(
         lambda: json.loads((pathlib.Path(__file__).parent / "manifest.json").read_text()))
     add_extra_js_url(hass, f"/room_climate_static/room-map-card.js?v={manifest['version']}")
+    add_extra_js_url(hass, f"/room_climate_static/room-climate-probe.js?v={manifest['version']}")
 
     @websocket_api.websocket_command({"type": f"{DOMAIN}/get"})
     @websocket_api.async_response
@@ -202,7 +203,17 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         await mgr.async_tick()
         connection.send_result(msg["id"], mgr.snapshot())
 
-    for fn in (ws_get, ws_set_room):
+    @websocket_api.websocket_command({
+        "type": f"{DOMAIN}/log_client", vol.Required("message"): str,
+        vol.Optional("stack", default=""): str, vol.Optional("ua", default=""): str, vol.Optional("where", default=""): str,
+    })
+    @websocket_api.async_response
+    async def ws_log_client(hass, connection, msg):
+        # Frontend failures (old tablets, blank cards) never reach the server otherwise.
+        _LOGGER.warning("Card error from client [%s] %s | %s | %s", msg["where"][:80], msg["message"][:400], msg["ua"][:200], msg["stack"][:800])
+        connection.send_result(msg["id"])
+
+    for fn in (ws_get, ws_set_room, ws_log_client):
         websocket_api.async_register_command(hass, fn)
 
     async def _on_sensor(event):
