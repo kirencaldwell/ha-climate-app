@@ -266,16 +266,36 @@ class RoomMapCard extends HTMLElement {
         <button data-act="sched" style="width:100%">Edit schedule…</button></div>`;
   }
 
+  // A unit's real state (from HA) next to what the controller wants. Shared by the home panel and diagnostics.
+  _unitStatus(x) {
+    const d = this._data;
+    const a = x.actual;  // what the unit is really doing; x.mode/x.setpoint are what Room Climate wants
+    const am = a ? (a.state === "heat_cool" ? "auto" : a.state) : x.mode;
+    const cls = am === "heat" ? "heat" : am === "cool" ? "cool" : "off";
+    const sp = a && a.setpoint != null ? Math.round(a.setpoint) : null;
+    const fmt = (m, t) => m === "off" ? "off" : `${m}${t != null ? ` ${t}°` : ""}`;
+    const actual = !a ? "no data" : a.state === "unavailable" ? "unavailable"
+      : [fmt(am, sp), a.action && a.action !== "off" && a.action !== "idle" ? a.action : null, a.temp != null ? `reads ${a.temp.toFixed(1)}°` : null].filter(Boolean).join(" · ");
+    const big = !a ? "—" : a.state === "unavailable" ? "N/A" : am === "off" ? "OFF" : `${am === "heat" ? "▲" : am === "cool" ? "▼" : "●"} ${sp ?? "—"}°`;
+    const wantTxt = fmt(x.mode, x.mode === "off" ? null : x.setpoint != null ? Math.round(x.setpoint) : null);
+    const same = a && a.state !== "unavailable" && x.mode === (am === "auto" ? "heat_cool" : am) && (x.mode === "off" || x.setpoint == null || sp === Math.round(x.setpoint));
+    return { cls, big, actual, wantTxt, same, a, dry: d.enabled === false };
+  }
+
   /* ---------- system overview (nothing selected) ---------- */
   // Home panel (nothing selected): just what each heat pump is doing.
   _overview() {
     const d = this._data, units = d.units || [], ul = d.units_live || {};
-    const label = { heat: "Heating", cool: "Cooling", off: "Off" };
     const tiles = units.map(u => {
       const x = ul[u.id]; if (!x) return "";
-      return `<div class="rc-tile ${x.mode}"><div class="nm">${(u.name || u.id).replace(/ (air handler|minisplit)$/i, "")}</div>
-        <div class="big">${x.mode === "heat" ? "▲ " : x.mode === "cool" ? "▼ " : ""}${label[x.mode] || x.mode}</div></div>`;
+      const st = this._unitStatus(x);
+      const warn = st.a && !st.same;
+      return `<div class="rc-tile ${st.cls}"><div class="nm">${(u.name || u.id).replace(/ (air handler|minisplit)$/i, "")}</div>
+        <div class="big">${st.big}</div>
+        <div class="why"><b>Actual</b> · ${st.actual}</div>
+        <div class="why" style="${warn ? "color:#ffd166" : ""}"><b>${st.dry ? "Wants (dry run)" : "Wants"}</b> · ${st.wantTxt}${x.reason ? ` · ${x.reason}` : ""}${warn ? " ⚠" : st.a ? " ✓" : ""}</div></div>`;
     }).join("");
+    const house = d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 6px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}${d.enabled === false ? " · <span style=\"color:#ffd166\">dry run, nothing sent</span>" : ""}</p>` : "";
     const db = (d.settings_effective || {}).deadband ?? 1;
     const top = units.flatMap(u => ((ul[u.id] || {}).rooms || []).map((r, _, all) => ({ ...r, drv: all.length > 1 && ul[u.id].driver === r.id })))
       .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name)).slice(0, 3);
@@ -285,7 +305,7 @@ class RoomMapCard extends HTMLElement {
         <span class="rc-pips" title="Priority ${r.priority}">${[1, 2, 3, 4, 5].map(n => `<b class="${n <= r.priority ? "on" : ""}"></b>`).join("")}</span></span>
         <span class="rc-d ${c}">${r.temp == null ? "—" : r.temp.toFixed(1) + "°"} <small>→ ${r.target}°</small></span></button>`;
     }).join("");
-    return `<h3>Heat pumps</h3><div class="rc-units">${tiles}</div>
+    return `<h3>Heat pumps</h3>${house}<div class="rc-units">${tiles}</div>
       ${pr ? `<div class="rc-sect"><h4>Highest priority</h4>${pr}</div>` : ""}
       <p class="rc-sub" style="margin:12px 0">Tap a room to adjust it.</p>
       <button data-act="diag" style="width:100%">Diagnostics</button>`;
@@ -332,16 +352,7 @@ class RoomMapCard extends HTMLElement {
     const short = u => (u.name || u.id).replace(/ (air handler|minisplit)$/i, "");
     const tiles = units.map(u => {
       const x = ul[u.id]; if (!x) return "";
-      const a = x.actual;  // what the unit is really doing; x.mode/x.setpoint are what Room Climate wants
-      const am = a ? (a.state === "heat_cool" ? "auto" : a.state) : x.mode;
-      const cls = am === "heat" ? "heat" : am === "cool" ? "cool" : "off";
-      const sp = a && a.setpoint != null ? Math.round(a.setpoint) : null;
-      const fmt = (m, t) => m === "off" ? "off" : `${m}${t != null ? ` ${t}°` : ""}`;
-      const actual = !a ? "no data" : a.state === "unavailable" ? "unavailable"
-        : [fmt(am, sp), a.action && a.action !== "off" && a.action !== "idle" ? a.action : null, a.temp != null ? `reads ${a.temp.toFixed(1)}°` : null].filter(Boolean).join(" · ");
-      const big = !a ? "—" : a.state === "unavailable" ? "N/A" : am === "off" ? "OFF" : `${am === "heat" ? "▲" : am === "cool" ? "▼" : "●"} ${sp ?? "—"}°`;
-      const wantTxt = fmt(x.mode, x.mode === "off" ? null : x.setpoint != null ? Math.round(x.setpoint) : null);
-      const same = a && a.state !== "unavailable" && x.mode === (am === "auto" ? "heat_cool" : am) && (x.mode === "off" || x.setpoint == null || sp === Math.round(x.setpoint));
+      const { cls, big, actual, wantTxt, same, a } = this._unitStatus(x);
       return `<div class="rc-tile ${cls}"><div class="nm">${short(u)}</div><div class="big">${big}</div>${gauge(x.error)}
         <div class="why"><b>Actual</b> · ${actual}</div>
         <div class="why" style="${a && !same ? "color:#ffd166" : ""}"><b>${d.enabled === false ? "Wants (dry run)" : "Wants"}</b> · ${wantTxt}${x.reason ? ` · ${x.reason}` : ""}${a && !same ? " ⚠ differs" : a ? " ✓ in sync" : ""}</div></div>`;
