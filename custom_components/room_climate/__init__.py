@@ -53,6 +53,8 @@ class Manager:
         self.data: dict = {"rooms": [], "units": [], "settings": {}, "enabled": True, "floorplan": None}
         self.states: dict[str, core.UnitState] = {}
         self.last: dict[str, core.Command] = {}
+        self.shadow: dict[str, core.UnitState] = {}  # decision state while disabled (dry run), kept apart from the real one
+        self._audit_seen: dict[str, tuple] = {}
         self._unsub = []
 
     async def async_load(self):
@@ -86,8 +88,10 @@ class Manager:
         return None if cur is None else TemperatureConverter.convert(float(cur), self.hass.config.units.temperature_unit, F)
 
     async def async_tick(self, _now=None):
-        if not self.data.get("enabled", True):
-            return
+        # Disabled means dry run: decide exactly as normal and log it against what the unit is really doing,
+        # but send nothing.
+        enabled = self.data.get("enabled", True)
+        states = self.states if enabled else self.shadow
         now = dt_util.now()
         settings = core.Settings(**self.data.get("settings", {}))
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
@@ -100,12 +104,38 @@ class Manager:
                     val, ts = self._f(r.sensor)
                     if val is not None:
                         readings[r.id] = (val, ts)
-            state = self.states.setdefault(unit.id, core.UnitState())
+            state = states.setdefault(unit.id, core.UnitState())
             cmd = core.decide(unit, mine, readings, self._unit_temp(unit.entity), state, now, settings)
             self.last[unit.id] = cmd
-            await self._send(unit, state, cmd)
-            self.states[unit.id] = core.apply(state, cmd, now)
+            if enabled:
+                await self._send(unit, state, cmd)
+            self._audit(unit, cmd, enabled, now)
+            states[unit.id] = core.apply(state, cmd, now)
         self._publish(now, rooms)
+
+    def _audit(self, unit: core.Unit, cmd: core.Command, enabled: bool, now):
+        """Log what we want the unit to do next to what it is doing. Logged when anything changes, else every 30 min."""
+        cur = self.hass.states.get(unit.entity)
+        if cur is None or cur.state == "unavailable":
+            line, key = f"{unit.id}: unit {unit.entity} unavailable", ("unavailable",)
+        else:
+            a = cur.attributes
+            actual_sp = a.get("temperature")
+            want_sp = None if cmd.setpoint is None else round(
+                TemperatureConverter.convert(cmd.setpoint, F, self.hass.config.units.temperature_unit), 1)
+            diffs = []
+            if cur.state != cmd.mode:
+                diffs.append(f"mode want {cmd.mode} has {cur.state}")
+            if want_sp is not None and (actual_sp is None or abs(actual_sp - want_sp) > 0.3):
+                diffs.append(f"setpoint want {want_sp} has {actual_sp}")
+            line = (f"{unit.id}: command {cmd.mode}/{want_sp} ({cmd.reason}) | actual hvac={cur.state} "
+                    f"setpoint={actual_sp} action={a.get('hvac_action')} unit_temp={a.get('current_temperature')} | "
+                    + ("MISMATCH " + "; ".join(diffs) if diffs else "in sync"))
+            key = (cmd.mode, want_sp, cmd.reason, cur.state, actual_sp, bool(diffs))
+        seen = self._audit_seen.get(unit.id)
+        if seen is None or seen[0] != key or (now - seen[1]).total_seconds() > 1800:
+            self._audit_seen[unit.id] = (key, now)
+            _LOGGER.info("%s %s", "LIVE" if enabled else "DRY-RUN", line)
 
     async def _send(self, unit: core.Unit, state: core.UnitState, cmd: core.Command):
         cur = self.hass.states.get(unit.entity)
@@ -115,11 +145,13 @@ class Manager:
         if cmd.setpoint is None and cmd.mode == state.mode:
             return  # nothing to say (e.g. holding with no sensors)
         if cur.state != mode:
+            _LOGGER.info("SEND %s hvac_mode %s -> %s (%s)", unit.entity, cur.state, mode, cmd.reason)
             await self.hass.services.async_call(CLIMATE, SERVICE_SET_HVAC_MODE,
                                                 {"entity_id": unit.entity, ATTR_HVAC_MODE: mode}, blocking=True)
         if cmd.setpoint is not None:
             sp = TemperatureConverter.convert(cmd.setpoint, F, self.hass.config.units.temperature_unit)
             if cur.attributes.get("temperature") != sp:
+                _LOGGER.info("SEND %s temperature %s -> %s (%s)", unit.entity, cur.attributes.get("temperature"), round(sp, 1), cmd.reason)
                 await self.hass.services.async_call(CLIMATE, SERVICE_SET_TEMPERATURE,
                                                     {"entity_id": unit.entity, ATTR_TEMPERATURE: round(sp, 1)}, blocking=True)
 
@@ -148,6 +180,11 @@ class Manager:
             ud["id"]: core.diagnose(_unit_from_dict(ud), rooms, readings, self._unit_temp(ud["entity"]),
                                     self.states.get(ud["id"], core.UnitState()), self.last.get(ud["id"]), now, settings)
             for ud in self.data["units"]}
+        for ud in self.data["units"]:  # what each unit is really doing, next to what we would command
+            cur = self.hass.states.get(ud["entity"])
+            out["units_live"][ud["id"]]["actual"] = None if cur is None else {
+                "state": cur.state, "setpoint": cur.attributes.get("temperature"),
+                "action": cur.attributes.get("hvac_action"), "temp": self._unit_temp(ud["entity"])}
         out["live"] = {}
         for rd in self.data["rooms"]:
             r = _room_from_dict(rd)

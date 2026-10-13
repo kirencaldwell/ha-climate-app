@@ -332,8 +332,13 @@ class RoomMapCard extends HTMLElement {
     const tiles = units.map(u => {
       const x = ul[u.id]; if (!x) return "";
       const big = x.mode === "off" ? "OFF" : `${x.mode === "heat" ? "▲" : "▼"} ${x.setpoint ?? "—"}°`;
+      const a = x.actual;
+      const now = !a ? "no data" : a.state === "unavailable" ? "unavailable"
+        : `${a.state}${a.setpoint != null ? ` · set ${Math.round(a.setpoint)}°` : ""}${a.action ? ` · ${a.action}` : ""}${a.temp != null ? ` · reads ${a.temp.toFixed(1)}°` : ""}`;
+      const sync = a && a.state !== "unavailable" && a.state !== x.mode;
       return `<div class="rc-tile ${x.mode}"><div class="nm">${short(u)}</div><div class="big">${big}</div>${gauge(x.error)}
-        <div class="why">${x.reason || ""}</div></div>`;
+        <div class="why">${x.reason || ""}</div>
+        <div class="why" style="${sync ? "color:#ffd166" : ""}">Unit now: ${now}${sync ? " ⚠ differs" : ""}</div></div>`;
     }).join("");
     const rows = units.flatMap(u => ((ul[u.id] || {}).rooms || []).map(r => ({ ...r, drv: ul[u.id].rooms.length > 1 && ul[u.id].driver === r.id })))
       .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name))
@@ -344,7 +349,8 @@ class RoomMapCard extends HTMLElement {
     const mon = monRooms.map(r => { const l = (d.live || {})[r.id] || {};
       const dup = monRooms.some(o => o !== r && o.name === r.name);  // disambiguate e.g. two baths
       return `<button data-room="${r.id}">${r.name}${dup ? ` · F${r.floor || 1}` : ""}<b>${l.temp == null ? "—" : l.temp.toFixed(0) + "°"}</b></button>`; }).join("");
-    return `<p class="rc-sub" style="margin:0">${running} of ${units.length} units running</p>
+    return `${d.enabled === false ? `<p class="rc-sub" style="margin:0 0 6px;color:#ffd166">DRY RUN · decisions are shown but no commands are sent</p>` : ""}
+      <p class="rc-sub" style="margin:0">${running} of ${units.length} units running</p>
       <div class="rc-units">${tiles}</div>
       <div class="rc-sect"><h4>Rooms · by priority</h4>
         <div class="rc-rows">${rows}</div>
