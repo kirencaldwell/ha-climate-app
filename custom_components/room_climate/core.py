@@ -2,8 +2,9 @@
 
 A *room* has a wifi sensor, a target (from its schedule) and a priority.
 A *unit* is a Mitsubishi climate entity serving one or more rooms. The
-controller decides each unit's hvac mode and setpoint from the rooms' sensors,
-not from the unit's own (poorly placed) sensor.
+controller picks one house-wide mode (the units share an outdoor compressor) from
+the rooms' current and predicted temperatures, then a setpoint per unit: its
+rooms' target when they need it, else a maintenance setpoint near the limits.
 """
 from __future__ import annotations
 
@@ -50,22 +51,39 @@ class Unit:
 
 @dataclass
 class Settings:
-    deadband: float = 1.0  # start heating/cooling when weighted error passes this
-    stop_margin: float = 0.0  # stop when error returns to within this of target
-    min_run_s: int = 300  # don't stop sooner than this after starting
-    min_off_s: int = 300  # don't restart sooner than this after stopping
-    mode_switch_s: int = 900  # off time required between heat <-> cool
+    # Comfort band around each room's target: inside it a room is "fine" and asks for nothing.
+    band_below: float = 1.0
+    band_above: float = 1.5
+    # House-wide hard limits: a room past these outweighs any priority.
+    floor: float = 65.0
+    ceiling: float = 72.0
+    hard_weight: float = 20.0
+    # Prediction: project each room's recent trend this far ahead.
+    horizon_s: int = 2700
+    history_s: int = 1800
+    max_predicted_change: float = 3.0
+    # House mode switching (heat <-> cool): only when the other side is clearly worse, and not too often.
+    min_mode_s: int = 1200
+    switch_ratio: float = 1.5
+    switch_margin: float = 0.5
+    min_cost: float = 0.05  # demand below this counts as comfortable
     max_offset: float = 6.0  # clamp on sensor-vs-unit-sensor compensation
     stale_s: int = 900  # reading older than this is ignored
     allow_cool: bool = True
     allow_heat: bool = True
+    deadband: float = 1.0  # legacy (card gauge width); kept so stored settings still load
+    stop_margin: float = 0.0  # legacy
+    min_run_s: int = 300  # legacy
+    min_off_s: int = 300  # legacy
+    mode_switch_s: int = 900  # legacy
 
 
 @dataclass
 class UnitState:
     mode: str = "off"  # "off" | "heat" | "cool"
     since: Optional[datetime] = None
-    last_run: Optional[str] = None  # last non-off mode, for heat<->cool lockout
+    last_run: Optional[str] = None  # last non-off mode
+    active: bool = False  # driving its rooms to target (vs idling at the maintenance setpoint)
 
 
 @dataclass
@@ -73,6 +91,14 @@ class Command:
     mode: str
     setpoint: Optional[float]
     reason: str = ""
+    active: bool = False
+
+
+@dataclass
+class HouseState:
+    """The one mode all units share (they have a common outdoor compressor)."""
+    mode: str = "off"  # "off" until something first needs conditioning, then "heat" | "cool"
+    since: Optional[datetime] = None
 
 
 def _hold_active(room: Room, now: datetime) -> bool:
@@ -118,65 +144,144 @@ def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]
     return num / den, rsum / den
 
 
-def decide(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float, datetime]],
-           unit_temp: Optional[float], state: UnitState, now: datetime,
-           settings: Settings = Settings()) -> Command:
-    """Return the command for one unit. Caller stores the new state if mode changed."""
+def predict(history: list[tuple[datetime, float]], now: datetime, settings: Settings = Settings()) -> Optional[float]:
+    """Project a room's temperature `horizon_s` ahead from a least-squares trend over the last `history_s`."""
+    pts = [(t, v) for t, v in history if (now - t).total_seconds() <= settings.history_s]
+    if len(pts) < 3 or (pts[-1][0] - pts[0][0]).total_seconds() < 600:
+        return None
+    xs = [(t - pts[0][0]).total_seconds() for t, _ in pts]
+    ys = [v for _, v in pts]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    if not den:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+    change = max(-settings.max_predicted_change, min(settings.max_predicted_change, slope * settings.horizon_s))
+    return ys[-1] + change
+
+
+def room_costs(room: Room, current: float, predicted: Optional[float], now: datetime,
+               settings: Settings = Settings()) -> tuple[float, float]:
+    """(cold, hot) discomfort for one room. A room counts as cold if it is cold now *or* will be, same for hot."""
+    t = target_temp(room, now)
+    w = max(MIN_PRIORITY, min(MAX_PRIORITY, room.priority))
+    lo = current if predicted is None else min(current, predicted)
+    hi = current if predicted is None else max(current, predicted)
+    cold = w * max(0.0, (t - settings.band_below) - lo) ** 2 + settings.hard_weight * max(0.0, settings.floor - lo) ** 2
+    hot = w * max(0.0, hi - (t + settings.band_above)) ** 2 + settings.hard_weight * max(0.0, hi - settings.ceiling) ** 2
+    return cold, hot
+
+
+def choose_mode(cold: float, hot: float, house: HouseState, now: datetime,
+                settings: Settings = Settings()) -> tuple[str, str]:
+    """Pick the house mode from total cold vs hot demand. Never goes back to off once running."""
+    can = {"heat": settings.allow_heat, "cool": settings.allow_cool}
+    if house.mode not in ("heat", "cool"):
+        want = "heat" if cold >= hot else "cool"
+        if max(cold, hot) < settings.min_cost or not can[want]:
+            return "off", "house comfortable"
+        return want, f"{'cold' if want == 'heat' else 'hot'} demand {max(cold, hot):.2f}"
+    mine, theirs = (cold, hot) if house.mode == "heat" else (hot, cold)
+    other = "cool" if house.mode == "heat" else "heat"
+    if can[other] and theirs >= settings.min_cost and theirs > mine * settings.switch_ratio + settings.switch_margin:
+        held = (now - house.since).total_seconds() if house.since else 1e9
+        if held < settings.min_mode_s:
+            return house.mode, f"{other} wanted ({theirs:.2f} vs {mine:.2f}); holding {house.mode} min time"
+        return other, f"switching: {'hot' if other == 'cool' else 'cold'} demand {theirs:.2f} vs {mine:.2f}"
+    return house.mode, f"{house.mode} (cold {cold:.2f}, hot {hot:.2f})"
+
+
+def unit_command(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float, datetime]],
+                 predicted: dict[str, Optional[float]], mode: str, unit_temp: Optional[float],
+                 state: UnitState, now: datetime, settings: Settings = Settings()) -> Command:
+    """Setpoint for one unit in the house mode: target when its rooms need it, else a maintenance setpoint
+    (floor in heat, ceiling in cool) so it stays in the shared mode but only works near the limits."""
+    if mode not in ("heat", "cool"):
+        return Command("off", None, "house comfortable")
     res = weighted_error(rooms, readings, now, settings)
+    maint = settings.floor if mode == "heat" else settings.ceiling
     if res is None:
-        # No trustworthy sensor: leave the unit alone rather than guess.
-        return Command(state.mode, None, "no fresh sensor readings; holding")
+        sp = max(unit.min_setpoint, min(unit.max_setpoint, round(maint)))
+        return Command(mode, float(sp), "no fresh sensors; maintenance")
     err, avg = res
-    target = avg - err  # weighted-average target
-    held = (now - state.since).total_seconds() if state.since else 1e9
-
-    mode = state.mode
-    reason = "in deadband"
+    target = avg - err
+    # Priority-weighted predicted temperature (falls back to the reading where there is no trend yet)
+    num = den = 0.0
+    for r in rooms:
+        got = readings.get(r.id)
+        if not got or (now - got[1]).total_seconds() > settings.stale_s:
+            continue
+        w = max(MIN_PRIORITY, min(MAX_PRIORITY, r.priority))
+        p = predicted.get(r.id)
+        num += w * (got[0] if p is None else p)
+        den += w
+    pavg = num / den
+    was = state.active and state.mode == mode
     if mode == "heat":
-        if err >= settings.stop_margin and held >= settings.min_run_s:
-            mode, reason = "off", "reached target"
-        else:
-            reason = "heating"
-    elif mode == "cool":
-        if err <= -settings.stop_margin and held >= settings.min_run_s:
-            mode, reason = "off", "reached target"
-        else:
-            reason = "cooling"
+        # Start below the band (now or predicted), keep going until the rooms reach target.
+        active = avg < target if was else min(avg, pavg) < target - settings.band_below
     else:
-        want = None
-        if err <= -settings.deadband and settings.allow_heat:
-            want = "heat"
-        elif err >= settings.deadband and settings.allow_cool:
-            want = "cool"
-        if want:
-            # Respect off-time lockouts: restart delay always, longer when flipping modes.
-            if held < settings.min_off_s:
-                reason = "waiting out min off time"
-            elif state.last_run not in (None, want) and held < settings.mode_switch_s:
-                reason = "waiting out heat/cool switch lockout"
-            else:
-                mode, reason = want, "heating" if want == "heat" else "cooling"
-
-    if mode == "off":
-        return Command("off", None, reason)
-
-    # Make the unit's own thermostat chase the *room* temperature: shift the setpoint by
-    # how far the unit's sensor disagrees with ours.
+        active = avg > target if was else max(avg, pavg) > target + settings.band_above
+    base = target if active else maint
     offset = 0.0
-    if unit_temp is not None:
+    if unit_temp is not None:  # make the unit's own thermostat chase the *room* temperature
         offset = max(-settings.max_offset, min(settings.max_offset, unit_temp - avg))
-    setpoint = target + offset
-    # Push past target a little so the unit actually runs until we say stop.
-    setpoint += 1.0 if mode == "heat" else -1.0
-    setpoint = max(unit.min_setpoint, min(unit.max_setpoint, round(setpoint)))
-    return Command(mode, float(setpoint), reason)
+    sp = max(unit.min_setpoint, min(unit.max_setpoint, round(base + offset)))
+    why = ("heating to target" if mode == "heat" else "cooling to target") if active else "maintenance (rooms in band)"
+    return Command(mode, float(sp), why, active)
+
+
+MANUAL_MODES = ("dry", "fan_only")
+
+
+def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple[float, datetime]],
+                 predicted: dict[str, Optional[float]], unit_temps: dict[str, Optional[float]],
+                 states: dict[str, UnitState], house: HouseState, now: datetime,
+                 settings: Settings = Settings(), manual: Optional[dict[str, str]] = None):
+    """One control tick for the whole house -> (commands by unit id, new HouseState, info dict).
+
+    All units always share one mode. A unit put into dry or fan by hand takes over: the controller holds
+    and keeps every other unit off so the compressor never gets conflicting modes.
+    """
+    manual = {u: m for u, m in (manual or {}).items() if m in MANUAL_MODES}
+    if manual:
+        m = next(iter(manual.values()))
+        cmds = {u.id: (Command(manual[u.id], None, f"manual {manual[u.id]}; holding") if u.id in manual
+                       else Command("off", None, f"blocked: manual {m} on another unit")) for u in units}
+        return cmds, house, {"mode": m, "reason": f"manual {m} in use", "cold": None, "hot": None}
+
+    cold = hot = 0.0
+    for r in rooms:
+        if r.unit is None:
+            continue  # monitor-only rooms don't steer the house
+        got = readings.get(r.id)
+        if not got or (now - got[1]).total_seconds() > settings.stale_s:
+            continue
+        # A room its unit is actively driving trends because of us and stops at target, so its trend says
+        # nothing about the opposite need (it would flip cool->heat as cooling works). Use the reading alone.
+        driven = states.get(r.unit, UnitState()).active
+        c, h = room_costs(r, got[0], None if driven else predicted.get(r.id), now, settings)
+        cold, hot = cold + c, hot + h
+    mode, reason = choose_mode(cold, hot, house, now, settings)
+    new_house = house if mode == house.mode else HouseState(mode, now)
+    cmds = {}
+    for u in units:
+        mine = [r for r in rooms if r.unit == u.id]
+        cmds[u.id] = unit_command(u, mine, readings, predicted, mode, unit_temps.get(u.id),
+                                  states.get(u.id, UnitState()), now, settings)
+    return cmds, new_house, {"mode": mode, "reason": reason, "cold": round(cold, 2), "hot": round(hot, 2)}
+
+
+def regime_changed(old: UnitState, new: UnitState) -> bool:
+    """True when a unit starts/stops driving its rooms or changes mode; trends from before no longer apply."""
+    return (old.mode, old.active) != (new.mode, new.active)
 
 
 def apply(state: UnitState, cmd: Command, now: datetime) -> UnitState:
     """Return the unit's state after issuing `cmd`."""
     if cmd.mode == state.mode:
-        return state
-    return UnitState(cmd.mode, now, cmd.mode if cmd.mode != "off" else state.last_run)
+        return UnitState(state.mode, state.since, state.last_run, cmd.active)
+    return UnitState(cmd.mode, now, cmd.mode if cmd.mode != "off" else state.last_run, cmd.active)
 
 
 def diagnose(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float, datetime]],

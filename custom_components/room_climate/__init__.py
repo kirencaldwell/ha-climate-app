@@ -54,6 +54,10 @@ class Manager:
         self.states: dict[str, core.UnitState] = {}
         self.last: dict[str, core.Command] = {}
         self.shadow: dict[str, core.UnitState] = {}  # decision state while disabled (dry run), kept apart from the real one
+        self.house = core.HouseState()
+        self.house_shadow = core.HouseState()
+        self.house_info: dict = {}
+        self.hist: dict[str, list] = {}  # room id -> [(time, temp F)] for trend prediction
         self._audit_seen: dict[str, tuple] = {}
         self._unsub = []
 
@@ -95,22 +99,47 @@ class Manager:
         now = dt_util.now()
         settings = core.Settings(**self.data.get("settings", {}))
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
-        for ud in self.data["units"]:
-            unit = _unit_from_dict(ud)
-            mine = [r for r in rooms if r.unit == unit.id]
-            readings = {}
-            for r in mine:
-                if r.sensor:
-                    val, ts = self._f(r.sensor)
-                    if val is not None:
-                        readings[r.id] = (val, ts)
-            state = states.setdefault(unit.id, core.UnitState())
-            cmd = core.decide(unit, mine, readings, self._unit_temp(unit.entity), state, now, settings)
-            self.last[unit.id] = cmd
+        units = [_unit_from_dict(ud) for ud in self.data["units"]]
+        readings, predicted = {}, {}
+        for r in rooms:
+            if not r.sensor:
+                continue
+            val, ts = self._f(r.sensor)
+            if val is None:
+                continue
+            readings[r.id] = (val, ts)
+            h = self.hist.setdefault(r.id, [])
+            h.append((now, val))
+            del h[:max(0, next((k for k, (t, _) in enumerate(h) if (now - t).total_seconds() <= settings.history_s), len(h)))]
+            predicted[r.id] = core.predict(h, now, settings)
+        manual = {}
+        for u in units:
+            cur = self.hass.states.get(u.entity)
+            if cur is not None and cur.state in core.MANUAL_MODES:
+                manual[u.id] = cur.state
+        house = self.house if enabled else self.house_shadow
+        cmds, new_house, info = core.control_step(
+            units, rooms, readings, predicted, {u.id: self._unit_temp(u.entity) for u in units},
+            states, house, now, settings, manual)
+        if new_house.mode != house.mode:
+            _LOGGER.info("%s house mode %s -> %s (%s)", "LIVE" if enabled else "DRY-RUN", house.mode, new_house.mode, info["reason"])
+        if enabled:
+            self.house = new_house
+        else:
+            self.house_shadow = new_house
+        self.house_info = {**info, "since": new_house.since.isoformat() if new_house.since else None,
+                           "predicted": {k: None if v is None else round(v, 1) for k, v in predicted.items()}}
+        for u in units:
+            cmd, state = cmds[u.id], states.setdefault(u.id, core.UnitState())
+            self.last[u.id] = cmd
             if enabled:
-                await self._send(unit, state, cmd)
-            self._audit(unit, cmd, enabled, now)
-            states[unit.id] = core.apply(state, cmd, now)
+                await self._send(u, state, cmd)
+            self._audit(u, cmd, enabled, now)
+            states[u.id] = core.apply(state, cmd, now)
+            if core.regime_changed(state, states[u.id]):
+                for r in rooms:
+                    if r.unit == u.id and self.hist.get(r.id):
+                        self.hist[r.id] = self.hist[r.id][-1:]
         self._publish(now, rooms)
 
     def _audit(self, unit: core.Unit, cmd: core.Command, enabled: bool, now):
@@ -178,13 +207,15 @@ class Manager:
         out["settings_effective"] = dataclasses.asdict(settings)
         out["units_live"] = {
             ud["id"]: core.diagnose(_unit_from_dict(ud), rooms, readings, self._unit_temp(ud["entity"]),
-                                    self.states.get(ud["id"], core.UnitState()), self.last.get(ud["id"]), now, settings)
+                                    (self.states if self.data.get("enabled", True) else self.shadow).get(ud["id"], core.UnitState()),
+                                    self.last.get(ud["id"]), now, settings)
             for ud in self.data["units"]}
         for ud in self.data["units"]:  # what each unit is really doing, next to what we would command
             cur = self.hass.states.get(ud["entity"])
             out["units_live"][ud["id"]]["actual"] = None if cur is None else {
                 "state": cur.state, "setpoint": cur.attributes.get("temperature"),
                 "action": cur.attributes.get("hvac_action"), "temp": self._unit_temp(ud["entity"])}
+        out["house"] = self.house_info
         out["live"] = {}
         for rd in self.data["rooms"]:
             r = _room_from_dict(rd)

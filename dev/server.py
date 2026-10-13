@@ -59,8 +59,7 @@ def snapshot():
     out["settings_effective"] = dataclasses.asdict(house.settings)
     out["units_live"] = {}
     for uid, unit in house.units.items():
-        cmd = core.decide(unit, list(house.rooms.values()), {k: v for k, v in readings.items() if house.rooms[k].unit == uid},
-                          house.unit_temp(uid), house.state[uid], house.now, house.settings)
+        cmd = house.cmd.get(uid)  # last command from the simulated control loop
         out["units_live"][uid] = core.diagnose(unit, list(house.rooms.values()), readings, house.unit_temp(uid),
                                                house.state[uid], cmd, house.now, house.settings)
     out["sim"] = {"time": house.now.strftime("%a %H:%M"), **state}

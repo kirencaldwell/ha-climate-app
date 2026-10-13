@@ -29,6 +29,8 @@ class SimHouse:
         self.now = start
         self.bias = unit_bias
         self.settings = core.Settings()
+        self.house = core.HouseState()
+        self.hist = {}
         self.log = []
 
     def unit_temp(self, uid):
@@ -55,11 +57,23 @@ class SimHouse:
                 self.control()
 
     def control(self):
-        for uid, unit in self.units.items():
-            rooms = [r for r in self.rooms.values() if r.unit == uid]
-            readings = {r.id: (self.sim[r.id].temp, self.now) for r in rooms}
-            cmd = core.decide(unit, rooms, readings, self.unit_temp(uid), self.state[uid], self.now, self.settings)
-            self.state[uid] = core.apply(self.state[uid], cmd, self.now)
+        rooms = list(self.rooms.values())
+        readings = {r.id: (self.sim[r.id].temp, self.now) for r in rooms}
+        predicted = {}
+        for r in rooms:
+            h = self.hist.setdefault(r.id, [])
+            h.append((self.now, self.sim[r.id].temp))
+            del h[:max(0, len(h) - 40)]
+            predicted[r.id] = core.predict(h, self.now, self.settings)
+        cmds, self.house, _ = core.control_step(
+            list(self.units.values()), rooms, readings, predicted, {u: self.unit_temp(u) for u in self.units},
+            self.state, self.house, self.now, self.settings)
+        for uid, cmd in cmds.items():
+            old, self.state[uid] = self.state[uid], core.apply(self.state[uid], cmd, self.now)
+            if core.regime_changed(old, self.state[uid]):
+                for r in rooms:
+                    if r.unit == uid and self.hist.get(r.id):
+                        self.hist[r.id] = self.hist[r.id][-1:]
             if cmd.setpoint is not None or cmd.mode != self.cmd[uid].mode:
                 self.cmd[uid] = cmd
             self.log.append((self.now, uid, cmd.mode))

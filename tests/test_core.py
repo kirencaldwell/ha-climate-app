@@ -46,47 +46,6 @@ def test_priority_weights_error():
     assert err < 0  # high-priority cold room dominates
 
 
-def test_stale_readings_ignored_and_unit_held():
-    r = Room("r", "R", "u")
-    old = {"r": (60.0, MON - timedelta(hours=2))}
-    cmd = core.decide(Unit("u", "climate.x"), [r], old, 70, UnitState("off"), MON)
-    assert cmd.setpoint is None and cmd.mode == "off"
-
-
-def test_heats_when_cold_and_compensates_unit_sensor():
-    r = Room("r", "R", "u", default_temp=68)
-    cmd = core.decide(Unit("u", "c"), [r], {"r": (66.0, MON)}, 69.0, UnitState("off"), MON)
-    assert cmd.mode == "heat"
-    assert cmd.setpoint == 68 + 3 + 1  # target + (unit - room) + push
-
-
-def test_deadband_stays_off():
-    r = Room("r", "R", "u", default_temp=68)
-    assert core.decide(Unit("u", "c"), [r], {"r": (67.5, MON)}, None, UnitState("off"), MON).mode == "off"
-
-
-def test_min_run_time_respected():
-    r = Room("r", "R", "u", default_temp=68)
-    st = UnitState("heat", MON - timedelta(seconds=60), "heat")
-    assert core.decide(Unit("u", "c"), [r], {"r": (69.0, MON)}, None, st, MON).mode == "heat"
-    st = UnitState("heat", MON - timedelta(seconds=600), "heat")
-    assert core.decide(Unit("u", "c"), [r], {"r": (69.0, MON)}, None, st, MON).mode == "off"
-
-
-def test_mode_switch_lockout():
-    r = Room("r", "R", "u", default_temp=68)
-    st = UnitState("off", MON - timedelta(seconds=400), "heat")
-    assert core.decide(Unit("u", "c"), [r], {"r": (70.0, MON)}, None, st, MON).mode == "off"
-    st = UnitState("off", MON - timedelta(seconds=1000), "heat")
-    assert core.decide(Unit("u", "c"), [r], {"r": (70.0, MON)}, None, st, MON).mode == "cool"
-
-
-def test_setpoint_clamped():
-    r = Room("r", "R", "u", default_temp=68)
-    u = Unit("u", "c", min_setpoint=61, max_setpoint=70)
-    assert core.decide(u, [r], {"r": (60.0, MON)}, 75.0, UnitState("off"), MON).setpoint == 70
-
-
 def _run(rooms, units, outdoor, hours=48):
     h = SimHouse(rooms, units, outdoor, MON.replace(hour=0))
     h.step(hours * 60)
@@ -148,3 +107,145 @@ def test_diagnose_skips_other_units_rooms():
     a = Room("a", "A", "u"); other = Room("x", "X", "other")
     d = _diag([a, other], {"a": (68.0, MON), "x": (60.0, MON)})
     assert [r["id"] for r in d["rooms"]] == ["a"]
+
+
+
+def test_sim_never_mixes_modes():
+    # One room cold, one hot: the two units must never run heat and cool at the same time.
+    rooms = [Room("cold", "Cold", "ah", default_temp=70), Room("hot", "Hot", "ms1", default_temp=66)]
+    h = SimHouse(rooms, [Unit("ah", "c1"), Unit("ms1", "c2")], lambda t: 50.0, MON.replace(hour=0))
+    h.sim["cold"].temp, h.sim["hot"].temp = 64, 72
+    for _ in range(12 * 60):
+        h.step(1)
+        modes = {s.mode for s in h.state.values()} - {"off"}
+        assert len(modes) <= 1, modes
+
+
+# --- house-wide controller: one shared mode, comfort band, hard limits, predicted temps ---
+
+def _house(bed=67.0, down=67.0, bed_pred=None, down_pred=None, house=None, at=MON, states=None):
+    rooms = [Room("bed", "Bedroom", "ms", priority=5, default_temp=67), Room("down", "Living", "ah", priority=2, default_temp=67)]
+    units = [Unit("ah", "c1"), Unit("ms", "c2")]
+    readings = {"bed": (bed, at), "down": (down, at)}
+    pred = {"bed": bed_pred, "down": down_pred}
+    return core.control_step(units, rooms, readings, pred, {}, states or {}, house or core.HouseState(), at)
+
+
+def test_costs_zero_inside_band_and_floor_beats_priority():
+    s = core.Settings()
+    hi_pri = Room("a", "A", "u", priority=5, default_temp=67)
+    lo_pri = Room("b", "B", "u", priority=1, default_temp=67)
+    assert core.room_costs(hi_pri, 66.2, None, MON) == (0.0, 0.0)  # inside 66-68.5
+    assert core.room_costs(hi_pri, 68.4, None, MON) == (0.0, 0.0)
+    slightly_cold = core.room_costs(hi_pri, 65.5, None, MON)[0]
+    freezing = core.room_costs(lo_pri, 60.0, None, MON)[0]
+    assert freezing > 10 * slightly_cold  # below the 65 floor wins regardless of priority
+    assert core.room_costs(lo_pri, 73.0, None, MON)[1] > core.room_costs(hi_pri, 69.5, None, MON)[1]
+
+
+def test_prediction_counts_before_it_happens():
+    r = Room("a", "A", "u", priority=5, default_temp=67)
+    assert core.room_costs(r, 68.0, None, MON)[1] == 0
+    assert core.room_costs(r, 68.0, 70.0, MON)[1] > 0  # heading over the band -> already hot demand
+
+
+def test_predict_trend():
+    hist = [(MON - timedelta(minutes=m), 66.0 + (20 - m) * 0.05) for m in range(20, -1, -2)]  # +0.05 F/min
+    p = core.predict(hist, MON)
+    assert abs(p - (67.0 + 0.05 * 45)) < 0.05
+    assert core.predict(hist[-2:], MON) is None  # too little history
+    flat = [(MON - timedelta(minutes=m), 66.0) for m in range(20, -1, -2)]
+    assert core.predict(flat, MON) == 66.0
+
+
+def test_cold_morning_heats_with_bedrooms_on_maintenance():
+    # Bedrooms slightly cool but inside the band; downstairs below the floor -> heat, bedroom unit idles at the floor.
+    cmds, house, info = _house(bed=66.3, down=59.5)
+    assert house.mode == "heat" and info["cold"] > 0
+    assert cmds["ah"].mode == "heat" and cmds["ah"].setpoint == 67 and cmds["ah"].active
+    assert cmds["ms"].mode == "heat" and cmds["ms"].setpoint == 65 and not cmds["ms"].active
+
+
+def test_all_units_always_share_the_house_mode():
+    for bed, down in [(66.3, 59.5), (70.0, 66.5), (64.0, 71.0), (67.0, 67.0)]:
+        cmds, house, _ = _house(bed=bed, down=down, house=core.HouseState("heat", MON - timedelta(hours=1)))
+        assert {c.mode for c in cmds.values()} == {house.mode}
+
+
+def test_afternoon_switches_to_cool_when_upstairs_heads_hot():
+    heating = core.HouseState("heat", MON - timedelta(hours=3))
+    cmds, house, info = _house(bed=68.3, bed_pred=70.5, down=66.5, house=heating)
+    assert house.mode == "cool" and "switching" in info["reason"]
+    assert cmds["ms"].mode == "cool" and cmds["ms"].active
+    assert cmds["ah"].mode == "cool" and cmds["ah"].setpoint == 72  # main floor is fine -> idles at the ceiling
+
+
+def test_own_cooling_trend_does_not_flip_back_to_heat():
+    cooling = core.HouseState("cool", MON - timedelta(hours=1))
+    st = {"ms": UnitState("cool", MON, "cool", active=True)}
+    _, house, _ = _house(bed=66.8, bed_pred=64.0, down=67.0, house=cooling, states=st)
+    assert house.mode == "cool"  # falling because we're cooling it; at target it idles
+    _, house, _ = _house(bed=66.8, bed_pred=64.0, down=67.0, house=cooling)  # not driven: a real cold trend
+    assert house.mode == "heat"
+
+
+def test_switch_waits_for_min_time_in_mode():
+    recent = core.HouseState("heat", MON - timedelta(minutes=10))
+    _, house, info = _house(bed=68.3, bed_pred=70.5, down=66.5, house=recent)
+    assert house.mode == "heat" and "holding" in info["reason"]
+
+
+def test_no_flip_for_mild_opposite_demand():
+    # Downstairs a bit cold, bedroom a touch warm: heat keeps going rather than flipping.
+    heating = core.HouseState("heat", MON - timedelta(hours=3))
+    _, house, _ = _house(bed=68.7, down=65.5, house=heating)
+    assert house.mode == "heat"
+
+
+def test_never_returns_to_off_once_running():
+    _, house, _ = _house(bed=67.0, down=67.0, house=core.HouseState("cool", MON - timedelta(hours=1)))
+    assert house.mode == "cool"
+    _, house, info = _house(bed=67.0, down=67.0)
+    assert house.mode == "off" and "comfortable" in info["reason"]
+
+
+def test_unit_keeps_heating_to_target_then_idles():
+    st = {"ah": UnitState("heat", MON, "heat", active=True)}
+    heating = core.HouseState("heat", MON - timedelta(hours=1))
+    cmds, _, _ = _house(down=66.6, house=heating, states=st)
+    assert cmds["ah"].active and cmds["ah"].setpoint == 67  # past the band edge but not yet at target
+    cmds, _, _ = _house(down=67.1, house=heating, states=st)
+    assert not cmds["ah"].active and cmds["ah"].setpoint == 65
+
+
+def test_manual_dry_or_fan_holds_and_blocks_others():
+    rooms = [Room("bed", "Bedroom", "ms", default_temp=67), Room("down", "Living", "ah", default_temp=67)]
+    units = [Unit("ah", "c1"), Unit("ms", "c2")]
+    for m in ("dry", "fan_only"):
+        cmds, house, info = core.control_step(units, rooms, {"down": (60.0, MON)}, {}, {}, {}, core.HouseState(), MON,
+                                              manual={"ms": m})
+        assert cmds["ms"].mode == m and cmds["ah"].mode == "off" and house.mode == "off" and m in info["reason"]
+
+
+def test_sim_spring_day_switches_without_flip_flopping():
+    # Cold night, warm sunny afternoon upstairs: heat in the morning, cool in the afternoon, no rapid flipping.
+    import math
+    rooms = [Room("bed", "Bedroom", "ms", priority=5, default_temp=67), Room("down", "Living", "ah", priority=2, default_temp=67)]
+    outdoor = lambda t: 50 + 22 * math.sin(math.pi * (t.hour + t.minute / 60 - 9) / 12)  # ~28 at 3am, ~72 at 3pm
+    h = SimHouse(rooms, [Unit("ah", "c1"), Unit("ms", "c2")], outdoor, MON.replace(hour=0))
+    h.sim["bed"].ua = h.sim["down"].ua = 0.004
+    modes, temps = [], []
+    for _ in range(24 * 60):
+        h.step(1)
+        # sun on the upstairs in the afternoon
+        if 12 <= h.now.hour < 18:
+            h.sim["bed"].temp += 0.02
+        modes.append(h.house.mode)
+        temps.append((h.sim["bed"].temp, h.sim["down"].temp))
+    switches = sum(1 for a, b in zip(modes, modes[1:]) if a != b and a != "off")
+    assert "heat" in modes and "cool" in modes
+    assert switches <= 2, switches
+    settled = temps[3 * 60:]
+    assert min(t for pair in settled for t in pair) > 63.5
+    assert max(t for pair in settled for t in pair) < 73.5
+

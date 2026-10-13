@@ -327,18 +327,24 @@ class RoomMapCard extends HTMLElement {
     const cls = dl => dl == null ? "" : dl > db ? "hot" : dl < -db ? "cold" : "ok";
     const gauge = v => `<div class="rc-g"><span class="band" style="width:${db / RANGE * 100}%"></span><span class="tick"></span>
       ${v == null ? "" : `<i class="${cls(v)}" style="left:${50 + 50 * clamp(v / RANGE, -1, 1)}%"></i>`}</div>`;
-    const running = units.filter(u => (ul[u.id] || {}).mode !== "off").length;
+    const isOn = u => { const a = (ul[u.id] || {}).actual; return a ? ["heat", "cool", "heat_cool", "auto", "dry", "fan_only"].includes(a.state) : (ul[u.id] || {}).mode !== "off"; };
+    const running = units.filter(isOn).length;
     const short = u => (u.name || u.id).replace(/ (air handler|minisplit)$/i, "");
     const tiles = units.map(u => {
       const x = ul[u.id]; if (!x) return "";
-      const big = x.mode === "off" ? "OFF" : `${x.mode === "heat" ? "▲" : "▼"} ${x.setpoint ?? "—"}°`;
-      const a = x.actual;
-      const now = !a ? "no data" : a.state === "unavailable" ? "unavailable"
-        : `${a.state}${a.setpoint != null ? ` · set ${Math.round(a.setpoint)}°` : ""}${a.action ? ` · ${a.action}` : ""}${a.temp != null ? ` · reads ${a.temp.toFixed(1)}°` : ""}`;
-      const sync = a && a.state !== "unavailable" && a.state !== x.mode;
-      return `<div class="rc-tile ${x.mode}"><div class="nm">${short(u)}</div><div class="big">${big}</div>${gauge(x.error)}
-        <div class="why">${x.reason || ""}</div>
-        <div class="why" style="${sync ? "color:#ffd166" : ""}">Unit now: ${now}${sync ? " ⚠ differs" : ""}</div></div>`;
+      const a = x.actual;  // what the unit is really doing; x.mode/x.setpoint are what Room Climate wants
+      const am = a ? (a.state === "heat_cool" ? "auto" : a.state) : x.mode;
+      const cls = am === "heat" ? "heat" : am === "cool" ? "cool" : "off";
+      const sp = a && a.setpoint != null ? Math.round(a.setpoint) : null;
+      const fmt = (m, t) => m === "off" ? "off" : `${m}${t != null ? ` ${t}°` : ""}`;
+      const actual = !a ? "no data" : a.state === "unavailable" ? "unavailable"
+        : [fmt(am, sp), a.action && a.action !== "off" && a.action !== "idle" ? a.action : null, a.temp != null ? `reads ${a.temp.toFixed(1)}°` : null].filter(Boolean).join(" · ");
+      const big = !a ? "—" : a.state === "unavailable" ? "N/A" : am === "off" ? "OFF" : `${am === "heat" ? "▲" : am === "cool" ? "▼" : "●"} ${sp ?? "—"}°`;
+      const wantTxt = fmt(x.mode, x.mode === "off" ? null : x.setpoint != null ? Math.round(x.setpoint) : null);
+      const same = a && a.state !== "unavailable" && x.mode === (am === "auto" ? "heat_cool" : am) && (x.mode === "off" || x.setpoint == null || sp === Math.round(x.setpoint));
+      return `<div class="rc-tile ${cls}"><div class="nm">${short(u)}</div><div class="big">${big}</div>${gauge(x.error)}
+        <div class="why"><b>Actual</b> · ${actual}</div>
+        <div class="why" style="${a && !same ? "color:#ffd166" : ""}"><b>${d.enabled === false ? "Wants (dry run)" : "Wants"}</b> · ${wantTxt}${x.reason ? ` · ${x.reason}` : ""}${a && !same ? " ⚠ differs" : a ? " ✓ in sync" : ""}</div></div>`;
     }).join("");
     const rows = units.flatMap(u => ((ul[u.id] || {}).rooms || []).map(r => ({ ...r, drv: ul[u.id].rooms.length > 1 && ul[u.id].driver === r.id })))
       .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name))
@@ -350,6 +356,7 @@ class RoomMapCard extends HTMLElement {
       const dup = monRooms.some(o => o !== r && o.name === r.name);  // disambiguate e.g. two baths
       return `<button data-room="${r.id}">${r.name}${dup ? ` · F${r.floor || 1}` : ""}<b>${l.temp == null ? "—" : l.temp.toFixed(0) + "°"}</b></button>`; }).join("");
     return `${d.enabled === false ? `<p class="rc-sub" style="margin:0 0 6px;color:#ffd166">DRY RUN · decisions are shown but no commands are sent</p>` : ""}
+      ${d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 4px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}</p>` : ""}
       <p class="rc-sub" style="margin:0">${running} of ${units.length} units running</p>
       <div class="rc-units">${tiles}</div>
       <div class="rc-sect"><h4>Rooms · by priority</h4>
