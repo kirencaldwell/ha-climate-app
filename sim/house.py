@@ -92,7 +92,7 @@ class SimHouse:
         self.prev_busy = busy
         cmds, self.house, _ = core.control_step(
             list(self.units.values()), rooms, readings, predicted, {u: self.unit_temp(u) for u in self.units},
-            self.state, self.house, self.now, self.settings, busy=busy)
+            self.state, self.house, self.now, self.settings, busy=busy, outdoor=self.outdoor(self.now))
         for uid, cmd in cmds.items():
             cmd, changed = core.stabilize(cmd, self.sent.get(uid), self.now, self.settings)
             if changed and cmd.setpoint is not None:

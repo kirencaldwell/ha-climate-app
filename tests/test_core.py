@@ -214,7 +214,7 @@ def test_manual_cooling_trend_does_not_trigger_heat():
 def test_idle_house_mode_says_so():
     cmds, house, info = _house(bed=67.0, down=67.0, house=core.HouseState("heat", MON - timedelta(hours=1)))
     assert house.mode == "heat" and "idle" in info["reason"]
-    assert "idling at 67" in cmds["ah"].reason
+    assert "idling" in cmds["ah"].reason and cmds["ah"].setpoint == 67
 
 
 def test_switch_waits_for_min_time_in_mode():
@@ -299,3 +299,76 @@ def test_sim_spring_day_switches_without_flip_flopping():
     assert min(t for pair in settled for t in pair) > 63.5
     assert max(t for pair in settled for t in pair) < 73.5
 
+
+
+# --- a schedule change can switch the house mode (the household keeps it cold, so a setback should cool) ---
+
+def _night(bed, bed_pred, at, house, down=66.5):
+    """Last night's setup: priority-5 primary bedroom set back 68 -> 65 at 21:30, main floor on a flat 67."""
+    bed_room = Room("bed", "Primary", "ms", priority=5, default_temp=67, schedule=[
+        ScheduleEntry(list(range(7)), "07:00", 68), ScheduleEntry(list(range(7)), "21:30", 65)])
+    rooms = [bed_room, Room("down", "Main", "ah", priority=2, default_temp=67)]
+    units = [Unit("ah", "c1"), Unit("ms", "c2")]
+    return core.control_step(units, rooms, {"bed": (bed, at), "down": (down, at)}, {"bed": bed_pred, "down": None},
+                             {}, {}, house, at)
+
+
+def test_evening_setback_switches_heat_to_cool_after_confirming():
+    at = MON.replace(hour=22, minute=36)
+    _, house, info = _night(67.5, None, at, core.HouseState("heat", at - timedelta(hours=2)))
+    assert info["hot"] > 0 and house.mode == "heat" and house.pending == "cool"
+    cmds, house, _ = _night(67.5, None, at + timedelta(minutes=11), house)
+    assert house.mode == "cool" and cmds["ms"].mode == "cool" and cmds["ms"].active
+
+
+# --- setpoints don't flicker between two whole degrees ---
+
+def test_rounding_jitter_holds_setpoint_and_reason():
+    s = core.Settings()
+    prev = (core.Command("cool", 68.0, "at target; idling"), MON - timedelta(minutes=2))
+    outs = [core.stabilize(core.Command("cool", float(round(raw)), "at target; idling", False, raw), prev, MON, s)
+            for raw in (67.45, 67.55, 67.45, 67.55)]
+    assert {o.setpoint for o, _ in outs} == {68.0}
+    assert {o.reason for o, _ in outs} == {"at target; idling"}  # no "(holding ...)" alternating in the log
+    assert not any(changed for _, changed in outs)
+
+
+def test_real_move_held_by_interval_says_so():
+    s = core.Settings()
+    prev = (core.Command("heat", 67.0, "x"), MON - timedelta(minutes=5))
+    out, changed = core.stabilize(core.Command("heat", 69.0, "heating toward 69°", True, 69.2), prev, MON, s)
+    assert out.setpoint == 67.0 and not changed and "recently changed" in out.reason
+
+
+def test_single_step_on_coarse_sensor_is_not_a_trend():
+    # 00:10 on 2026-10-14: the bedroom unit's sensor stepped 66.2 -> 67.1 once and the trend predicted 68.9.
+    hist = [(MON - timedelta(minutes=m), 66.2 if m > 10 else 67.1) for m in range(30, -1, -1)]
+    assert core.predict(hist, MON) == 67.1
+    flicker = [(MON - timedelta(minutes=m), 66.2 if m % 2 else 67.1) for m in range(30, -1, -1)]
+    assert core.predict(flicker, MON) == 67.1
+    rising = [(MON - timedelta(minutes=m), 66.2 + 0.9 * ((30 - m) // 10)) for m in range(30, -1, -1)]  # 3 steps up
+    assert core.predict(rising, MON) > 68.9
+
+
+# --- optional free cooling/heating from the weather (off by default) ---
+
+def test_free_cooling_is_off_by_default():
+    r = Room("bed", "Primary", "ms", priority=5, schedule=[ScheduleEntry(list(range(7)), "21:30", 65)])
+    assert core.room_costs(r, 67.1, None, MON.replace(hour=23), outdoor=55.0)[1] > 0  # a cold night still cools
+
+
+def test_free_cooling_when_enabled_lets_a_slightly_warm_room_coast():
+    s = Settings(free_delta=5.0)
+    at = MON.replace(hour=0, minute=35)
+    r = Room("bed", "Primary", "ms", priority=5, schedule=[ScheduleEntry(list(range(7)), "21:30", 65)])
+    assert core.room_costs(r, 67.1, None, at, s, outdoor=55.0)[1] == 0
+    assert core.room_costs(r, 67.1, None, at, s, outdoor=65.0)[1] > 0  # mild night: no free cooling
+    assert core.room_costs(r, 73.0, None, at, s, outdoor=40.0)[1] > 0  # ceiling always counts
+
+
+def test_free_heating_when_enabled_lets_a_slightly_cool_room_coast():
+    s = Settings(free_delta=5.0)
+    r = Room("r", "R", "u", priority=5, default_temp=70)
+    assert core.room_costs(r, 68.5, None, MON, s, outdoor=88.0)[0] == 0
+    assert core.room_costs(r, 68.5, None, MON, s, outdoor=70.0)[0] > 0
+    assert core.room_costs(r, 63.0, None, MON, s, outdoor=88.0)[0] > 0  # floor always counts

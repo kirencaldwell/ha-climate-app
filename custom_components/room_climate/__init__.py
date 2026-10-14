@@ -84,8 +84,9 @@ class Manager:
             cur = st.attributes.get("current_temperature")
             if cur is None:
                 return None, None
-            return (TemperatureConverter.convert(float(cur), self.hass.config.units.temperature_unit, F),
-                    getattr(st, "last_reported", None) or st.last_updated)
+            # A climate entity only reports when something changes, so a steady room would look stale after
+            # stale_s. If the unit drops off, the entity goes unavailable (handled above), so available = live.
+            return TemperatureConverter.convert(float(cur), self.hass.config.units.temperature_unit, F), dt_util.now()
         try:
             val = float(st.state)
         except ValueError:
@@ -94,6 +95,22 @@ class Manager:
         # last_reported moves on every report; last_updated only when the value changes, which would make a
         # steady sensor look stale.
         return TemperatureConverter.convert(val, unit, F), getattr(st, "last_reported", None) or st.last_updated
+
+    def _outdoor(self, settings: core.Settings):
+        """Outdoor temperature in F from `outdoor_entity`, else the first weather entity (None if unknown)."""
+        ent = settings.outdoor_entity or next(iter(sorted(self.hass.states.async_entity_ids("weather"))), None)
+        st = self.hass.states.get(ent) if ent else None
+        if st is None or st.state in ("unknown", "unavailable"):
+            return None
+        try:
+            if ent.startswith("weather."):
+                val = st.attributes.get("temperature")
+                unit = st.attributes.get("temperature_unit") or self.hass.config.units.temperature_unit
+            else:
+                val, unit = st.state, st.attributes.get("unit_of_measurement") or self.hass.config.units.temperature_unit
+            return None if val is None else TemperatureConverter.convert(float(val), unit, F)
+        except (TypeError, ValueError):
+            return None
 
     def _unit_temp(self, entity_id: str):
         st = self.hass.states.get(entity_id)
@@ -138,7 +155,7 @@ class Manager:
         house = self.house if enabled else self.house_shadow
         cmds, new_house, info = core.control_step(
             units, rooms, readings, predicted, {u.id: self._unit_temp(u.entity) for u in units},
-            states, house, now, settings, manual, busy)
+            states, house, now, settings, manual, busy, self._outdoor(settings))
         if new_house.mode != house.mode:
             _LOGGER.info("%s house mode %s -> %s (%s)", "LIVE" if enabled else "DRY-RUN", house.mode, new_house.mode, info["reason"])
         if enabled:
@@ -263,6 +280,7 @@ class Manager:
                  action=cur.attributes.get("hvac_action") if cur else None)
         text(f"sensor.{DOMAIN}_house_mode", "House mode", info.get("mode") or "off", "mdi:home-thermometer",
              reason=info.get("reason"), dry_run=not self.data.get("enabled", True))
+        temp(f"sensor.{DOMAIN}_outdoor", "Outdoor (as seen by controller)", info.get("outdoor"), "mdi:home-export-outline")
         for k in ("cold", "hot"):
             self.hass.states.async_set(f"sensor.{DOMAIN}_house_{k}_demand", info.get(k) or 0.0, {
                 "friendly_name": f"House {k} demand", "state_class": "measurement",

@@ -76,6 +76,11 @@ class Settings:
     # Reading older than this is ignored. Long, because Bluetooth sensors (e.g. Govee) only update when the value
     # changes; a sensor that really drops out goes unavailable instead.
     stale_s: int = 7200
+    # Free cooling/heating (off by default): when it's at least this much colder outside than a room, a room merely
+    # above its comfort band is left to cool off on its own, so only the hard ceiling asks for cooling (mirrored for
+    # heat on hot days). Off because a schedule drop to a cold target should actively cool, not wait for the weather.
+    free_delta: Optional[float] = None
+    outdoor_entity: str = ""  # weather.* or sensor.*; empty = the first weather entity
     allow_cool: bool = True
     allow_heat: bool = True
     deadband: float = 1.0  # legacy (card gauge width); kept so stored settings still load
@@ -99,6 +104,7 @@ class Command:
     setpoint: Optional[float]
     reason: str = ""
     active: bool = False
+    raw: Optional[float] = None  # setpoint before rounding, so stabilize can tell real moves from rounding jitter
 
 
 @dataclass
@@ -168,6 +174,10 @@ def predict(history: list[tuple[datetime, float]], now: datetime, settings: Sett
         return None
     xs = [(t - pts[0][0]).total_seconds() for t, _ in pts]
     ys = [v for _, v in pts]
+    if len({round(v, 2) for v in ys}) < 3:
+        # One step on a coarse sensor (a Mitsubishi unit reports in 0.5 C = 0.9 F steps) or a reading flickering
+        # between two values is not a trend; extrapolating it predicts a phantom 2 F swing.
+        return ys[-1]
     mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
     den = sum((x - mx) ** 2 for x in xs)
     if not den:
@@ -178,14 +188,22 @@ def predict(history: list[tuple[datetime, float]], now: datetime, settings: Sett
 
 
 def room_costs(room: Room, current: float, predicted: Optional[float], now: datetime,
-               settings: Settings = Settings()) -> tuple[float, float]:
-    """(cold, hot) discomfort for one room. A room counts as cold if it is cold now *or* will be, same for hot."""
+               settings: Settings = Settings(), outdoor: Optional[float] = None) -> tuple[float, float]:
+    """(cold, hot) discomfort for one room. A room counts as cold if it is cold now *or* will be, same for hot.
+
+    With `free_delta` set and an outdoor temperature, comfort demand the weather will settle by itself is dropped;
+    the hard floor/ceiling always count."""
     t = target_temp(room, now)
     w = max(MIN_PRIORITY, min(MAX_PRIORITY, room.priority))
     lo = current if predicted is None else min(current, predicted)
     hi = current if predicted is None else max(current, predicted)
-    cold = w * max(0.0, (t - settings.band_below) - lo) ** 2 + settings.hard_weight * max(0.0, settings.floor - lo) ** 2
-    hot = w * max(0.0, hi - (t + settings.band_above)) ** 2 + settings.hard_weight * max(0.0, hi - settings.ceiling) ** 2
+    free = settings.free_delta is not None and outdoor is not None
+    free_cool = free and outdoor <= current - settings.free_delta
+    free_heat = free and outdoor >= current + settings.free_delta
+    cold = (0.0 if free_heat else w * max(0.0, (t - settings.band_below) - lo) ** 2) \
+        + settings.hard_weight * max(0.0, settings.floor - lo) ** 2
+    hot = (0.0 if free_cool else w * max(0.0, hi - (t + settings.band_above)) ** 2) \
+        + settings.hard_weight * max(0.0, hi - settings.ceiling) ** 2
     return cold, hot
 
 
@@ -242,27 +260,32 @@ def unit_command(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float,
     offset = 0.0
     if unit_temp is not None:  # make the unit's own thermostat chase the *room* temperature
         offset = max(-settings.max_offset, min(settings.max_offset, unit_temp - avg))
-    sp = max(unit.min_setpoint, min(unit.max_setpoint, round(target + offset)))
+    raw = max(unit.min_setpoint, min(unit.max_setpoint, target + offset))
     needs = avg < target if mode == "heat" else avg > target
-    why = (("heating" if mode == "heat" else "cooling") + f" toward {target:.1f}°") if needs else f"at target; idling at {sp}°"
-    return Command(mode, float(sp), why, needs)
+    # Whole degrees in the reason: it is logged whenever it changes, and tenths tick over through every ramp.
+    why = (("heating" if mode == "heat" else "cooling") + f" toward {target:.0f}°") if needs else "at target; idling"
+    return Command(mode, float(round(raw)), why, needs, raw)
 
 
 def stabilize(cmd: Command, prev: Optional[tuple[Command, datetime]], now: datetime,
               settings: Settings = Settings()) -> tuple[Command, bool]:
     """Hold the previous setpoint unless the new one differs by at least `setpoint_min_change` and the last change
-    was at least `setpoint_min_interval_s` ago. Mode changes always go through. Returns (command, changed)."""
+    was at least `setpoint_min_interval_s` ago. Mode changes always go through. Returns (command, changed).
+
+    "Small" compares the unrounded setpoint, so a value hovering near x.5 doesn't alternate between two whole
+    degrees. A small hold is the normal steady state and isn't annotated; only a real move held back by the
+    interval says so."""
     if prev is None or cmd.setpoint is None:
         return cmd, True
     pcmd, at = prev
     if pcmd.mode != cmd.mode or pcmd.setpoint is None:
         return cmd, True
-    small = abs(cmd.setpoint - pcmd.setpoint) < settings.setpoint_min_change
-    soon = (now - at).total_seconds() < settings.setpoint_min_interval_s
-    if small or soon:
-        why = "small change" if small else "recently changed"
-        held = Command(cmd.mode, pcmd.setpoint, f"{cmd.reason} (holding {pcmd.setpoint:g}°: {why})" if cmd.setpoint != pcmd.setpoint else cmd.reason, cmd.active)
-        return held, False
+    want = cmd.raw if cmd.raw is not None else cmd.setpoint
+    if abs(want - pcmd.setpoint) < settings.setpoint_min_change:
+        return Command(cmd.mode, pcmd.setpoint, cmd.reason, cmd.active, cmd.raw), False
+    if (now - at).total_seconds() < settings.setpoint_min_interval_s:
+        return Command(cmd.mode, pcmd.setpoint, f"{cmd.reason} (holding {pcmd.setpoint:g}°: recently changed)",
+                       cmd.active, cmd.raw), False
     return cmd, True
 
 
@@ -273,7 +296,7 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
                  predicted: dict[str, Optional[float]], unit_temps: dict[str, Optional[float]],
                  states: dict[str, UnitState], house: HouseState, now: datetime,
                  settings: Settings = Settings(), manual: Optional[dict[str, str]] = None,
-                 busy: Optional[set[str]] = None):
+                 busy: Optional[set[str]] = None, outdoor: Optional[float] = None):
     """One control tick for the whole house -> (commands by unit id, new HouseState, info dict).
 
     All units always share one mode. A unit put into dry or fan by hand takes over: the controller holds
@@ -299,7 +322,7 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         # its setpoint, so the trend says nothing about the opposite need (it would flip cool->heat as cooling
         # works). Use the reading alone.
         driven = states.get(r.unit, UnitState()).active or r.unit in (busy or ())
-        c, h = room_costs(r, got[0], None if driven else predicted.get(r.id), now, settings)
+        c, h = room_costs(r, got[0], None if driven else predicted.get(r.id), now, settings, outdoor)
         cold, hot = cold + c, hot + h
         per_room[r.id] = (round(c, 2), round(h, 2))
     new_house, reason = choose_mode(cold, hot, house, now, settings)
@@ -309,7 +332,8 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         mine = [r for r in rooms if r.unit == u.id]
         cmds[u.id] = unit_command(u, mine, readings, predicted, mode, unit_temps.get(u.id),
                                   states.get(u.id, UnitState()), now, settings)
-    return cmds, new_house, {"mode": mode, "reason": reason, "cold": round(cold, 2), "hot": round(hot, 2), "rooms": per_room}
+    return cmds, new_house, {"mode": mode, "reason": reason, "cold": round(cold, 2), "hot": round(hot, 2), "rooms": per_room,
+                             "outdoor": outdoor}
 
 
 def regime_changed(old: UnitState, new: UnitState) -> bool:

@@ -565,5 +565,8 @@ class RoomMapCard extends HTMLElement {
   const f = RoomMapCard.prototype[m];
   if (typeof f === "function") RoomMapCard.prototype[m] = function (...a) { try { return f.apply(this, a); } catch (e) { this._fail(m, e); } };
 });
-customElements.define("room-map-card", RoomMapCard);
-window.customCards = (window.customCards || []).concat([{ type: "room-map-card", name: "Room map card" }]);
+// The load probe may re-import this file if the first load stalled, so registering twice must be harmless.
+if (!customElements.get("room-map-card")) {
+  customElements.define("room-map-card", RoomMapCard);
+  window.customCards = (window.customCards || []).concat([{ type: "room-map-card", name: "Room map card" }]);
+}
