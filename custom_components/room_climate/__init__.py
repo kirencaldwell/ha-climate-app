@@ -147,6 +147,7 @@ class Manager:
             self.house_shadow = new_house
         self.house_info = {**info, "since": new_house.since.isoformat() if new_house.since else None,
                            "predicted": {k: None if v is None else round(v, 1) for k, v in predicted.items()}}
+        self._tick_debug = (readings, predicted, info, settings)
         sent = self.sent[enabled]
         for u in units:
             # Keep setpoints steady (inverter efficiency): small or too-frequent changes hold the previous one.
@@ -214,6 +215,58 @@ class Manager:
                 "friendly_name": r.name, "temperature": val, "target": core.target_temp(r, now),
                 "priority": r.priority, "unit": r.unit,
                 "action": self.last.get(r.unit, core.Command("off", None)).mode})
+        self._publish_debug(now, rooms)
+
+    def _publish_debug(self, now, rooms):
+        """Controller internals as sensor.room_climate_* entities so the recorder keeps their history for graphs."""
+        if not getattr(self, "_tick_debug", None):
+            return
+        readings, predicted, info, settings = self._tick_debug
+        unit_f = TemperatureConverter.convert  # internal values are F; HA here is F as well
+        disp = self.hass.config.units.temperature_unit
+
+        def temp(entity, name, value, icon="mdi:thermometer"):
+            self.hass.states.async_set(entity, "unknown" if value is None else round(unit_f(value, F, disp), 2), {
+                "friendly_name": name, "unit_of_measurement": disp, "device_class": "temperature",
+                "state_class": "measurement", "icon": icon})
+
+        def text(entity, name, value, icon, **attrs):
+            self.hass.states.async_set(entity, value, {"friendly_name": name, "icon": icon, **attrs})
+
+        for r in rooms:
+            if r.unit is None or not r.sensor:
+                continue
+            p = f"sensor.{DOMAIN}_{r.id}"
+            t = core.target_temp(r, now)
+            got = readings.get(r.id)
+            temp(f"{p}_temperature", f"{r.name} temperature", got[0] if got else None)
+            temp(f"{p}_target", f"{r.name} target", t, "mdi:target")
+            temp(f"{p}_band_low", f"{r.name} band low", t - settings.band_below, "mdi:arrow-collapse-down")
+            temp(f"{p}_band_high", f"{r.name} band high", t + settings.band_above, "mdi:arrow-collapse-up")
+            temp(f"{p}_predicted", f"{r.name} predicted ({settings.horizon_s // 60} min)", predicted.get(r.id), "mdi:chart-line")
+            c, h = info.get("rooms", {}).get(r.id, (0.0, 0.0))
+            self.hass.states.async_set(f"{p}_demand", round(h - c, 2), {
+                "friendly_name": f"{r.name} demand (hot + / cold -)", "state_class": "measurement",
+                "icon": "mdi:scale-balance", "cold": c, "hot": h})
+        for ud in self.data["units"]:
+            cmd = self.last.get(ud["id"])
+            p = f"sensor.{DOMAIN}_{ud['id']}"
+            name = ud.get("name") or ud["id"]
+            temp(f"{p}_commanded_setpoint", f"{name} commanded setpoint", cmd.setpoint if cmd else None, "mdi:thermostat")
+            text(f"{p}_wanted_mode", f"{name} wanted mode", cmd.mode if cmd else "off", "mdi:hvac",
+                 reason=cmd.reason if cmd else "")
+            cur = self.hass.states.get(ud["entity"])
+            temp(f"{p}_actual_setpoint", f"{name} actual setpoint",
+                 None if cur is None or cur.attributes.get("temperature") is None else
+                 unit_f(float(cur.attributes["temperature"]), disp, F), "mdi:thermostat-box")
+            text(f"{p}_actual_mode", f"{name} actual mode", cur.state if cur else "unavailable", "mdi:hvac",
+                 action=cur.attributes.get("hvac_action") if cur else None)
+        text(f"sensor.{DOMAIN}_house_mode", "House mode", info.get("mode") or "off", "mdi:home-thermometer",
+             reason=info.get("reason"), dry_run=not self.data.get("enabled", True))
+        for k in ("cold", "hot"):
+            self.hass.states.async_set(f"sensor.{DOMAIN}_house_{k}_demand", info.get(k) or 0.0, {
+                "friendly_name": f"House {k} demand", "state_class": "measurement",
+                "icon": "mdi:snowflake-thermometer" if k == "cold" else "mdi:sun-thermometer"})
 
     def snapshot(self) -> dict:
         now = dt_util.now()

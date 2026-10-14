@@ -285,9 +285,10 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         m = next(iter(manual.values()))
         cmds = {u.id: (Command(manual[u.id], None, f"manual {manual[u.id]}; holding") if u.id in manual
                        else Command("off", None, f"blocked: manual {m} on another unit")) for u in units}
-        return cmds, house, {"mode": m, "reason": f"manual {m} in use", "cold": None, "hot": None}
+        return cmds, house, {"mode": m, "reason": f"manual {m} in use", "cold": None, "hot": None, "rooms": {}}
 
     cold = hot = 0.0
+    per_room: dict[str, tuple[float, float]] = {}
     for r in rooms:
         if r.unit is None:
             continue  # monitor-only rooms don't steer the house
@@ -300,6 +301,7 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         driven = states.get(r.unit, UnitState()).active or r.unit in (busy or ())
         c, h = room_costs(r, got[0], None if driven else predicted.get(r.id), now, settings)
         cold, hot = cold + c, hot + h
+        per_room[r.id] = (round(c, 2), round(h, 2))
     new_house, reason = choose_mode(cold, hot, house, now, settings)
     mode = new_house.mode
     cmds = {}
@@ -307,7 +309,7 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         mine = [r for r in rooms if r.unit == u.id]
         cmds[u.id] = unit_command(u, mine, readings, predicted, mode, unit_temps.get(u.id),
                                   states.get(u.id, UnitState()), now, settings)
-    return cmds, new_house, {"mode": mode, "reason": reason, "cold": round(cold, 2), "hot": round(hot, 2)}
+    return cmds, new_house, {"mode": mode, "reason": reason, "cold": round(cold, 2), "hot": round(hot, 2), "rooms": per_room}
 
 
 def regime_changed(old: UnitState, new: UnitState) -> bool:
