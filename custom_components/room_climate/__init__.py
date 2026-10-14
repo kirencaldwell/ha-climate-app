@@ -77,6 +77,13 @@ class Manager:
         st = self.hass.states.get(entity_id)
         if st is None or st.state in ("unknown", "unavailable"):
             return None, None
+        if entity_id.startswith("climate."):
+            # A room with no separate sensor can use its unit's own reading (the climate's current temperature).
+            cur = st.attributes.get("current_temperature")
+            if cur is None:
+                return None, None
+            return (TemperatureConverter.convert(float(cur), self.hass.config.units.temperature_unit, F),
+                    getattr(st, "last_reported", None) or st.last_updated)
         try:
             val = float(st.state)
         except ValueError:
