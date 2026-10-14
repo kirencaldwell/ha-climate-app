@@ -58,6 +58,8 @@ class Manager:
         self.house_shadow = core.HouseState()
         self.house_info: dict = {}
         self.hist: dict[str, list] = {}  # room id -> [(time, temp F)] for trend prediction
+        self.prev_busy: set = set()
+        self.sent: dict[bool, dict] = {True: {}, False: {}}  # live/dry-run -> unit id -> (last setpoint command, when)
         self._audit_seen: dict[str, tuple] = {}
         self._unsub = []
 
@@ -126,6 +128,13 @@ class Manager:
                 manual[u.id] = cur.state
             if cur is not None and cur.attributes.get("hvac_action") in ("heating", "cooling"):
                 busy.add(u.id)
+        for u in units:  # a compressor that started/stopped on its own makes the earlier trend misleading
+            if (u.id in busy) != (u.id in self.prev_busy):
+                for r in rooms:
+                    if r.unit == u.id and self.hist.get(r.id):
+                        self.hist[r.id] = self.hist[r.id][-1:]
+                        predicted[r.id] = None
+        self.prev_busy = busy
         house = self.house if enabled else self.house_shadow
         cmds, new_house, info = core.control_step(
             units, rooms, readings, predicted, {u.id: self._unit_temp(u.entity) for u in units},
@@ -138,8 +147,13 @@ class Manager:
             self.house_shadow = new_house
         self.house_info = {**info, "since": new_house.since.isoformat() if new_house.since else None,
                            "predicted": {k: None if v is None else round(v, 1) for k, v in predicted.items()}}
+        sent = self.sent[enabled]
         for u in units:
-            cmd, state = cmds[u.id], states.setdefault(u.id, core.UnitState())
+            # Keep setpoints steady (inverter efficiency): small or too-frequent changes hold the previous one.
+            cmd, changed = core.stabilize(cmds[u.id], sent.get(u.id), now, settings)
+            if changed and cmd.setpoint is not None:
+                sent[u.id] = (cmd, now)
+            state = states.setdefault(u.id, core.UnitState())
             self.last[u.id] = cmd
             if enabled:
                 await self._send(u, state, cmd)

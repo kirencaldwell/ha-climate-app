@@ -158,12 +158,13 @@ def test_predict_trend():
     assert core.predict(flat, MON) == 66.0
 
 
-def test_cold_morning_heats_with_bedrooms_on_maintenance():
-    # Bedrooms slightly cool but inside the band; downstairs below the floor -> heat, bedroom unit idles at the floor.
+def test_cold_morning_heats_with_every_unit_steady_at_target():
+    # Downstairs below the floor -> heat. Every unit holds the 67 target; the inverters slow down on their own
+    # as rooms get there, instead of flipping between run/idle setpoints.
     cmds, house, info = _house(bed=66.3, down=59.5)
     assert house.mode == "heat" and info["cold"] > 0
     assert cmds["ah"].mode == "heat" and cmds["ah"].setpoint == 67 and cmds["ah"].active
-    assert cmds["ms"].mode == "heat" and cmds["ms"].setpoint == 65 and not cmds["ms"].active
+    assert cmds["ms"].mode == "heat" and cmds["ms"].setpoint == 67
 
 
 def test_all_units_always_share_the_house_mode():
@@ -172,21 +173,34 @@ def test_all_units_always_share_the_house_mode():
         assert {c.mode for c in cmds.values()} == {house.mode}
 
 
-def test_afternoon_switches_to_cool_when_upstairs_heads_hot():
+def test_afternoon_switches_to_cool_after_confirming():
     heating = core.HouseState("heat", MON - timedelta(hours=3))
-    cmds, house, info = _house(bed=68.3, bed_pred=70.5, down=66.5, house=heating)
+    _, house, info = _house(bed=68.3, bed_pred=70.5, down=66.5, house=heating)
+    assert house.mode == "heat" and house.pending == "cool" and "confirming" in info["reason"]
+    later = MON + timedelta(minutes=11)
+    cmds, house, info = _house(bed=68.3, bed_pred=70.5, down=66.5, house=house, at=later)
     assert house.mode == "cool" and "switching" in info["reason"]
     assert cmds["ms"].mode == "cool" and cmds["ms"].active
-    assert cmds["ah"].mode == "cool" and cmds["ah"].setpoint == 72  # main floor is fine -> idles at the ceiling
+    assert cmds["ah"].mode == "cool" and cmds["ah"].setpoint == 67 and not cmds["ah"].active  # main floor fine
+
+
+def test_blip_does_not_switch():
+    heating = core.HouseState("heat", MON - timedelta(hours=3))
+    _, house, _ = _house(bed=68.3, bed_pred=70.5, down=66.5, house=heating)
+    assert house.pending == "cool"
+    _, house, _ = _house(bed=67.5, down=66.5, house=house, at=MON + timedelta(minutes=5))  # demand went away
+    assert house.mode == "heat" and house.pending is None
+    _, house, _ = _house(bed=68.3, bed_pred=70.5, down=66.5, house=house, at=MON + timedelta(minutes=12))
+    assert house.mode == "heat" and house.pending == "cool"  # confirmation starts over
 
 
 def test_own_cooling_trend_does_not_flip_back_to_heat():
     cooling = core.HouseState("cool", MON - timedelta(hours=1))
     st = {"ms": UnitState("cool", MON, "cool", active=True)}
     _, house, _ = _house(bed=66.8, bed_pred=64.0, down=67.0, house=cooling, states=st)
-    assert house.mode == "cool"  # falling because we're cooling it; at target it idles
+    assert house.mode == "cool" and house.pending is None  # falling because we're cooling it
     _, house, _ = _house(bed=66.8, bed_pred=64.0, down=67.0, house=cooling)  # not driven: a real cold trend
-    assert house.mode == "heat"
+    assert house.pending == "heat"
 
 
 def test_manual_cooling_trend_does_not_trigger_heat():
@@ -200,7 +214,7 @@ def test_manual_cooling_trend_does_not_trigger_heat():
 def test_idle_house_mode_says_so():
     cmds, house, info = _house(bed=67.0, down=67.0, house=core.HouseState("heat", MON - timedelta(hours=1)))
     assert house.mode == "heat" and "idle" in info["reason"]
-    assert "idle at 65" in cmds["ah"].reason
+    assert "idling at 67" in cmds["ah"].reason
 
 
 def test_switch_waits_for_min_time_in_mode():
@@ -223,13 +237,34 @@ def test_never_returns_to_off_once_running():
     assert house.mode == "off" and "comfortable" in info["reason"]
 
 
-def test_unit_keeps_heating_to_target_then_idles():
-    st = {"ah": UnitState("heat", MON, "heat", active=True)}
+def test_setpoint_stays_put_as_room_reaches_target():
     heating = core.HouseState("heat", MON - timedelta(hours=1))
-    cmds, _, _ = _house(down=66.6, house=heating, states=st)
-    assert cmds["ah"].active and cmds["ah"].setpoint == 67  # past the band edge but not yet at target
-    cmds, _, _ = _house(down=67.1, house=heating, states=st)
-    assert not cmds["ah"].active and cmds["ah"].setpoint == 65
+    a, _, _ = _house(down=66.6, house=heating)
+    b, _, _ = _house(down=67.4, house=heating)
+    assert a["ah"].setpoint == b["ah"].setpoint == 67  # no run/idle setpoint flip
+    assert a["ah"].active and not b["ah"].active
+
+
+def test_stabilize_holds_small_and_frequent_setpoint_changes():
+    s = core.Settings()
+    prev = (core.Command("heat", 67.0, "x"), MON - timedelta(minutes=30))
+    held, changed = core.stabilize(core.Command("heat", 67.4, "y"), prev, MON, s)
+    assert held.setpoint == 67.0 and not changed  # under 1 F
+    recent = (core.Command("heat", 67.0, "x"), MON - timedelta(minutes=5))
+    held, changed = core.stabilize(core.Command("heat", 69.0, "y"), recent, MON, s)
+    assert held.setpoint == 67.0 and not changed  # changed 5 min ago
+    out, changed = core.stabilize(core.Command("heat", 69.0, "y"), prev, MON, s)
+    assert out.setpoint == 69.0 and changed
+    out, changed = core.stabilize(core.Command("cool", 72.0, "y"), recent, MON, s)
+    assert out.mode == "cool" and changed  # mode changes always go through
+
+
+def test_schedule_glides_into_changes():
+    r = Room("r", "R", "u", schedule=[ScheduleEntry(list(range(7)), "07:00", 69), ScheduleEntry(list(range(7)), "22:00", 65)])
+    assert core.scheduled_temp(r, MON.replace(hour=5, minute=59)) == 65
+    assert core.scheduled_temp(r, MON.replace(hour=6, minute=30)) == 67  # halfway through the hour before 07:00
+    assert core.scheduled_temp(r, MON.replace(hour=7)) == 69
+    assert core.scheduled_temp(r, MON.replace(hour=21, minute=45)) == 66  # setback eases in too
 
 
 def test_manual_dry_or_fan_holds_and_blocks_others():
@@ -259,6 +294,7 @@ def test_sim_spring_day_switches_without_flip_flopping():
     switches = sum(1 for a, b in zip(modes, modes[1:]) if a != b and a != "off")
     assert "heat" in modes and "cool" in modes
     assert switches <= 2, switches
+    assert h.changes <= 24, h.changes  # setpoint/mode commands across both units in a day: steady, not chattering
     settled = temps[3 * 60:]
     assert min(t for pair in settled for t in pair) > 63.5
     assert max(t for pair in settled for t in pair) < 73.5

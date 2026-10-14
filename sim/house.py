@@ -31,6 +31,11 @@ class SimHouse:
         self.settings = core.Settings()
         self.house = core.HouseState()
         self.hist = {}
+        self.sent = {}
+        self.changes = 0  # setpoint/mode commands that actually changed something
+        self.running = {}
+        self.prev_busy = set()
+        self.starts = 0  # compressor starts across all units
         self.log = []
 
     def unit_temp(self, uid):
@@ -43,18 +48,30 @@ class SimHouse:
             out = self.outdoor(self.now)
             for uid, unit in self.units.items():
                 rooms = [r for r in self.rooms.values() if r.unit == uid]
-                power = 0.0
-                c = self.cmd[uid]
-                ut = self.unit_temp(uid)
-                if c.mode == "heat" and ut < c.setpoint:
-                    power = 1.0
-                elif c.mode == "cool" and ut > c.setpoint:
-                    power = -1.0
+                power = self._inverter(uid, self.cmd[uid], self.unit_temp(uid))
                 for r in rooms:
                     s = self.sim[r.id]
                     s.temp += s.ua * (out - s.temp) + power * 0.35 / len(rooms) * s.cap_gain
             if self.now.minute % 1 == 0:
                 self.control()
+
+    def _inverter(self, uid, c, ut):
+        """Inverter compressor: capacity follows the error down to a minimum; below that it has to stop, and it
+        restarts only once the room drifts past the setpoint again. Counts starts (the costly part)."""
+        if c.mode not in ("heat", "cool") or c.setpoint is None:
+            self.running[uid] = False
+            return 0.0
+        err = (c.setpoint - ut) if c.mode == "heat" else (ut - c.setpoint)  # >0 = needs work
+        if self.running.get(uid):
+            if err < -1.0:  # overshot even at minimum capacity
+                self.running[uid] = False
+        elif err > 0.5:
+            self.running[uid] = True
+            self.starts += 1
+        if not self.running.get(uid):
+            return 0.0
+        cap = max(0.25, min(1.0, 0.3 + 0.5 * err))
+        return cap if c.mode == "heat" else -cap
 
     def control(self):
         rooms = list(self.rooms.values())
@@ -65,10 +82,23 @@ class SimHouse:
             h.append((self.now, self.sim[r.id].temp))
             del h[:max(0, len(h) - 40)]
             predicted[r.id] = core.predict(h, self.now, self.settings)
+        busy = {u for u, on in self.running.items() if on}
+        for u in self.units:  # compressor started/stopped on its own: earlier trend no longer applies
+            if (u in busy) != (u in self.prev_busy):
+                for r in rooms:
+                    if r.unit == u and self.hist.get(r.id):
+                        self.hist[r.id] = self.hist[r.id][-1:]
+                        predicted[r.id] = None
+        self.prev_busy = busy
         cmds, self.house, _ = core.control_step(
             list(self.units.values()), rooms, readings, predicted, {u: self.unit_temp(u) for u in self.units},
-            self.state, self.house, self.now, self.settings)
+            self.state, self.house, self.now, self.settings, busy=busy)
         for uid, cmd in cmds.items():
+            cmd, changed = core.stabilize(cmd, self.sent.get(uid), self.now, self.settings)
+            if changed and cmd.setpoint is not None:
+                if self.sent.get(uid) is None or self.sent[uid][0].setpoint != cmd.setpoint or self.sent[uid][0].mode != cmd.mode:
+                    self.changes += 1
+                self.sent[uid] = (cmd, self.now)
             old, self.state[uid] = self.state[uid], core.apply(self.state[uid], cmd, self.now)
             if core.regime_changed(old, self.state[uid]):
                 for r in rooms:
