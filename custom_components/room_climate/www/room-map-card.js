@@ -86,9 +86,12 @@ const CSS = `
 }
 `;
 
+const FLOOR_NAMES = { 1: "Basement", 2: "First Floor", 3: "Second Floor" };
+
 class RoomMapCard extends HTMLElement {
   setConfig(config) {
-    this._config = config; this._sel = null; this._floor = 1; this._data = null;
+    // Opens on the First Floor (floor 2); card config `default_floor` overrides.
+    this._config = config; this._sel = null; this._floor = config.default_floor || 2; this._data = null;
     try { this._build(); } catch (e) { this._fail("setConfig", e); }
   }
   set hass(hass) {
@@ -125,6 +128,10 @@ class RoomMapCard extends HTMLElement {
       try { this._hass.callWS({ type: "room_climate/log_client", message: msg, stack: String((e && e.stack) || "").slice(0, 1500), ua: navigator.userAgent, where: location.pathname }).catch(() => {}); } catch (_) { /* hass not ready */ }
     }
     if (this._wrap && !this._data) this._wrap.innerHTML = `<div style="padding:16px;color:#ff8a5c;font-family:monospace;font-size:13px;white-space:pre-wrap">Room Climate could not load\n${msg.replace(/[<&]/g, "")}\nRetrying every 15 s.</div>`;
+  }
+  // Card config `floor_names: {1: "...", ...}` overrides these.
+  _floorName(f) {
+    return ((this._config || {}).floor_names || {})[f] || FLOOR_NAMES[f] || `Floor ${f}`;
   }
   _color(t, target) {
     if (t == null) return "#888";
@@ -217,7 +224,7 @@ class RoomMapCard extends HTMLElement {
         <path d="M0 -6 L2.5 2 L0 0.5 L-2.5 2 Z" transform="scale(${k})"/>
         <text y="${-7 * k}" text-anchor="middle" font-size="${3.5 * k}" transform="rotate(${-rot} 0 ${-7 * k})">N</text></g>`;
     const tabs = floors.length > 1 ? `<div class="rc-seg">${floors.map(f =>
-      `<button data-floor="${f}" class="${f === this._floor ? "on" : ""}">Floor ${f}</button>`).join("")}</div>` : "";
+      `<button data-floor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
     this._wrap.innerHTML = `${tabs}<div class="rc-main">
       <div class="rc-map"><svg viewBox="${vb.join(" ")}" style="${tech ? "border-radius:10px" : ""}">${bg}${shapes}${compass}</svg></div>
       <div class="rc-panel"></div></div>`;
@@ -365,7 +372,7 @@ class RoomMapCard extends HTMLElement {
     const monRooms = d.rooms.filter(r => !r.unit);
     const mon = monRooms.map(r => { const l = (d.live || {})[r.id] || {};
       const dup = monRooms.some(o => o !== r && o.name === r.name);  // disambiguate e.g. two baths
-      return `<button data-room="${r.id}">${r.name}${dup ? ` · F${r.floor || 1}` : ""}<b>${l.temp == null ? "—" : l.temp.toFixed(0) + "°"}</b></button>`; }).join("");
+      return `<button data-room="${r.id}">${r.name}${dup ? ` · ${this._floorName(r.floor || 1)}` : ""}<b>${l.temp == null ? "—" : l.temp.toFixed(0) + "°"}</b></button>`; }).join("");
     return `${d.enabled === false ? `<p class="rc-sub" style="margin:0 0 6px;color:#ffd166">DRY RUN · decisions are shown but no commands are sent</p>` : ""}
       ${d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 4px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}</p>` : ""}
       <p class="rc-sub" style="margin:0">${running} of ${units.length} units running</p>
