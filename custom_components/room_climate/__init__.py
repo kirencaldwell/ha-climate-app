@@ -119,15 +119,17 @@ class Manager:
             h.append((now, val))
             del h[:max(0, next((k for k, (t, _) in enumerate(h) if (now - t).total_seconds() <= settings.history_s), len(h)))]
             predicted[r.id] = core.predict(h, now, settings)
-        manual = {}
+        manual, busy = {}, set()
         for u in units:
             cur = self.hass.states.get(u.entity)
             if cur is not None and cur.state in core.MANUAL_MODES:
                 manual[u.id] = cur.state
+            if cur is not None and cur.attributes.get("hvac_action") in ("heating", "cooling"):
+                busy.add(u.id)
         house = self.house if enabled else self.house_shadow
         cmds, new_house, info = core.control_step(
             units, rooms, readings, predicted, {u.id: self._unit_temp(u.entity) for u in units},
-            states, house, now, settings, manual)
+            states, house, now, settings, manual, busy)
         if new_house.mode != house.mode:
             _LOGGER.info("%s house mode %s -> %s (%s)", "LIVE" if enabled else "DRY-RUN", house.mode, new_house.mode, info["reason"])
         if enabled:

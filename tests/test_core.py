@@ -98,7 +98,7 @@ def test_diagnose_weights_and_driver():
 def test_diagnose_ignores_stale_and_missing_sensors():
     a = Room("a", "A", "u", priority=3)
     b = Room("b", "B", "u", priority=3)
-    d = _diag([a, b], {"a": (66.0, MON - timedelta(hours=2))})  # a stale, b missing
+    d = _diag([a, b], {"a": (66.0, MON - timedelta(hours=3))})  # a stale, b missing
     assert d["error"] is None and d["driver"] is None
     assert all(not r["fresh"] and r["weight_pct"] == 0 for r in d["rooms"])
 
@@ -123,12 +123,12 @@ def test_sim_never_mixes_modes():
 
 # --- house-wide controller: one shared mode, comfort band, hard limits, predicted temps ---
 
-def _house(bed=67.0, down=67.0, bed_pred=None, down_pred=None, house=None, at=MON, states=None):
+def _house(bed=67.0, down=67.0, bed_pred=None, down_pred=None, house=None, at=MON, states=None, busy=None):
     rooms = [Room("bed", "Bedroom", "ms", priority=5, default_temp=67), Room("down", "Living", "ah", priority=2, default_temp=67)]
     units = [Unit("ah", "c1"), Unit("ms", "c2")]
     readings = {"bed": (bed, at), "down": (down, at)}
     pred = {"bed": bed_pred, "down": down_pred}
-    return core.control_step(units, rooms, readings, pred, {}, states or {}, house or core.HouseState(), at)
+    return core.control_step(units, rooms, readings, pred, {}, states or {}, house or core.HouseState(), at, busy=busy)
 
 
 def test_costs_zero_inside_band_and_floor_beats_priority():
@@ -187,6 +187,20 @@ def test_own_cooling_trend_does_not_flip_back_to_heat():
     assert house.mode == "cool"  # falling because we're cooling it; at target it idles
     _, house, _ = _house(bed=66.8, bed_pred=64.0, down=67.0, house=cooling)  # not driven: a real cold trend
     assert house.mode == "heat"
+
+
+def test_manual_cooling_trend_does_not_trigger_heat():
+    # Unit cooled by hand: the bedroom drops fast, but that's the unit, not the room getting cold.
+    _, house, _ = _house(bed=66.2, bed_pred=63.0, down=67.0, busy={"ms"})
+    assert house.mode == "off"
+    _, house, _ = _house(bed=66.2, bed_pred=63.0, down=67.0)
+    assert house.mode == "heat"
+
+
+def test_idle_house_mode_says_so():
+    cmds, house, info = _house(bed=67.0, down=67.0, house=core.HouseState("heat", MON - timedelta(hours=1)))
+    assert house.mode == "heat" and "idle" in info["reason"]
+    assert "idle at 65" in cmds["ah"].reason
 
 
 def test_switch_waits_for_min_time_in_mode():

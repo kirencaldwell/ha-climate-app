@@ -68,7 +68,9 @@ class Settings:
     switch_margin: float = 0.5
     min_cost: float = 0.05  # demand below this counts as comfortable
     max_offset: float = 6.0  # clamp on sensor-vs-unit-sensor compensation
-    stale_s: int = 900  # reading older than this is ignored
+    # Reading older than this is ignored. Long, because Bluetooth sensors (e.g. Govee) only update when the value
+    # changes; a sensor that really drops out goes unavailable instead.
+    stale_s: int = 7200
     allow_cool: bool = True
     allow_heat: bool = True
     deadband: float = 1.0  # legacy (card gauge width); kept so stored settings still load
@@ -188,6 +190,8 @@ def choose_mode(cold: float, hot: float, house: HouseState, now: datetime,
         if held < settings.min_mode_s:
             return house.mode, f"{other} wanted ({theirs:.2f} vs {mine:.2f}); holding {house.mode} min time"
         return other, f"switching: {'hot' if other == 'cool' else 'cold'} demand {theirs:.2f} vs {mine:.2f}"
+    if max(cold, hot) < settings.min_cost:
+        return house.mode, f"{house.mode} mode, idle: nothing needed"
     return house.mode, f"{house.mode} (cold {cold:.2f}, hot {hot:.2f})"
 
 
@@ -227,7 +231,7 @@ def unit_command(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float,
     if unit_temp is not None:  # make the unit's own thermostat chase the *room* temperature
         offset = max(-settings.max_offset, min(settings.max_offset, unit_temp - avg))
     sp = max(unit.min_setpoint, min(unit.max_setpoint, round(base + offset)))
-    why = ("heating to target" if mode == "heat" else "cooling to target") if active else "maintenance (rooms in band)"
+    why = ("heating to target" if mode == "heat" else "cooling to target") if active else f"idle at {sp}° (rooms fine)"
     return Command(mode, float(sp), why, active)
 
 
@@ -237,11 +241,13 @@ MANUAL_MODES = ("dry", "fan_only")
 def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple[float, datetime]],
                  predicted: dict[str, Optional[float]], unit_temps: dict[str, Optional[float]],
                  states: dict[str, UnitState], house: HouseState, now: datetime,
-                 settings: Settings = Settings(), manual: Optional[dict[str, str]] = None):
+                 settings: Settings = Settings(), manual: Optional[dict[str, str]] = None,
+                 busy: Optional[set[str]] = None):
     """One control tick for the whole house -> (commands by unit id, new HouseState, info dict).
 
     All units always share one mode. A unit put into dry or fan by hand takes over: the controller holds
-    and keeps every other unit off so the compressor never gets conflicting modes.
+    and keeps every other unit off so the compressor never gets conflicting modes. `busy` lists units that are
+    actually heating/cooling right now (by us or by hand): their rooms' trends come from the unit, not the room.
     """
     manual = {u: m for u, m in (manual or {}).items() if m in MANUAL_MODES}
     if manual:
@@ -257,9 +263,10 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         got = readings.get(r.id)
         if not got or (now - got[1]).total_seconds() > settings.stale_s:
             continue
-        # A room its unit is actively driving trends because of us and stops at target, so its trend says
-        # nothing about the opposite need (it would flip cool->heat as cooling works). Use the reading alone.
-        driven = states.get(r.unit, UnitState()).active
+        # A room whose unit is heating/cooling it (by us or by hand) trends because of the unit, and that stops at
+        # its setpoint, so the trend says nothing about the opposite need (it would flip cool->heat as cooling
+        # works). Use the reading alone.
+        driven = states.get(r.unit, UnitState()).active or r.unit in (busy or ())
         c, h = room_costs(r, got[0], None if driven else predicted.get(r.id), now, settings)
         cold, hot = cold + c, hot + h
     mode, reason = choose_mode(cold, hot, house, now, settings)
