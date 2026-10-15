@@ -184,7 +184,8 @@ class Manager:
         self._publish(now, rooms)
 
     def _audit(self, unit: core.Unit, cmd: core.Command, enabled: bool, now):
-        """Log what we want the unit to do next to what it is doing. Logged when anything changes, else every 30 min."""
+        """Log what we want the unit to do next to what it is doing. Logged only when the decision (mode, setpoint)
+        or the unit's own mode/setpoint changes; reason wording and sensor ticks alone don't repeat the line."""
         cur = self.hass.states.get(unit.entity)
         if cur is None or cur.state == "unavailable":
             line, key = f"{unit.id}: unit {unit.entity} unavailable", ("unavailable",)
@@ -201,10 +202,9 @@ class Manager:
             line = (f"{unit.id}: command {cmd.mode}/{want_sp} ({cmd.reason}) | actual hvac={cur.state} "
                     f"setpoint={actual_sp} action={a.get('hvac_action')} unit_temp={a.get('current_temperature')} | "
                     + ("MISMATCH " + "; ".join(diffs) if diffs else "in sync"))
-            key = (cmd.mode, want_sp, cmd.reason, cur.state, actual_sp, bool(diffs))
-        seen = self._audit_seen.get(unit.id)
-        if seen is None or seen[0] != key or (now - seen[1]).total_seconds() > 1800:
-            self._audit_seen[unit.id] = (key, now)
+            key = (cmd.mode, want_sp, cur.state, actual_sp)
+        if self._audit_seen.get(unit.id) != key:
+            self._audit_seen[unit.id] = key
             _LOGGER.info("%s %s", "LIVE" if enabled else "DRY-RUN", line)
 
     async def _send(self, unit: core.Unit, state: core.UnitState, cmd: core.Command):
