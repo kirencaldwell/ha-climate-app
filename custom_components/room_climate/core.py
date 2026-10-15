@@ -129,6 +129,15 @@ class HouseState:
     pending_since: Optional[datetime] = None
 
 
+def elapsed(later: datetime, earlier: datetime) -> float:
+    """Real seconds between two times. Subtracting two local times in the same zone gives wall-clock time, which is
+    an hour off across a daylight-saving change (and negative during the repeated fall-back hour), so aware times
+    go through their UTC timestamps. Naive times (sim, tests) have no DST to get wrong."""
+    if later.tzinfo is None or earlier.tzinfo is None:
+        return (later - earlier).total_seconds()
+    return later.timestamp() - earlier.timestamp()
+
+
 def _hold_active(room: Room, now: datetime) -> bool:
     if room.hold_temp is None:
         return False
@@ -177,7 +186,7 @@ def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]
     num = den = rsum = 0.0
     for r in rooms:
         got = readings.get(r.id)
-        if not got or (now - got[1]).total_seconds() > settings.stale_s:
+        if not got or elapsed(now, got[1]) > settings.stale_s:
             continue
         w = room_priority(r, now)
         num += w * (got[0] - target_temp(r, now))
@@ -190,10 +199,10 @@ def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]
 
 def predict(history: list[tuple[datetime, float]], now: datetime, settings: Settings = Settings()) -> Optional[float]:
     """Project a room's temperature `horizon_s` ahead from a least-squares trend over the last `history_s`."""
-    pts = [(t, v) for t, v in history if (now - t).total_seconds() <= settings.history_s]
-    if len(pts) < 3 or (pts[-1][0] - pts[0][0]).total_seconds() < 600:
+    pts = [(t, v) for t, v in history if elapsed(now, t) <= settings.history_s]
+    if len(pts) < 3 or elapsed(pts[-1][0], pts[0][0]) < 600:
         return None
-    xs = [(t - pts[0][0]).total_seconds() for t, _ in pts]
+    xs = [elapsed(t, pts[0][0]) for t, _ in pts]
     ys = [v for _, v in pts]
     if len({round(v, 2) for v in ys}) < 3:
         # One step on a coarse sensor (a Mitsubishi unit reports in 0.5 C = 0.9 F steps) or a reading flickering
@@ -245,12 +254,12 @@ def choose_mode(cold: float, hot: float, house: HouseState, now: datetime,
     other = "cool" if house.mode == "heat" else "heat"
     stay = HouseState(house.mode, house.since)
     if can[other] and theirs >= settings.min_cost and theirs > mine * settings.switch_ratio + settings.switch_margin:
-        held = (now - house.since).total_seconds() if house.since else 1e9
+        held = elapsed(now, house.since) if house.since else 1e9
         if held < settings.min_mode_s:
             return stay, f"{other} wanted ({theirs:.2f} vs {mine:.2f}); holding {house.mode} min time"
         if house.pending != other:
             return HouseState(house.mode, house.since, other, now), f"{other} wanted ({theirs:.2f} vs {mine:.2f}); confirming"
-        waited = (now - house.pending_since).total_seconds()
+        waited = elapsed(now, house.pending_since)
         if waited < settings.switch_confirm_s:
             return HouseState(house.mode, house.since, other, house.pending_since), \
                 f"{other} wanted ({theirs:.2f} vs {mine:.2f}); confirming {int(waited // 60)}/{settings.switch_confirm_s // 60} min"
@@ -304,7 +313,7 @@ def stabilize(cmd: Command, prev: Optional[tuple[Command, datetime]], now: datet
     want = cmd.raw if cmd.raw is not None else cmd.setpoint
     if abs(want - pcmd.setpoint) < settings.setpoint_min_change:
         return Command(cmd.mode, pcmd.setpoint, cmd.reason, cmd.active, cmd.raw), False
-    if (now - at).total_seconds() < settings.setpoint_min_interval_s:
+    if elapsed(now, at) < settings.setpoint_min_interval_s:
         return Command(cmd.mode, pcmd.setpoint, f"{cmd.reason} (holding {pcmd.setpoint:g}°: recently changed)",
                        cmd.active, cmd.raw), False
     return cmd, True
@@ -337,7 +346,7 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         if r.unit is None:
             continue  # monitor-only rooms don't steer the house
         got = readings.get(r.id)
-        if not got or (now - got[1]).total_seconds() > settings.stale_s:
+        if not got or elapsed(now, got[1]) > settings.stale_s:
             continue
         # A room whose unit is heating/cooling it (by us or by hand) trends because of the unit, and that stops at
         # its setpoint, so the trend says nothing about the opposite need (it would flip cool->heat as cooling
@@ -377,7 +386,7 @@ def diagnose(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float, dat
     items, den = [], 0.0
     for r in mine:
         got = readings.get(r.id)
-        fresh = bool(got) and (now - got[1]).total_seconds() <= settings.stale_s
+        fresh = bool(got) and elapsed(now, got[1]) <= settings.stale_s
         w = room_priority(r, now)
         items.append({"id": r.id, "name": r.name, "priority": w, "temp": got[0] if got else None,
                       "target": target_temp(r, now), "fresh": fresh, "w": w})
@@ -397,7 +406,7 @@ def diagnose(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float, dat
     return {
         "unit": unit.id, "mode": state.mode,
         "setpoint": cmd.setpoint if cmd else None, "reason": cmd.reason if cmd else "",
-        "held_s": int((now - state.since).total_seconds()) if state.since else None,
+        "held_s": int(elapsed(now, state.since)) if state.since else None,
         "error": None if res is None else round(res[0], 2),
         "avg": None if res is None else round(res[1], 2),
         "target": None if res is None else round(res[1] - res[0], 2),

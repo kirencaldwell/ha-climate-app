@@ -399,3 +399,54 @@ def test_priority_schedule_shifts_unit_toward_the_room_in_use():
     e_night = core.weighted_error([living, bed], readings_at(night), night, Settings())[0]
     # noon: (3*2 + 1*-2)/4 = +1.0 (warm living room dominates); night: (3*2 + 5*-2)/8 = -0.5 (cool bedroom does)
     assert abs(e_noon - 1.0) < 1e-9 and abs(e_night + 0.5) < 1e-9
+
+
+# --- daylight saving: timers measure real time, schedules follow the local clock ---
+from datetime import timezone as _tz
+from zoneinfo import ZoneInfo as _Zone
+
+_LA = _Zone("America/Los_Angeles")
+_FALL = datetime(2026, 11, 1, 8, 0, tzinfo=_tz.utc)  # 01:00 PDT; clocks go 02:00 PDT -> 01:00 PST
+_SPRING = datetime(2027, 3, 14, 9, 0, tzinfo=_tz.utc)  # 01:00 PST; clocks go 02:00 PST -> 03:00 PDT
+
+
+def _local(utc, minutes):
+    return (utc + timedelta(minutes=minutes)).astimezone(_LA)  # what dt_util.now() returns
+
+
+def test_elapsed_is_real_time_across_dst():
+    for base in (_FALL, _SPRING):
+        assert core.elapsed(_local(base, 90), _local(base, 30)) == 3600
+
+
+def test_setpoint_interval_is_15_real_minutes_across_fall_back():
+    s = Settings()
+    first = _local(_FALL, 55)  # 01:55 PDT
+    prev = (core.Command("cool", 68.0, raw=68.0), first)
+    later = _local(_FALL, 75)  # 01:15 PST, 20 real minutes on (wall clock says 40 minutes earlier)
+    _, changed = core.stabilize(core.Command("cool", 66.0, raw=66.0), prev, later, s)
+    assert changed
+
+
+def test_mode_switch_still_confirms_across_spring_forward():
+    s = Settings()
+    house = core.HouseState("heat", _local(_SPRING, -120), "cool", _local(_SPRING, 58))  # pending since 01:58 PST
+    at = _local(_SPRING, 61)  # 03:01 PDT, 3 real minutes later (wall clock says 63)
+    new, why = core.choose_mode(0.0, 50.0, house, at, s)
+    assert new.mode == "heat" and "confirming" in why
+
+
+def test_trend_is_sane_through_the_repeated_hour():
+    hist = [(_local(_FALL, m), 70.0 - 0.05 * m) for m in range(30, 91, 5)]  # steady fall through 02:00 PDT -> 01:00 PST
+    p = core.predict(hist, hist[-1][0], Settings())
+    assert p is not None and p < hist[-1][1]
+
+
+def test_schedule_follows_the_local_clock_on_dst_days():
+    r = Room("r", "R", "u", schedule=[ScheduleEntry(list(range(7)), "07:00", 70), ScheduleEntry(list(range(7)), "21:00", 64)],
+             priority_schedule=[core.PriorityEntry(list(range(7)), "07:00", 2), core.PriorityEntry(list(range(7)), "21:00", 5)])
+    for day in (datetime(2026, 11, 1, tzinfo=_LA), datetime(2027, 3, 14, tzinfo=_LA)):
+        assert core.target_temp(r, day.replace(hour=7, minute=0)) == 70
+        assert core.target_temp(r, day.replace(hour=5, minute=59)) == 64
+        assert core.room_priority(r, day.replace(hour=6, minute=59)) == 5
+        assert core.room_priority(r, day.replace(hour=7, minute=0)) == 2

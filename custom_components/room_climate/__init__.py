@@ -138,7 +138,7 @@ class Manager:
             readings[r.id] = (val, ts)
             h = self.hist.setdefault(r.id, [])
             h.append((now, val))
-            del h[:max(0, next((k for k, (t, _) in enumerate(h) if (now - t).total_seconds() <= settings.history_s), len(h)))]
+            del h[:max(0, next((k for k, (t, _) in enumerate(h) if core.elapsed(now, t) <= settings.history_s), len(h)))]
             predicted[r.id] = core.predict(h, now, settings)
         manual, busy = {}, set()
         for u in units:
@@ -364,7 +364,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
                 room[k] = msg[k]
         if "hold_hours" in msg:
             h = msg["hold_hours"]
-            room["hold_until"] = None if not h else (dt_util.now() + timedelta(hours=h)).isoformat()
+            room["hold_until"] = None if not h else (dt_util.utcnow() + timedelta(hours=h)).isoformat()  # real hours, even across DST
         if msg.get("hold_temp", 1) is None:
             room.pop("hold_until", None)
         await mgr.async_save()
