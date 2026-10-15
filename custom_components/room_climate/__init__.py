@@ -20,7 +20,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from . import core
+from . import core, datalog
 
 DOMAIN = "room_climate"
 _LOGGER = logging.getLogger(__name__)
@@ -72,6 +72,7 @@ class Manager:
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
         self._ours: list[str] = []  # context ids of our recent service calls
         self._audit_seen: dict[str, tuple] = {}
+        self._logged_minute = None
         self._unsub = []
 
     async def async_load(self):
@@ -143,9 +144,13 @@ class Manager:
         # steady sensor look stale.
         return TemperatureConverter.convert(val, unit, F), getattr(st, "last_reported", None) or st.last_updated
 
+    def _outdoor_entity(self, settings: core.Settings | None = None) -> str | None:
+        settings = settings or core.Settings(**self.data.get("settings", {}))
+        return settings.outdoor_entity or next(iter(sorted(self.hass.states.async_entity_ids("weather"))), None)
+
     def _outdoor(self, settings: core.Settings):
         """Outdoor temperature in F from `outdoor_entity`, else the first weather entity (None if unknown)."""
-        ent = settings.outdoor_entity or next(iter(sorted(self.hass.states.async_entity_ids("weather"))), None)
+        ent = self._outdoor_entity(settings)
         st = self.hass.states.get(ent) if ent else None
         if st is None or st.state in ("unknown", "unavailable"):
             return None
@@ -229,6 +234,59 @@ class Manager:
                     if r.unit == u.id and self.hist.get(r.id):
                         self.hist[r.id] = self.hist[r.id][-1:]
         self._publish(now, rooms)
+        await self._log(now, rooms, units, predicted, info)
+
+    async def _log(self, now, rooms, units, predicted, info):
+        """One row per minute to the long-term log in /config/room_climate_data (see datalog.py)."""
+        minute = now.replace(second=0, microsecond=0)
+        if minute == self._logged_minute:
+            return
+        self._logged_minute = minute
+
+        def num(v):
+            try:
+                return None if v is None else round(float(v), 2)
+            except (TypeError, ValueError):
+                return None
+
+        row = {"t": minute.isoformat(), "house": info.get("mode") or "off", "reason": info.get("reason"),
+               "cold": info.get("cold"), "hot": info.get("hot"), "rooms": {}, "units": {}, "extra": {}}
+        ent = self._outdoor_entity()
+        wx = self.hass.states.get(ent) if ent else None
+        if wx is not None:
+            a = wx.attributes
+            row["weather"] = {"state": wx.state, "temp": num(a.get("temperature")), "humidity": num(a.get("humidity")),
+                              "cloud": num(a.get("cloud_coverage")), "wind": num(a.get("wind_speed"))}
+        row["outdoor"] = num(info.get("outdoor"))
+        sun = self.hass.states.get("sun.sun")
+        if sun is not None:
+            row["sun"] = {"elev": num(sun.attributes.get("elevation")), "az": num(sun.attributes.get("azimuth"))}
+        for r in rooms:
+            if not r.sensor:
+                continue
+            val, _ = self._f(r.sensor)  # raw: None while the sensor is out (the controller bridges short gaps)
+            c, h = info.get("rooms", {}).get(r.id, (None, None))
+            row["rooms"][r.id] = {"temp": num(val), "target": core.target_temp(r, now), "prio": core.room_priority(r, now),
+                                  "pred": num(predicted.get(r.id)), "unit": r.unit, "cold": c, "hot": h}
+        prefixes = []
+        for u in units:
+            cur, cmd = self.hass.states.get(u.entity), self.last.get(u.id)
+            a = cur.attributes if cur is not None else {}
+            row["units"][u.id] = {"entity": u.entity, "control": self.control(u.id),
+                                  "state": cur.state if cur is not None else None, "sp": num(a.get("temperature")),
+                                  "action": a.get("hvac_action"), "fan": a.get("fan_mode"), "temp": num(self._unit_temp(u.entity)),
+                                  "cmd": cmd.mode if cmd else None, "cmd_sp": cmd.setpoint if cmd else None,
+                                  "why": cmd.reason if cmd else None}
+            prefixes.append("sensor." + u.entity.split(".", 1)[1] + "_")
+        # Anything else the unit controllers report (signal now; fan stage, compressor Hz, outdoor coil temp if added).
+        for st in self.hass.states.async_all("sensor"):
+            if st.entity_id.startswith(tuple(prefixes)) and st.state not in BAD_STATES:
+                row["extra"][st.entity_id] = num(st.state) if num(st.state) is not None else st.state
+        path = self.hass.config.path("room_climate_data")
+        try:
+            await self.hass.async_add_executor_job(datalog.append, path, row, now)
+        except OSError as e:
+            _LOGGER.warning("long-term log write failed: %s", e)
 
     def _audit(self, unit: core.Unit, cmd: core.Command, ours: bool, now):
         """Log what we want the unit to do next to what it is doing. Logged only when the decision (mode, setpoint)
