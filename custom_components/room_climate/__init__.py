@@ -34,6 +34,8 @@ def _room_from_dict(d: dict) -> core.Room:
         id=d["id"], name=d.get("name", d["id"]), unit=d.get("unit"), sensor=d.get("sensor"),
         priority=int(d.get("priority", 3)), default_temp=float(d.get("default_temp", 68)),
         schedule=[core.ScheduleEntry(list(e["days"]), e["start"], float(e["temp"])) for e in d.get("schedule", [])],
+        priority_schedule=[core.PriorityEntry(list(e["days"]), e["start"], int(e["priority"]))
+                           for e in d.get("priority_schedule", [])],
         hold_temp=d.get("hold_temp"),
         hold_until=dt_util.parse_datetime(d["hold_until"]) if d.get("hold_until") else None,
         floor=int(d.get("floor", 1)), shape=d.get("shape", {}))
@@ -230,7 +232,7 @@ class Manager:
             val, _ = self._f(r.sensor) if r.sensor else (None, None)
             self.hass.states.async_set(f"{DOMAIN}.{r.id}", "ok" if val is not None else "no_sensor", {
                 "friendly_name": r.name, "temperature": val, "target": core.target_temp(r, now),
-                "priority": r.priority, "unit": r.unit,
+                "priority": core.room_priority(r, now), "unit": r.unit,
                 "action": self.last.get(r.unit, core.Command("off", None)).mode})
         self._publish_debug(now, rooms)
 
@@ -315,7 +317,7 @@ class Manager:
             r = _room_from_dict(rd)
             val, _ = self._f(r.sensor) if r.sensor else (None, None)
             c = self.last.get(r.unit)
-            out["live"][r.id] = {"temp": val, "target": core.target_temp(r, now),
+            out["live"][r.id] = {"temp": val, "target": core.target_temp(r, now), "priority": core.room_priority(r, now),
                                  "mode": c.mode if c else "off", "reason": c.reason if c else ""}
         return out
 
@@ -344,6 +346,10 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         vol.Optional("priority"): vol.All(int, vol.Range(min=1, max=5)),
         vol.Optional("default_temp"): vol.Coerce(float),
         vol.Optional("schedule"): list,
+        vol.Optional("priority_schedule"): [vol.Schema({
+            vol.Required("days"): [vol.All(int, vol.Range(min=0, max=6))],
+            vol.Required("start"): vol.Match(r"^\d{2}:\d{2}$"),
+            vol.Required("priority"): vol.All(int, vol.Range(min=1, max=5))})],
         vol.Optional("hold_temp"): vol.Any(None, vol.Coerce(float)),
         vol.Optional("hold_hours"): vol.Any(None, vol.Coerce(float)),
     })
@@ -353,7 +359,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         if room is None:
             connection.send_error(msg["id"], "not_found", "unknown room")
             return
-        for k in ("priority", "default_temp", "schedule", "hold_temp"):
+        for k in ("priority", "default_temp", "schedule", "priority_schedule", "hold_temp"):
             if k in msg:
                 room[k] = msg[k]
         if "hold_hours" in msg:

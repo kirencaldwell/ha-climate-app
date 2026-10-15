@@ -1,6 +1,6 @@
 """Pure control logic (no Home Assistant imports). All temperatures are degrees F.
 
-A *room* has a wifi sensor, a target (from its schedule) and a priority.
+A *room* has a wifi sensor, a target (from its schedule) and a priority (fixed, or from its priority schedule).
 A *unit* is a Mitsubishi climate entity serving one or more rooms. The
 controller picks one house-wide mode (the units share an outdoor compressor) from
 the rooms' current and predicted temperatures, then holds each unit at its rooms'
@@ -28,14 +28,27 @@ class ScheduleEntry:
 
 
 @dataclass
+class PriorityEntry:
+    """From `start` on these days the room has this priority (until the next entry). Steps, no glide."""
+    days: list[int]
+    start: str
+    priority: int
+
+    def minutes(self) -> int:
+        h, m = self.start.split(":")
+        return int(h) * 60 + int(m)
+
+
+@dataclass
 class Room:
     id: str
     name: str
     unit: Optional[str]  # None = monitor-only (sensor shown, never drives a unit)
     sensor: Optional[str] = None
-    priority: int = 3
+    priority: int = 3  # used when no priority schedule entry applies
     default_temp: float = 68.0
     schedule: list[ScheduleEntry] = field(default_factory=list)
+    priority_schedule: list[PriorityEntry] = field(default_factory=list)  # e.g. bedrooms low during the day
     hold_temp: Optional[float] = None  # manual override ...
     hold_until: Optional[datetime] = None  # ... until this time (None = until next schedule change)
     floor: int = 1
@@ -125,12 +138,12 @@ def _hold_active(room: Room, now: datetime) -> bool:
 SCHEDULE_RAMP_S = 3600  # glide into each schedule change over this long instead of stepping
 
 
-def _entry_times(room: Room, now: datetime, days):
+def _entry_times(room: Room, now: datetime, days, entries=None, value=lambda e: e.temp):
     for back in days:
         day = now - timedelta(days=back)
-        for e in room.schedule:
+        for e in (room.schedule if entries is None else entries):
             if day.weekday() in e.days:
-                yield day.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=e.minutes()), e.temp
+                yield day.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=e.minutes()), value(e)
 
 
 def scheduled_temp(room: Room, now: datetime) -> float:
@@ -150,6 +163,14 @@ def target_temp(room: Room, now: datetime) -> float:
     return room.hold_temp if _hold_active(room, now) else scheduled_temp(room, now)
 
 
+def room_priority(room: Room, now: datetime) -> int:
+    """Priority in force now: the latest priority-schedule entry at or before `now` (looking back up to a week),
+    else the room's fixed priority. Clamped to MIN_PRIORITY..MAX_PRIORITY."""
+    past = [x for x in _entry_times(room, now, range(8), room.priority_schedule, lambda e: e.priority) if x[0] <= now]
+    p = max(past)[1] if past else room.priority
+    return max(MIN_PRIORITY, min(MAX_PRIORITY, int(p)))
+
+
 def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]],
                    now: datetime, settings: Settings):
     """Priority-weighted (reading - target). Returns (error, avg_reading) or None."""
@@ -158,7 +179,7 @@ def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]
         got = readings.get(r.id)
         if not got or (now - got[1]).total_seconds() > settings.stale_s:
             continue
-        w = max(MIN_PRIORITY, min(MAX_PRIORITY, r.priority))
+        w = room_priority(r, now)
         num += w * (got[0] - target_temp(r, now))
         rsum += w * got[0]
         den += w
@@ -194,7 +215,7 @@ def room_costs(room: Room, current: float, predicted: Optional[float], now: date
     With `free_delta` set and an outdoor temperature, comfort demand the weather will settle by itself is dropped;
     the hard floor/ceiling always count."""
     t = target_temp(room, now)
-    w = max(MIN_PRIORITY, min(MAX_PRIORITY, room.priority))
+    w = room_priority(room, now)
     lo = current if predicted is None else min(current, predicted)
     hi = current if predicted is None else max(current, predicted)
     free = settings.free_delta is not None and outdoor is not None
@@ -357,8 +378,8 @@ def diagnose(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float, dat
     for r in mine:
         got = readings.get(r.id)
         fresh = bool(got) and (now - got[1]).total_seconds() <= settings.stale_s
-        w = max(MIN_PRIORITY, min(MAX_PRIORITY, r.priority))
-        items.append({"id": r.id, "name": r.name, "priority": r.priority, "temp": got[0] if got else None,
+        w = room_priority(r, now)
+        items.append({"id": r.id, "name": r.name, "priority": w, "temp": got[0] if got else None,
                       "target": target_temp(r, now), "fresh": fresh, "w": w})
         if fresh:
             den += w

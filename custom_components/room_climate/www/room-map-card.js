@@ -11,6 +11,13 @@
  */
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const TEMP_MIN = 55, TEMP_MAX = 85;  // schedule editor range (F)
+// The chart editor edits either schedule: what each point's value is, its range and gridlines, and how it's shown.
+const SCHED_KINDS = {
+  temp: { key: "schedule", field: "temp", title: "Schedule", lo: TEMP_MIN, hi: TEMP_MAX, grid: 5, fmt: v => `${v}°`, def: r => r.default_temp,
+          hint: "The temperature holds until the next point" },
+  prio: { key: "priority_schedule", field: "priority", title: "Priority schedule", lo: 1, hi: 5, grid: 1, fmt: v => `P${v}`, def: r => r.priority,
+          hint: "The priority holds until the next point (5 = matters most)" },
+};
 
 const toMin = s => { const [h, m] = s.split(":"); return +h * 60 + +m; };
 const toHHMM = m => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
@@ -165,6 +172,7 @@ class RoomMapCard extends HTMLElement {
       case "hold": this._set({ hold_temp: this._holdTemp ?? room.hold_temp ?? live.target, hold_hours: +t.dataset.h }); break;
       case "hold-clear": this._set({ hold_temp: null, hold_hours: null }); break;
       case "sched": this._openSchedule(room); break;
+      case "psched": this._openSchedule(room, "prio"); break;
     }
   }
 
@@ -255,13 +263,16 @@ class RoomMapCard extends HTMLElement {
       <span>${val}°</span><button data-act="${act}" data-d="1" aria-label="Raise">+</button></div>`;
     const holding = room.hold_temp != null;
     const holdVal = this._holdTemp ?? room.hold_temp ?? live.target;
-    const today = (room.schedule || []).filter(e => e.days.includes(todayIdx()))
+    const todayOf = (list, fmt) => (list || []).filter(e => e.days.includes(todayIdx()))
       .sort((a, b) => toMin(a.start) - toMin(b.start))
-      .map(e => `${fmtTime(toMin(e.start))} → ${e.temp}°`).join(" · ");
+      .map(e => `${fmtTime(toMin(e.start))} → ${fmt(e)}`).join(" · ");
+    const today = todayOf(room.schedule, e => `${e.temp}°`);
+    const ptoday = todayOf(room.priority_schedule, e => `P${e.priority}`);
+    const pnow = live.priority ?? room.priority;
     el.innerHTML = `<h3>${room.name}</h3>
       <p class="rc-sub">${reading} · target ${live.target}° · unit ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}</p>
       <div class="rc-row"><span class="rc-lbl">Default temp</span>${step("def", room.default_temp)}</div>
-      <div class="rc-row"><span class="rc-lbl">Priority</span>
+      <div class="rc-row"><span class="rc-lbl">${(room.priority_schedule || []).length ? "Default priority" : "Priority"}</span>
         <div class="rc-chips">${[1, 2, 3, 4, 5].map(n => `<button data-act="prio" data-v="${n}" class="${n === room.priority ? "on" : ""}">${n}</button>`).join("")}</div></div>
       <div class="rc-sect"><h4>Hold${holding ? " · active" : ""}</h4>
         <div class="rc-row"><span class="rc-lbl">Hold at</span>${step("hold-step", holdVal)}</div>
@@ -270,7 +281,10 @@ class RoomMapCard extends HTMLElement {
           ${holding ? `<button data-act="hold-clear">Clear</button>` : ""}</div></div></div>
       <div class="rc-sect"><h4>Schedule</h4>
         <p class="rc-sub" style="margin:8px 0">${today || "No schedule for today — using default temp."}</p>
-        <button data-act="sched" style="width:100%">Edit schedule…</button></div>`;
+        <button data-act="sched" style="width:100%">Edit schedule…</button></div>
+      <div class="rc-sect"><h4>Priority schedule · now P${pnow}</h4>
+        <p class="rc-sub" style="margin:8px 0">${ptoday || "No priority schedule for today — using the default priority."}</p>
+        <button data-act="psched" style="width:100%">Edit priority schedule…</button></div>`;
   }
 
   // A unit's real state (from HA) next to what the controller wants. Shared by the home panel and diagnostics.
@@ -384,19 +398,20 @@ class RoomMapCard extends HTMLElement {
   }
 
   /* ---------- schedule editor (modal) ---------- */
-  _openSchedule(room) {
+  _openSchedule(room, kind = "temp") {
     this._closeSchedule();
-    const days = DAYS.map((_, d) => (room.schedule || []).filter(e => e.days.includes(d))
-      .map(e => ({ m: toMin(e.start), t: e.temp })).sort((a, b) => a.m - b.m));
+    const k = SCHED_KINDS[kind];
+    const days = DAYS.map((_, d) => (room[k.key] || []).filter(e => e.days.includes(d))
+      .map(e => ({ m: toMin(e.start), t: e[k.field] })).sort((a, b) => a.m - b.m));
     // Every day gets an explicit 12:00 AM point (fixed in time) so the ends of the curve don't depend on other points.
     // Seeded with the temperature already in force, so existing behavior is unchanged. A day's end is the next day's start.
-    const starts = days.map((_, d) => RoomMapCard._carryFor(days, d, room.default_temp));
+    const starts = days.map((_, d) => RoomMapCard._carryFor(days, d, k.def(room)));
     days.forEach((pts, d) => { if (!pts.length || pts[0].m !== 0) pts.unshift({ m: 0, t: starts[d] }); });
-    this._ed = { room, days, day: todayIdx(), sel: null, selEnd: false, drag: false };
+    this._ed = { room, k, days, day: todayIdx(), sel: null, selEnd: false, drag: false };
     const m = this._modal = document.createElement("div");
     m.className = "rc-modal";
-    m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="Schedule">
-      <header><h3>Schedule · ${room.name}</h3><button data-x="cancel" aria-label="Close">✕</button></header>
+    m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="${k.title}">
+      <header><h3>${k.title} · ${room.name}</h3><button data-x="cancel" aria-label="Close">✕</button></header>
       <div class="rc-body">
         <div class="rc-seg" data-slot="days"></div>
         <svg class="rc-chart" viewBox="0 0 640 320"></svg>
@@ -431,17 +446,17 @@ class RoomMapCard extends HTMLElement {
     }
     return def;
   }
-  _carry() { return RoomMapCard._carryFor(this._ed.days, this._ed.day, this._ed.room.default_temp); }
+  _carry() { return RoomMapCard._carryFor(this._ed.days, this._ed.day, this._ed.k.def(this._ed.room)); }
 
   _edRender() {
     const ed = this._ed, m = this._modal; if (!ed) return;
-    const W = 640, H = 320, L = 46, R = 14, T = 14, B = 30;
-    const x = mn => L + (W - L - R) * mn / 1440, y = t => T + (H - T - B) * (1 - (t - TEMP_MIN) / (TEMP_MAX - TEMP_MIN));
+    const k = ed.k, W = 640, H = 320, L = 46, R = 14, T = 14, B = 30;
+    const x = mn => L + (W - L - R) * mn / 1440, y = t => T + (H - T - B) * (1 - (t - k.lo) / (k.hi - k.lo));
     const pts = ed.days[ed.day], endP = ed.days[(ed.day + 1) % 7][0];
     let grid = "";
-    for (let t = TEMP_MIN; t <= TEMP_MAX; t += 5)
+    for (let t = k.lo; t <= k.hi; t += k.grid)
       grid += `<line x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}" stroke="currentColor" stroke-opacity=".12"/>
-               <text x="${L - 8}" y="${y(t) + 4}" text-anchor="end" font-size="12" fill="currentColor" fill-opacity=".6">${t}°</text>`;
+               <text x="${L - 8}" y="${y(t) + 4}" text-anchor="end" font-size="12" fill="currentColor" fill-opacity=".6">${k.fmt(t)}</text>`;
     ["12a", "3a", "6a", "9a", "12p", "3p", "6p", "9p", "12a"].forEach((l, i) => {
       grid += `<line y1="${T}" y2="${H - B}" x1="${x(i * 180)}" x2="${x(i * 180)}" stroke="currentColor" stroke-opacity=".12"/>
                <text x="${x(i * 180)}" y="${H - 10}" text-anchor="middle" font-size="12" fill="currentColor" fill-opacity=".6">${l}</text>`;
@@ -449,7 +464,7 @@ class RoomMapCard extends HTMLElement {
     let line = `M${x(0)} ${y(pts[0].t)}`;
     pts.slice(1).forEach(p => { line += `H${x(p.m)}V${y(p.t)}`; });
     line += `H${x(1440)}V${y(endP.t)}`;  // step to tomorrow's start temp at midnight
-    const area = `${line}V${y(TEMP_MIN)}H${x(0)}Z`;
+    const area = `${line}V${y(k.lo)}H${x(0)}Z`;
     // Start/end handles are squares (vertical-only); interior points are circles.
     const sq = (attr, px, py, on) => `<g ${attr}><circle cx="${px}" cy="${py}" r="26" fill="transparent"/>
         <rect x="${px - (on ? 12 : 10)}" y="${py - (on ? 12 : 10)}" width="${on ? 24 : 20}" height="${on ? 24 : 20}" rx="5"
@@ -463,7 +478,7 @@ class RoomMapCard extends HTMLElement {
     let tip = "";
     if (ed.sel) {
       const tx = clamp(x(ed.selEnd ? 1440 : ed.sel.m), L + 52, W - R - 52), ty = y(ed.sel.t) - 22 < T + 8 ? y(ed.sel.t) + 34 : y(ed.sel.t) - 22;
-      tip = `<text x="${tx}" y="${ty}" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">${ed.selEnd ? "End of day" : fmtTime(ed.sel.m)} · ${ed.sel.t}°</text>`;
+      tip = `<text x="${tx}" y="${ty}" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">${ed.selEnd ? "End of day" : fmtTime(ed.sel.m)} · ${k.fmt(ed.sel.t)}</text>`;
     }
     m.querySelector("svg").innerHTML = `<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent" data-plot="1"/>
       <g pointer-events="none">${grid}<path d="${area}" fill="#3fa9ff" fill-opacity=".15"/>
@@ -472,12 +487,12 @@ class RoomMapCard extends HTMLElement {
       `<button data-x="day" data-d="${d}" class="${d === ed.day ? "on" : ""}">${n}</button>`).join("");
     const sel = ed.sel, fixed = sel && (ed.selEnd || sel.m === 0), dis = fixed ? "disabled" : "";
     m.querySelector('[data-slot="readout"]').innerHTML = sel
-      ? `<div class="rc-row"><div class="rc-step"><button data-x="t" data-d="-1">−</button><span>${sel.t}°</span><button data-x="t" data-d="1">+</button></div>
+      ? `<div class="rc-row"><div class="rc-step"><button data-x="t" data-d="-1">−</button><span>${k.fmt(sel.t)}</span><button data-x="t" data-d="1">+</button></div>
            <div class="rc-step"><button data-x="m" data-d="-15" ${dis}>−15m</button><span style="min-width:5.5em">${ed.selEnd ? "End of day" : fmtTime(sel.m)}</span><button data-x="m" data-d="15" ${dis}>+15m</button></div>
            <button data-x="del" ${dis}>Delete</button></div>
          ${fixed ? `<p class="rc-sub" style="margin:0">${ed.selEnd ? `End of day is the start of ${DAYS[(ed.day + 1) % 7]}: only its temperature can change.` : "Start of day: only its temperature can change."}</p>` : ""}`
       : `<p class="rc-sub" style="margin:8px 0">Tap the chart to add a point · drag a point to change its time and temperature.
-           The temperature holds until the next point${pts.length ? "" : " (no points yet: using the default temp)"}.</p>`;
+           ${k.hint}.</p>`;
   }
 
   _svgPt(e, svg) {
@@ -485,9 +500,9 @@ class RoomMapCard extends HTMLElement {
     return p.matrixTransform(svg.getScreenCTM().inverse());
   }
   _fromChart(p) {
-    const W = 640, H = 320, L = 46, R = 14, T = 14, B = 30;
+    const k = this._ed.k, W = 640, H = 320, L = 46, R = 14, T = 14, B = 30;
     const m = clamp(Math.round((p.x - L) / (W - L - R) * 1440 / 15) * 15, 0, 1425);
-    const t = clamp(Math.round(TEMP_MIN + (1 - (p.y - T) / (H - T - B)) * (TEMP_MAX - TEMP_MIN)), TEMP_MIN, TEMP_MAX);
+    const t = clamp(Math.round(k.lo + (1 - (p.y - T) / (H - T - B)) * (k.hi - k.lo)), k.lo, k.hi);
     return { m, t };
   }
   _edDown(e, svg) {
@@ -523,13 +538,13 @@ class RoomMapCard extends HTMLElement {
     switch (b.dataset.x) {
       case "cancel": this._closeSchedule(); return;
       case "save": {
-        const sched = this._toSchedule(ed.days);
+        const k = ed.k, sched = this._toSchedule(ed.days, k.field);
         this._closeSchedule();
-        this._set({ schedule: sched });
+        this._set({ [k.key]: sched });
         return;
       }
       case "day": ed.day = d; ed.sel = null; ed.selEnd = false; break;
-      case "t": ed.sel.t = clamp(ed.sel.t + d, TEMP_MIN, TEMP_MAX); break;
+      case "t": ed.sel.t = clamp(ed.sel.t + d, ed.k.lo, ed.k.hi); break;
       case "m": {
         if (ed.selEnd || ed.sel.m === 0) break;
         const nm = clamp(ed.sel.m + d, 0, 1425);
@@ -549,12 +564,12 @@ class RoomMapCard extends HTMLElement {
     this._edRender();
   }
 
-  // Per-day point lists -> schedule entries, merging days that share an identical (time, temp) point.
-  _toSchedule(days) {
+  // Per-day point lists -> schedule entries, merging days that share an identical (time, value) point.
+  _toSchedule(days, field = "temp") {
     const by = new Map();
     days.forEach((pts, d) => pts.forEach(p => {
       const key = `${p.m}|${p.t}`;
-      if (!by.has(key)) by.set(key, { days: [], start: toHHMM(p.m), temp: p.t });
+      if (!by.has(key)) by.set(key, { days: [], start: toHHMM(p.m), [field]: p.t });
       by.get(key).days.push(d);
     }));
     return [...by.values()].sort((a, b) => toMin(a.start) - toMin(b.start));

@@ -90,6 +90,24 @@ const rt = card._toSchedule(card._ed.days);
 const want = [{days:[0,1,2,3,4,5,6], start:"00:00", temp:65}, ...room.schedule].map(e => ({...e}));
 ok("untouched schedule round-trips (plus explicit 00:00 start at the carried-in temp)", JSON.stringify(rt) === JSON.stringify(want));
 card._closeSchedule();
+// Priority schedule: same editor, 1-5 scale, saved as priority_schedule
+card._openSchedule(room, "prio");
+const ped = card._ed;
+ok("priority editor seeds 00:00 with the default priority", ped.days.every(d => d.length === 1 && d[0].m === 0 && d[0].t === 3));
+ok("priority editor title", document.querySelector(".rc-sheet h3").textContent.startsWith("Priority schedule"));
+const PY = p => 14 + 276 * (1 - (p - 1) / 4), psvg = document.querySelector(".rc-chart");
+const pat = (x, y) => { const r = psvg.getBoundingClientRect(), s = r.width / 640; return { clientX: r.left + x * s, clientY: r.top + y * s, pointerId: 1, bubbles: true }; };
+psvg.querySelector("[data-plot]").dispatchEvent(new PointerEvent("pointerdown", pat(X(540), PY(1))));
+psvg.dispatchEvent(new PointerEvent("pointerup", pat(X(540), PY(1))));
+ok("tap adds 9:00 AM @ P1", ped.sel && ped.sel.m === 540 && ped.sel.t === 1);
+document.querySelector('[data-x="t"][data-d="-1"]').click();
+ok("priority clamps at 1", ped.sel.t === 1);
+document.querySelector('[data-x="copy"][data-to="weekdays"]').click();
+saved = null; document.querySelector('[data-x="save"]').click(); await new Promise(r => setTimeout(r, 50));
+const ps = saved && saved.priority_schedule;
+ok("save sent priority_schedule only", Array.isArray(ps) && !("schedule" in saved));
+ok("weekday 9:00 entry at priority 1", ps && ps.some(e => e.start === "09:00" && e.priority === 1 && [0,1,2,3,4].every(d => e.days.includes(d)) && !e.days.includes(5)));
+ok("entries carry priority, not temp", ps && ps.every(e => "priority" in e && !("temp" in e)));
 // diagnostics view
 card._sel = null; card._render();
 ok("home panel is minimal (tiles + button, no room list)", !card.querySelector(".rc-rm") && !!card.querySelector('[data-act="diag"]'));

@@ -23,6 +23,8 @@ def room_from_dict(d):
         id=d["id"], name=d.get("name", d["id"]), unit=d.get("unit"), sensor=d.get("sensor"),
         priority=int(d.get("priority", 3)), default_temp=float(d.get("default_temp", 68)),
         schedule=[core.ScheduleEntry(list(e["days"]), e["start"], float(e["temp"])) for e in d.get("schedule", [])],
+        priority_schedule=[core.PriorityEntry(list(e["days"]), e["start"], int(e["priority"]))
+                           for e in d.get("priority_schedule", [])],
         hold_temp=d.get("hold_temp"),
         hold_until=datetime.fromisoformat(d["hold_until"]) if d.get("hold_until") else None,
         floor=int(d.get("floor", 1)), shape=d.get("shape", {}))
@@ -70,7 +72,7 @@ def set_room(msg):
     room = next((r for r in cfg["rooms"] if r["id"] == msg["room_id"]), None)
     if room is None:
         raise KeyError("unknown room")
-    for k in ("priority", "default_temp", "schedule", "hold_temp"):
+    for k in ("priority", "default_temp", "schedule", "priority_schedule", "hold_temp"):
         if k in msg:
             room[k] = msg[k]
     if "hold_hours" in msg:

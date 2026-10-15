@@ -372,3 +372,30 @@ def test_free_heating_when_enabled_lets_a_slightly_cool_room_coast():
     assert core.room_costs(r, 68.5, None, MON, s, outdoor=88.0)[0] == 0
     assert core.room_costs(r, 68.5, None, MON, s, outdoor=70.0)[0] > 0
     assert core.room_costs(r, 63.0, None, MON, s, outdoor=88.0)[0] > 0  # floor always counts
+
+
+def test_priority_schedule_steps_and_falls_back_to_fixed_priority():
+    from core import PriorityEntry
+    wk = [0, 1, 2, 3, 4]
+    r = Room("bed", "Bed", "u", priority=4,
+             priority_schedule=[PriorityEntry(wk, "08:00", 1), PriorityEntry(wk, "20:00", 5)])
+    day = MON.replace(hour=0, minute=0)
+    assert core.room_priority(r, day.replace(hour=12)) == 1
+    assert core.room_priority(r, day.replace(hour=22)) == 5
+    assert core.room_priority(r, day.replace(hour=7)) == 5  # Sunday had no entry, so Friday 20:00 carries
+    assert core.room_priority(Room("x", "X", "u", priority=4), day) == 4
+    assert core.room_priority(Room("x", "X", "u", priority=9), day) == 5  # clamped
+
+
+def test_priority_schedule_shifts_unit_toward_the_room_in_use():
+    from core import PriorityEntry
+    wk = [0, 1, 2, 3, 4, 5, 6]
+    living = Room("liv", "Living", "u", priority=3, default_temp=68)
+    bed = Room("bed", "Bed", "u", priority=3, default_temp=68,
+               priority_schedule=[PriorityEntry(wk, "08:00", 1), PriorityEntry(wk, "21:00", 5)])
+    readings_at = lambda t: {"liv": (70.0, t), "bed": (66.0, t)}
+    noon, night = MON.replace(hour=12, minute=0), MON.replace(hour=22, minute=0)
+    e_noon = core.weighted_error([living, bed], readings_at(noon), noon, Settings())[0]
+    e_night = core.weighted_error([living, bed], readings_at(night), night, Settings())[0]
+    # noon: (3*2 + 1*-2)/4 = +1.0 (warm living room dominates); night: (3*2 + 5*-2)/8 = -0.5 (cool bedroom does)
+    assert abs(e_noon - 1.0) < 1e-9 and abs(e_night + 0.5) < 1e-9
