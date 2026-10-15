@@ -131,6 +131,22 @@ def _house(bed=67.0, down=67.0, bed_pred=None, down_pred=None, house=None, at=MO
     return core.control_step(units, rooms, readings, pred, {}, states or {}, house or core.HouseState(), at, busy=busy)
 
 
+def _started(rooms, units, readings, pred=None, manual=None, busy=None):
+    """control_step twice, past the confirmation time: leaving "off" takes a held demand, not one reading."""
+    house = core.HouseState()
+    for minutes in (0, 11):
+        now = MON + timedelta(minutes=minutes)
+        rd = {k: (v[0], now) for k, v in readings.items()}
+        cmds, house, info = core.control_step(units, rooms, rd, pred or {}, {}, {}, house, now, manual=manual, busy=busy)
+    return cmds, house, info
+
+
+def _house_started(bed=67.0, down=67.0, bed_pred=None, down_pred=None, busy=None):
+    rooms = [Room("bed", "Bedroom", "ms", priority=5, default_temp=67), Room("down", "Living", "ah", priority=2, default_temp=67)]
+    units = [Unit("ah", "c1"), Unit("ms", "c2")]
+    return _started(rooms, units, {"bed": (bed, MON), "down": (down, MON)}, {"bed": bed_pred, "down": down_pred}, busy=busy)
+
+
 def test_costs_zero_inside_band_and_floor_beats_priority():
     s = core.Settings()
     hi_pri = Room("a", "A", "u", priority=5, default_temp=67)
@@ -161,7 +177,7 @@ def test_predict_trend():
 def test_cold_morning_heats_with_every_unit_steady_at_target():
     # Downstairs below the floor -> heat. Every unit holds the 67 target; the inverters slow down on their own
     # as rooms get there, instead of flipping between run/idle setpoints.
-    cmds, house, info = _house(bed=66.3, down=59.5)
+    cmds, house, info = _house_started(bed=66.3, down=59.5)
     assert house.mode == "heat" and info["cold"] > 0
     assert cmds["ah"].mode == "heat" and cmds["ah"].setpoint == 67 and cmds["ah"].active
     assert cmds["ms"].mode == "heat" and cmds["ms"].setpoint == 67
@@ -205,9 +221,9 @@ def test_own_cooling_trend_does_not_flip_back_to_heat():
 
 def test_manual_cooling_trend_does_not_trigger_heat():
     # Unit cooled by hand: the bedroom drops fast, but that's the unit, not the room getting cold.
-    _, house, _ = _house(bed=66.2, bed_pred=63.0, down=67.0, busy={"ms"})
+    _, house, _ = _house_started(bed=66.2, bed_pred=63.0, down=67.0, busy={"ms"})
     assert house.mode == "off"
-    _, house, _ = _house(bed=66.2, bed_pred=63.0, down=67.0)
+    _, house, _ = _house_started(bed=66.2, bed_pred=63.0, down=67.0)
     assert house.mode == "heat"
 
 
@@ -371,7 +387,7 @@ def test_free_heating_when_enabled_lets_a_slightly_cool_room_coast():
     r = Room("r", "R", "u", priority=5, default_temp=70)
     assert core.room_costs(r, 68.5, None, MON, s, outdoor=88.0)[0] == 0
     assert core.room_costs(r, 68.5, None, MON, s, outdoor=70.0)[0] > 0
-    assert core.room_costs(r, 63.0, None, MON, s, outdoor=88.0)[0] > 0  # floor always counts
+    assert core.room_costs(r, s.floor - 1.0, None, MON, s, outdoor=88.0)[0] > 0  # floor always counts
 
 
 def test_priority_schedule_steps_and_falls_back_to_fixed_priority():
@@ -468,7 +484,7 @@ def test_unit_on_its_thermostat_in_auto_or_off_does_not_steer():
     units = [Unit("ah", "c1"), Unit("ms", "c2")]
     readings = {"down": (60.0, MON), "bed": (66.0, MON)}
     for m in ("auto", "off", "heat_cool"):
-        _, house, info = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": m})
+        _, house, info = _started(rooms, units, readings, manual={"ms": m})
         assert house.mode == "heat" and "following" not in info["reason"], m
 
 
@@ -499,11 +515,59 @@ def test_no_readings_keeps_the_setpoint_instead_of_jumping_to_a_limit():
 def test_rooms_on_thermostat_units_do_not_pick_the_house_mode():
     rooms = [Room("bed3", "Bedroom 3", "ms", default_temp=67), Room("k", "Kitchen", "ah", default_temp=67)]
     units = [Unit("ah", "c1"), Unit("ms", "c2")]
-    readings = {"bed3": (76.0, MON), "k": (65.5, MON)}  # bedroom 3's unit sensor reads hot; the kitchen is cool
-    _, house, info = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": "off"})
+    readings = {"bed3": (76.0, MON), "k": (64.5, MON)}  # bedroom 3's unit sensor reads hot; the kitchen is clearly cool
+    _, house, info = _started(rooms, units, readings, manual={"ms": "off"})
     assert house.mode == "heat" and "bed3" not in info["rooms"]
-    _, house, _ = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": "unavailable"})
+    _, house, _ = _started(rooms, units, readings, manual={"ms": "unavailable"})
     assert house.mode == "heat"
     # with nothing under our control, every room still counts (what Room Climate would do)
     _, house, info = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": "off", "ah": "off"})
     assert "bed3" in info["rooms"]
+
+
+# --- leaving "off", the hard floor, and units that just changed mode ---
+def test_a_hair_under_the_floor_does_not_start_the_house():
+    s = Settings()
+    r = Room("pb", "Primary", "ms", priority=5, default_temp=65)  # night target 65, as in the house
+    u = Unit("ms", "c2")
+    c, h = core.room_costs(r, 64.94, None, MON, s)
+    assert c == 0 and h == 0  # the floor (63) is below the target band, so a rounding step costs nothing
+    _, house, info = core.control_step([u], [r], {"pb": (64.94, MON)}, {}, {}, {}, core.HouseState(), MON)
+    assert house.mode == "off" and info["reason"] == "house comfortable"
+
+
+def test_leaving_off_needs_real_demand_held_for_the_confirmation_time():
+    s = Settings()
+    h = core.HouseState()
+    h, why = core.choose_mode(0.5, 0.0, h, MON, s)  # below start_cost
+    assert h.mode == "off" and h.pending is None
+    h, why = core.choose_mode(5.0, 0.0, h, MON, s)
+    assert h.mode == "off" and h.pending == "heat" and "confirming" in why
+    h, why = core.choose_mode(5.0, 0.0, h, MON + timedelta(minutes=5), s)
+    assert h.mode == "off" and "5/10" in why
+    h, why = core.choose_mode(5.0, 0.0, h, MON + timedelta(minutes=10), s)
+    assert h.mode == "heat" and h.since == MON + timedelta(minutes=10)
+
+
+def test_demand_that_goes_away_or_flips_restarts_the_confirmation():
+    s = Settings()
+    h, _ = core.choose_mode(5.0, 0.0, core.HouseState(), MON, s)
+    h, _ = core.choose_mode(0.2, 0.0, h, MON + timedelta(minutes=6), s)  # gone
+    assert h.mode == "off" and h.pending is None
+    h, _ = core.choose_mode(5.0, 0.0, h, MON + timedelta(minutes=7), s)
+    h, _ = core.choose_mode(0.0, 5.0, h, MON + timedelta(minutes=12), s)  # flipped to cool: new clock
+    assert h.pending == "cool" and h.pending_since == MON + timedelta(minutes=12)
+
+
+def test_unit_sensor_room_keeps_its_reading_while_the_unit_settles_after_a_mode_change():
+    s = Settings()
+    changed = MON
+    assert core.settling(changed, MON + timedelta(minutes=14), s) and not core.settling(changed, MON + timedelta(minutes=16), s)
+    assert not core.settling(None, MON, s)
+    _, last = core.hold_reading((67.1, MON), None, MON, s)
+    got, last = core.hold_reading((63.5, MON + timedelta(minutes=1)), last, MON + timedelta(minutes=1), s, settle=True)
+    assert got == (67.1, MON)  # the drop is ignored
+    got, last = core.hold_reading((64.4, MON + timedelta(minutes=20)), last, MON + timedelta(minutes=20), s, settle=False)
+    assert got == (64.4, MON + timedelta(minutes=20))  # settled: believe the sensor again
+    got, _ = core.hold_reading((63.5, MON), None, MON, s, settle=True)
+    assert got == (63.5, MON)  # nothing earlier to hold: use what there is

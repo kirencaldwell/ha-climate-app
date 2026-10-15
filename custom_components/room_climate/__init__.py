@@ -66,6 +66,7 @@ class Manager:
         self.house = core.HouseState()
         self.house_info: dict = {}
         self.hist: dict[str, list] = {}  # room id -> [(time, temp F)] for trend prediction
+        self._mode_seen: dict[str, tuple] = {}  # unit id -> (mode, when we saw it change; None = since startup)
         self.last_good: dict[str, tuple] = {}  # room id -> (temp F, reading time, last seen) to bridge sensor dropouts
         self.prev_busy: set = set()
         self.sent: dict = {}  # unit id -> (last setpoint command, when); for thermostat units, what we would have sent
@@ -178,16 +179,34 @@ class Manager:
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
         units = [_unit_from_dict(ud) for ud in self.data["units"]]
         readings, predicted = {}, {}
+        settle = set()  # units that changed mode recently
+        for u in units:
+            cur = self.hass.states.get(u.entity)
+            if cur is None or cur.state in BAD_STATES:
+                continue
+            seen = self._mode_seen.get(u.id)
+            if seen is None:
+                self._mode_seen[u.id] = (cur.state, None)
+            elif seen[0] != cur.state:
+                self._mode_seen[u.id] = (cur.state, now)
+                for r in rooms:  # the trend from before the change no longer applies
+                    if r.unit == u.id and self.hist.get(r.id):
+                        self.hist[r.id] = self.hist[r.id][-1:]
+            if core.settling(self._mode_seen[u.id][1], now, settings):
+                settle.add(u.id)
+        unit_entity = {u.id: u.entity for u in units}
         for r in rooms:
             if not r.sensor:
                 continue
             val, ts = self._f(r.sensor)
-            got, self.last_good[r.id] = core.hold_reading(None if val is None else (val, ts), self.last_good.get(r.id), now, settings)
+            own = r.unit in settle and r.sensor == unit_entity.get(r.unit)  # reads its own unit, which just changed mode
+            got, self.last_good[r.id] = core.hold_reading(None if val is None else (val, ts), self.last_good.get(r.id), now,
+                                                          settings, settle=own)
             if got is None:
                 continue
             readings[r.id] = got
-            if val is None:
-                continue  # bridging a dropout: no new point for the trend
+            if val is None or own:
+                continue  # bridging a dropout or a mode change: no new point for the trend
             h = self.hist.setdefault(r.id, [])
             h.append((now, val))
             del h[:max(0, next((k for k, (t, _) in enumerate(h) if core.elapsed(now, t) <= settings.history_s), len(h)))]
@@ -506,7 +525,22 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         await mgr.async_set_control(msg["unit_id"], msg["control"], "set in the Room Climate card")
         connection.send_result(msg["id"], mgr.snapshot())
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_log_client):
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/set_settings", vol.Required("settings"): dict})
+    @websocket_api.async_response
+    async def ws_set_settings(hass, connection, msg):
+        known = {f.name for f in dataclasses.fields(core.Settings)}
+        new = msg["settings"]
+        bad = [k for k, v in new.items() if k not in known or not isinstance(v, (int, float, bool, str, type(None)))]
+        if bad:
+            connection.send_error(msg["id"], "invalid", f"unknown or invalid settings: {', '.join(bad)}")
+            return
+        mgr.data.setdefault("settings", {}).update(new)
+        _LOGGER.info("settings changed: %s", new)
+        await mgr.async_save()
+        await mgr.async_tick()
+        connection.send_result(msg["id"], mgr.snapshot())
+
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client):
         websocket_api.async_register_command(hass, fn)
 
     unit_entities = [u["entity"] for u in mgr.data["units"]]

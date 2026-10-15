@@ -69,7 +69,7 @@ class Settings:
     band_below: float = 1.0
     band_above: float = 1.5
     # House-wide hard limits: a room past these outweighs any priority.
-    floor: float = 65.0
+    floor: float = 63.0  # below every schedule's night target, so a target at 65 doesn't sit on the hard limit
     ceiling: float = 72.0
     hard_weight: float = 20.0
     # Prediction: project each room's recent trend this far ahead.
@@ -82,6 +82,7 @@ class Settings:
     switch_ratio: float = 1.5
     switch_margin: float = 0.5
     min_cost: float = 0.05  # demand below this counts as comfortable
+    start_cost: float = 1.0  # demand needed to leave "off" (then confirmed for switch_confirm_s like any mode switch)
     max_offset: float = 6.0  # clamp on sensor-vs-unit-sensor compensation
     # Inverter efficiency: keep setpoints steady so the compressor modulates instead of stopping and starting.
     setpoint_min_change: float = 1.0  # ignore setpoint moves smaller than this (F)
@@ -92,6 +93,9 @@ class Settings:
     # A sensor that goes unavailable (Bluetooth sensors drop out for seconds to minutes) keeps its last reading this
     # long before the room counts as having no reading.
     dropout_grace_s: int = 900
+    # A room that reads its own unit's sensor can jump when that unit changes mode (the sensor is in the unit's airflow),
+    # so for this long after a mode change the room keeps the reading from just before it.
+    mode_settle_s: int = 900
     # Free cooling/heating (off by default): when it's at least this much colder outside than a room, a room merely
     # above its comfort band is left to cool off on its own, so only the hard ceiling asks for cooling (mirrored for
     # heat on hot days). Off because a schedule drop to a cold target should actively cool, not wait for the weather.
@@ -200,10 +204,18 @@ def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]
     return num / den, rsum / den
 
 
+def settling(changed_at: Optional[datetime], now: datetime, settings: Settings = Settings()) -> bool:
+    """True for `mode_settle_s` after a unit changed mode (None = no change seen yet)."""
+    return changed_at is not None and elapsed(now, changed_at) < settings.mode_settle_s
+
+
 def hold_reading(fresh: Optional[tuple[float, datetime]], last: Optional[tuple[float, datetime, datetime]],
-                 now: datetime, settings: Settings = Settings()):
+                 now: datetime, settings: Settings = Settings(), settle: bool = False):
     """Bridge a sensor dropout. `fresh` is this tick's (value, time) or None if unavailable; `last` is the previous
-    result of this function's second value: (value, time, when it was last seen). Returns (reading to use, new last)."""
+    result of this function's second value: (value, time, when it was last seen). Returns (reading to use, new last).
+    With `settle`, a fresh reading is ignored in favour of the last one (see `mode_settle_s`)."""
+    if settle and last is not None:
+        return (last[0], last[1]), last
     if fresh is not None:
         return fresh, (fresh[0], fresh[1], now)
     if last is not None and elapsed(now, last[2]) <= settings.dropout_grace_s:
@@ -255,15 +267,26 @@ def choose_mode(cold: float, hot: float, house: HouseState, now: datetime,
                 settings: Settings = Settings()) -> tuple[HouseState, str]:
     """Pick the house mode from total cold vs hot demand. Never goes back to off once running.
 
+    Leaving "off" (first start, or after a restart) takes demand of `start_cost`, held for `switch_confirm_s`, so a
+    sensor ticking a hair past a limit can't start the compressor.
+
     Each heat<->cool switch stops the compressor and reverses the refrigerant flow, so a switch needs the other
     side to be clearly worse *continuously* for `switch_confirm_s`, after at least `min_mode_s` in the mode.
     """
     can = {"heat": settings.allow_heat, "cool": settings.allow_cool}
     if house.mode not in ("heat", "cool"):
         want = "heat" if cold >= hot else "cool"
-        if max(cold, hot) < settings.min_cost or not can[want]:
+        demand = max(cold, hot)
+        if demand < settings.start_cost or not can[want]:
             return HouseState("off"), "house comfortable"
-        return HouseState(want, now), f"{'cold' if want == 'heat' else 'hot'} demand {max(cold, hot):.2f}"
+        what = f"{'cold' if want == 'heat' else 'hot'} demand {demand:.2f}"
+        if house.pending != want:
+            return HouseState("off", None, want, now), f"{want} wanted ({what}); confirming"
+        waited = elapsed(now, house.pending_since)
+        if waited < settings.switch_confirm_s:
+            return HouseState("off", None, want, house.pending_since), \
+                f"{want} wanted ({what}); confirming {int(waited // 60)}/{settings.switch_confirm_s // 60} min"
+        return HouseState(want, now), what
     mine, theirs = (cold, hot) if house.mode == "heat" else (hot, cold)
     other = "cool" if house.mode == "heat" else "heat"
     stay = HouseState(house.mode, house.since)
