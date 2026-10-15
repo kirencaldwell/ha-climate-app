@@ -89,6 +89,9 @@ class Settings:
     # Reading older than this is ignored. Long, because Bluetooth sensors (e.g. Govee) only update when the value
     # changes; a sensor that really drops out goes unavailable instead.
     stale_s: int = 7200
+    # A sensor that goes unavailable (Bluetooth sensors drop out for seconds to minutes) keeps its last reading this
+    # long before the room counts as having no reading.
+    dropout_grace_s: int = 900
     # Free cooling/heating (off by default): when it's at least this much colder outside than a room, a room merely
     # above its comfort band is left to cool off on its own, so only the hard ceiling asks for cooling (mirrored for
     # heat on hot days). Off because a schedule drop to a cold target should actively cool, not wait for the weather.
@@ -197,6 +200,17 @@ def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]
     return num / den, rsum / den
 
 
+def hold_reading(fresh: Optional[tuple[float, datetime]], last: Optional[tuple[float, datetime, datetime]],
+                 now: datetime, settings: Settings = Settings()):
+    """Bridge a sensor dropout. `fresh` is this tick's (value, time) or None if unavailable; `last` is the previous
+    result of this function's second value: (value, time, when it was last seen). Returns (reading to use, new last)."""
+    if fresh is not None:
+        return fresh, (fresh[0], fresh[1], now)
+    if last is not None and elapsed(now, last[2]) <= settings.dropout_grace_s:
+        return (last[0], last[1]), last
+    return None, last
+
+
 def predict(history: list[tuple[datetime, float]], now: datetime, settings: Settings = Settings()) -> Optional[float]:
     """Project a room's temperature `horizon_s` ahead from a least-squares trend over the last `history_s`."""
     pts = [(t, v) for t, v in history if elapsed(now, t) <= settings.history_s]
@@ -282,9 +296,9 @@ def unit_command(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float,
         return Command("off", None, "house comfortable")
     res = weighted_error(rooms, readings, now, settings)
     if res is None:
-        # No reading: hold a safe setpoint at the limit so the unit only works to keep rooms off the floor/ceiling.
-        sp = settings.floor if mode == "heat" else settings.ceiling
-        return Command(mode, float(max(unit.min_setpoint, min(unit.max_setpoint, round(sp)))), "no fresh sensors; holding limit")
+        # No reading (sensors out past the dropout grace, or none yet after a restart): leave the unit's setpoint as
+        # it is rather than jumping to a limit; stabilize keeps our last setpoint if we have one.
+        return Command(mode, None, "no fresh sensors; holding setpoint")
     err, avg = res
     target = avg - err
     offset = 0.0
@@ -305,7 +319,11 @@ def stabilize(cmd: Command, prev: Optional[tuple[Command, datetime]], now: datet
     "Small" compares the unrounded setpoint, so a value hovering near x.5 doesn't alternate between two whole
     degrees. A small hold is the normal steady state and isn't annotated; only a real move held back by the
     interval says so."""
-    if prev is None or cmd.setpoint is None:
+    if cmd.setpoint is None:
+        if prev is not None and prev[0].mode == cmd.mode and prev[0].setpoint is not None:
+            return Command(cmd.mode, prev[0].setpoint, cmd.reason, cmd.active, prev[0].setpoint), False
+        return cmd, True
+    if prev is None:
         return cmd, True
     pcmd, at = prev
     if pcmd.mode != cmd.mode or pcmd.setpoint is None:
@@ -345,9 +363,14 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
 
     cold = hot = 0.0
     per_room: dict[str, tuple[float, float]] = {}
+    # Only rooms on units we drive pick heat vs cool: a unit left on its thermostat isn't ours to serve, and its room
+    # may read from that unit's own (biased) sensor. With no unit under our control every room counts, so what Room
+    # Climate *would* do stays meaningful.
+    ours = {u.id for u in units} - set(manual or {})
+    voters = ours or {u.id for u in units}
     for r in rooms:
-        if r.unit is None:
-            continue  # monitor-only rooms don't steer the house
+        if r.unit is None or r.unit not in voters:
+            continue  # monitor-only rooms (and rooms of thermostat-run units) don't steer the house
         got = readings.get(r.id)
         if not got or elapsed(now, got[1]) > settings.stale_s:
             continue

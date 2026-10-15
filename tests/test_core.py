@@ -470,3 +470,40 @@ def test_unit_on_its_thermostat_in_auto_or_off_does_not_steer():
     for m in ("auto", "off", "heat_cool"):
         _, house, info = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": m})
         assert house.mode == "heat" and "following" not in info["reason"], m
+
+
+# --- sensor dropouts and missing readings ---
+def test_short_dropout_keeps_the_last_reading_then_lets_go():
+    s = Settings()
+    got, last = core.hold_reading((70.0, MON), None, MON, s)
+    assert got == (70.0, MON)
+    got, last = core.hold_reading(None, last, MON + timedelta(minutes=7), s)
+    assert got == (70.0, MON)  # bridged
+    got, _ = core.hold_reading(None, last, MON + timedelta(minutes=16), s)
+    assert got is None  # past the grace: really gone
+
+
+def test_no_readings_keeps_the_setpoint_instead_of_jumping_to_a_limit():
+    s = Settings()
+    u, rooms = Unit("ah", "c1"), [Room("k", "Kitchen", "ah", default_temp=67)]
+    cmd = core.unit_command(u, rooms, {}, {}, "cool", None, UnitState("cool"), MON, s)
+    assert cmd.mode == "cool" and cmd.setpoint is None and "holding setpoint" in cmd.reason
+    held, changed = core.stabilize(cmd, (core.Command("cool", 67.0, raw=67.0), MON - timedelta(hours=1)), MON, s)
+    assert held.setpoint == 67.0 and not changed  # mid-run: keep what we sent
+    fresh, changed = core.stabilize(cmd, None, MON, s)
+    assert fresh.setpoint is None and changed  # just restarted: don't touch the unit's setpoint
+    after, changed = core.stabilize(core.Command("cool", 67.0, raw=67.2), (core.Command("cool", 67.0, raw=67.0), MON), MON + timedelta(minutes=2), s)
+    assert after.setpoint == 67.0  # readings back: no jump
+
+
+def test_rooms_on_thermostat_units_do_not_pick_the_house_mode():
+    rooms = [Room("bed3", "Bedroom 3", "ms", default_temp=67), Room("k", "Kitchen", "ah", default_temp=67)]
+    units = [Unit("ah", "c1"), Unit("ms", "c2")]
+    readings = {"bed3": (76.0, MON), "k": (65.5, MON)}  # bedroom 3's unit sensor reads hot; the kitchen is cool
+    _, house, info = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": "off"})
+    assert house.mode == "heat" and "bed3" not in info["rooms"]
+    _, house, _ = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": "unavailable"})
+    assert house.mode == "heat"
+    # with nothing under our control, every room still counts (what Room Climate would do)
+    _, house, info = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": "off", "ah": "off"})
+    assert "bed3" in info["rooms"]

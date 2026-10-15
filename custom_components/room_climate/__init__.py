@@ -66,6 +66,7 @@ class Manager:
         self.house = core.HouseState()
         self.house_info: dict = {}
         self.hist: dict[str, list] = {}  # room id -> [(time, temp F)] for trend prediction
+        self.last_good: dict[str, tuple] = {}  # room id -> (temp F, reading time, last seen) to bridge sensor dropouts
         self.prev_busy: set = set()
         self.sent: dict = {}  # unit id -> (last setpoint command, when); for thermostat units, what we would have sent
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
@@ -176,9 +177,12 @@ class Manager:
             if not r.sensor:
                 continue
             val, ts = self._f(r.sensor)
-            if val is None:
+            got, self.last_good[r.id] = core.hold_reading(None if val is None else (val, ts), self.last_good.get(r.id), now, settings)
+            if got is None:
                 continue
-            readings[r.id] = (val, ts)
+            readings[r.id] = got
+            if val is None:
+                continue  # bridging a dropout: no new point for the trend
             h = self.hist.setdefault(r.id, [])
             h.append((now, val))
             del h[:max(0, next((k for k, (t, _) in enumerate(h) if core.elapsed(now, t) <= settings.history_s), len(h)))]
@@ -186,8 +190,8 @@ class Manager:
         manual, busy = {}, set()
         for u in units:
             cur = self.hass.states.get(u.entity)
-            if cur is not None and cur.state not in BAD_STATES and self.control(u.id) == THERMOSTAT:
-                manual[u.id] = cur.state
+            if self.control(u.id) == THERMOSTAT:  # even when unavailable: still not ours to drive
+                manual[u.id] = cur.state if cur is not None else "unavailable"
             if cur is not None and cur.attributes.get("hvac_action") in ("heating", "cooling"):
                 busy.add(u.id)
         for u in units:  # a compressor that started/stopped on its own makes the earlier trend misleading
