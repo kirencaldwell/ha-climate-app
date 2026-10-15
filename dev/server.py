@@ -64,6 +64,7 @@ def snapshot():
         cmd = house.cmd.get(uid)  # last command from the simulated control loop
         out["units_live"][uid] = core.diagnose(unit, list(house.rooms.values()), readings, house.unit_temp(uid),
                                                house.state[uid], cmd, house.now, house.settings)
+        out["units_live"][uid]["control"] = "room_climate"  # the sim always drives its units
     out["sim"] = {"time": house.now.strftime("%a %H:%M"), **state}
     return out
 
@@ -124,6 +125,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(snapshot())
             elif msg["type"] == "room_climate/set_room":
                 self._send(set_room(msg))
+            elif msg["type"] == "room_climate/set_control":
+                self._send(snapshot())  # the sim always drives its units
             elif msg["type"] == "sim/set":
                 for k in ("outdoor", "speed"):
                     if k in msg:

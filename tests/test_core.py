@@ -450,3 +450,23 @@ def test_schedule_follows_the_local_clock_on_dst_days():
         assert core.target_temp(r, day.replace(hour=5, minute=59)) == 64
         assert core.room_priority(r, day.replace(hour=6, minute=59)) == 5
         assert core.room_priority(r, day.replace(hour=7, minute=0)) == 2
+
+
+# --- thermostat control: units not driven by us still share the compressor ---
+def test_unit_on_its_thermostat_in_heat_or_cool_sets_the_house_mode():
+    rooms = [Room("bed", "Bedroom", "ms", default_temp=67), Room("down", "Living", "ah", default_temp=67)]
+    units = [Unit("ah", "c1"), Unit("ms", "c2")]
+    readings = {"down": (60.0, MON), "bed": (66.0, MON)}  # living room wants heat
+    cmds, house, info = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": "cool"})
+    assert house.mode == "cool" and cmds["ah"].mode == "cool" and "following cool" in info["reason"]
+    cmds, house, _ = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": "heat"})
+    assert house.mode == "heat" and cmds["ah"].mode == "heat"
+
+
+def test_unit_on_its_thermostat_in_auto_or_off_does_not_steer():
+    rooms = [Room("bed", "Bedroom", "ms", default_temp=67), Room("down", "Living", "ah", default_temp=67)]
+    units = [Unit("ah", "c1"), Unit("ms", "c2")]
+    readings = {"down": (60.0, MON), "bed": (66.0, MON)}
+    for m in ("auto", "off", "heat_cool"):
+        _, house, info = core.control_step(units, rooms, readings, {}, {}, {}, core.HouseState(), MON, manual={"ms": m})
+        assert house.mode == "heat" and "following" not in info["reason"], m

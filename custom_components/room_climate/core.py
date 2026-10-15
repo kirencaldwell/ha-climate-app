@@ -329,16 +329,19 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
                  busy: Optional[set[str]] = None, outdoor: Optional[float] = None):
     """One control tick for the whole house -> (commands by unit id, new HouseState, info dict).
 
-    All units always share one mode. A unit put into dry or fan by hand takes over: the controller holds
-    and keeps every other unit off so the compressor never gets conflicting modes. `busy` lists units that are
+    All units always share one mode. `manual` holds the current mode of each unit under thermostat control (not
+    driven by us); commands are still computed for those units, as what Room Climate would do. A unit in dry or fan
+    takes over: the controller keeps every other unit off so the compressor never gets conflicting modes. A unit in
+    heat or cool on its thermostat sets the house mode for the rest, for the same reason. `busy` lists units that are
     actually heating/cooling right now (by us or by hand): their rooms' trends come from the unit, not the room.
     """
-    manual = {u: m for u, m in (manual or {}).items() if m in MANUAL_MODES}
-    if manual:
-        m = next(iter(manual.values()))
-        cmds = {u.id: (Command(manual[u.id], None, f"manual {manual[u.id]}; holding") if u.id in manual
+    blocking = {u: m for u, m in (manual or {}).items() if m in MANUAL_MODES}
+    if blocking:
+        m = next(iter(blocking.values()))
+        cmds = {u.id: (Command(blocking[u.id], None, f"manual {blocking[u.id]}; holding") if u.id in blocking
                        else Command("off", None, f"blocked: manual {m} on another unit")) for u in units}
         return cmds, house, {"mode": m, "reason": f"manual {m} in use", "cold": None, "hot": None, "rooms": {}}
+    forced = next((m for m in (manual or {}).values() if m in ("heat", "cool")), None)
 
     cold = hot = 0.0
     per_room: dict[str, tuple[float, float]] = {}
@@ -356,6 +359,9 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         cold, hot = cold + c, hot + h
         per_room[r.id] = (round(c, 2), round(h, 2))
     new_house, reason = choose_mode(cold, hot, house, now, settings)
+    if forced and new_house.mode != forced:
+        new_house = HouseState(forced, now if house.mode != forced else house.since)
+        reason = f"following {forced} set on a thermostat ({reason})"
     mode = new_house.mode
     cmds = {}
     for u in units:

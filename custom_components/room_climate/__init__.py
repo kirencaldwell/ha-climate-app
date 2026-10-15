@@ -12,7 +12,9 @@ from homeassistant.components import websocket_api
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.climate import ATTR_HVAC_MODE, DOMAIN as CLIMATE, SERVICE_SET_HVAC_MODE, SERVICE_SET_TEMPERATURE
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Context, Event, HomeAssistant
+from homeassistant.helpers import discovery
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
@@ -26,7 +28,13 @@ STORE_VERSION = 1
 INTERVAL = timedelta(seconds=60)
 F, C = UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
 
-CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({vol.Optional("enabled", default=True): bool})}, extra=vol.ALLOW_EXTRA)
+CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({vol.Optional("enabled"): bool})}, extra=vol.ALLOW_EXTRA)  # legacy key, ignored
+
+# Who drives a unit. "thermostat": its own mode and setpoint, set by hand (the default). "room_climate": we command it.
+ROOM_CLIMATE, THERMOSTAT = "room_climate", "thermostat"
+SIGNAL_CONTROL = f"{DOMAIN}_control"  # dispatched (unit id) when a unit's control changes
+OURS_GRACE_S = 30  # unit state changes this soon after we sent it something are its echo of our command
+BAD_STATES = ("unknown", "unavailable")
 
 
 def _room_from_dict(d: dict) -> core.Room:
@@ -52,16 +60,16 @@ class Manager:
     def __init__(self, hass: HomeAssistant):
         self.hass = hass
         self.store = Store(hass, STORE_VERSION, DOMAIN)
-        self.data: dict = {"rooms": [], "units": [], "settings": {}, "enabled": True, "floorplan": None}
+        self.data: dict = {"rooms": [], "units": [], "settings": {}, "floorplan": None}
         self.states: dict[str, core.UnitState] = {}
         self.last: dict[str, core.Command] = {}
-        self.shadow: dict[str, core.UnitState] = {}  # decision state while disabled (dry run), kept apart from the real one
         self.house = core.HouseState()
-        self.house_shadow = core.HouseState()
         self.house_info: dict = {}
         self.hist: dict[str, list] = {}  # room id -> [(time, temp F)] for trend prediction
         self.prev_busy: set = set()
-        self.sent: dict[bool, dict] = {True: {}, False: {}}  # live/dry-run -> unit id -> (last setpoint command, when)
+        self.sent: dict = {}  # unit id -> (last setpoint command, when); for thermostat units, what we would have sent
+        self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
+        self._ours: list[str] = []  # context ids of our recent service calls
         self._audit_seen: dict[str, tuple] = {}
         self._unsub = []
 
@@ -71,7 +79,43 @@ class Manager:
             seed = pathlib.Path(__file__).parent / "default_config.json"
             loaded = await self.hass.async_add_executor_job(lambda: json.loads(seed.read_text()))
             loaded.pop("_comment", None)
+        loaded.pop("enabled", None)  # the old dry-run switch; control is now per unit
+        for ud in loaded.get("units", []):
+            ud.setdefault("control", THERMOSTAT)
         self.data = loaded
+
+    def control(self, unit_id: str) -> str:
+        ud = next((u for u in self.data["units"] if u["id"] == unit_id), {})
+        return ud.get("control", THERMOSTAT)
+
+    async def async_set_control(self, unit_id: str, control: str, why: str):
+        ud = next((u for u in self.data["units"] if u["id"] == unit_id), None)
+        if ud is None or ud.get("control") == control:
+            return
+        ud["control"] = control
+        self.sent.pop(unit_id, None)  # taking over: send our setpoint now, not after the change interval
+        _LOGGER.info("%s control -> %s (%s)", unit_id, control, why)
+        await self.async_save()
+        async_dispatcher_send(self.hass, SIGNAL_CONTROL, unit_id)
+        await self.async_tick()
+
+    async def async_unit_changed(self, event: Event):
+        """A unit under our control changed mode or setpoint without us: someone used its thermostat, the app or the
+        remote. Hand it to the thermostat so we don't fight them."""
+        ud = next((u for u in self.data["units"] if u["entity"] == event.data["entity_id"]), None)
+        old, new = event.data.get("old_state"), event.data.get("new_state")
+        if ud is None or ud.get("control") != ROOM_CLIMATE or old is None or new is None:
+            return
+        if old.state in BAD_STATES or new.state in BAD_STATES:
+            return  # dropping off and reconnecting is not a change of mind
+        sp_old, sp_new = old.attributes.get("temperature"), new.attributes.get("temperature")
+        if old.state == new.state and sp_old == sp_new:
+            return
+        at = self._sent_at.get(ud["id"])
+        if event.context.id in self._ours or (at and core.elapsed(dt_util.utcnow(), at) < OURS_GRACE_S):
+            return
+        await self.async_set_control(ud["id"], THERMOSTAT,
+                                     f"changed at the thermostat: {old.state}/{sp_old} -> {new.state}/{sp_new}")
 
     async def async_save(self):
         await self.store.async_save(self.data)
@@ -120,10 +164,9 @@ class Manager:
         return None if cur is None else TemperatureConverter.convert(float(cur), self.hass.config.units.temperature_unit, F)
 
     async def async_tick(self, _now=None):
-        # Disabled means dry run: decide exactly as normal and log it against what the unit is really doing,
-        # but send nothing.
-        enabled = self.data.get("enabled", True)
-        states = self.states if enabled else self.shadow
+        # Decide for every unit, but send only to units under our control; for the rest the decision is shown as what
+        # Room Climate would do.
+        states = self.states
         now = dt_util.now()
         settings = core.Settings(**self.data.get("settings", {}))
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
@@ -143,7 +186,7 @@ class Manager:
         manual, busy = {}, set()
         for u in units:
             cur = self.hass.states.get(u.entity)
-            if cur is not None and cur.state in core.MANUAL_MODES:
+            if cur is not None and cur.state not in BAD_STATES and self.control(u.id) == THERMOSTAT:
                 manual[u.id] = cur.state
             if cur is not None and cur.attributes.get("hvac_action") in ("heating", "cooling"):
                 busy.add(u.id)
@@ -154,20 +197,17 @@ class Manager:
                         self.hist[r.id] = self.hist[r.id][-1:]
                         predicted[r.id] = None
         self.prev_busy = busy
-        house = self.house if enabled else self.house_shadow
+        house = self.house
         cmds, new_house, info = core.control_step(
             units, rooms, readings, predicted, {u.id: self._unit_temp(u.entity) for u in units},
             states, house, now, settings, manual, busy, self._outdoor(settings))
         if new_house.mode != house.mode:
-            _LOGGER.info("%s house mode %s -> %s (%s)", "LIVE" if enabled else "DRY-RUN", house.mode, new_house.mode, info["reason"])
-        if enabled:
-            self.house = new_house
-        else:
-            self.house_shadow = new_house
+            _LOGGER.info("house mode %s -> %s (%s)", house.mode, new_house.mode, info["reason"])
+        self.house = new_house
         self.house_info = {**info, "since": new_house.since.isoformat() if new_house.since else None,
                            "predicted": {k: None if v is None else round(v, 1) for k, v in predicted.items()}}
         self._tick_debug = (readings, predicted, info, settings)
-        sent = self.sent[enabled]
+        sent = self.sent
         for u in units:
             # Keep setpoints steady (inverter efficiency): small or too-frequent changes hold the previous one.
             cmd, changed = core.stabilize(cmds[u.id], sent.get(u.id), now, settings)
@@ -175,9 +215,10 @@ class Manager:
                 sent[u.id] = (cmd, now)
             state = states.setdefault(u.id, core.UnitState())
             self.last[u.id] = cmd
-            if enabled:
+            ours = self.control(u.id) == ROOM_CLIMATE
+            if ours:
                 await self._send(u, state, cmd)
-            self._audit(u, cmd, enabled, now)
+            self._audit(u, cmd, ours, now)
             states[u.id] = core.apply(state, cmd, now)
             if core.regime_changed(state, states[u.id]):
                 for r in rooms:
@@ -185,7 +226,7 @@ class Manager:
                         self.hist[r.id] = self.hist[r.id][-1:]
         self._publish(now, rooms)
 
-    def _audit(self, unit: core.Unit, cmd: core.Command, enabled: bool, now):
+    def _audit(self, unit: core.Unit, cmd: core.Command, ours: bool, now):
         """Log what we want the unit to do next to what it is doing. Logged only when the decision (mode, setpoint)
         or the unit's own mode/setpoint changes; reason wording and sensor ticks alone don't repeat the line."""
         cur = self.hass.states.get(unit.entity)
@@ -205,9 +246,10 @@ class Manager:
                     f"setpoint={actual_sp} action={a.get('hvac_action')} unit_temp={a.get('current_temperature')} | "
                     + ("MISMATCH " + "; ".join(diffs) if diffs else "in sync"))
             key = (cmd.mode, want_sp, cur.state, actual_sp)
+        key = (ours, *key)
         if self._audit_seen.get(unit.id) != key:
             self._audit_seen[unit.id] = key
-            _LOGGER.info("%s %s", "LIVE" if enabled else "DRY-RUN", line)
+            _LOGGER.info("%s %s", "CONTROL" if ours else "THERMOSTAT (would)", line)
 
     async def _send(self, unit: core.Unit, state: core.UnitState, cmd: core.Command):
         cur = self.hass.states.get(unit.entity)
@@ -218,14 +260,22 @@ class Manager:
             return  # nothing to say (e.g. holding with no sensors)
         if cur.state != mode:
             _LOGGER.info("SEND %s hvac_mode %s -> %s (%s)", unit.entity, cur.state, mode, cmd.reason)
-            await self.hass.services.async_call(CLIMATE, SERVICE_SET_HVAC_MODE,
-                                                {"entity_id": unit.entity, ATTR_HVAC_MODE: mode}, blocking=True)
+            await self._call(unit, SERVICE_SET_HVAC_MODE, {ATTR_HVAC_MODE: mode})
         if cmd.setpoint is not None:
             sp = TemperatureConverter.convert(cmd.setpoint, F, self.hass.config.units.temperature_unit)
-            if cur.attributes.get("temperature") != sp:
-                _LOGGER.info("SEND %s temperature %s -> %s (%s)", unit.entity, cur.attributes.get("temperature"), round(sp, 1), cmd.reason)
-                await self.hass.services.async_call(CLIMATE, SERVICE_SET_TEMPERATURE,
-                                                    {"entity_id": unit.entity, ATTR_TEMPERATURE: round(sp, 1)}, blocking=True)
+            have = cur.attributes.get("temperature")
+            # The unit keeps setpoints in 0.5 C steps (67 F reads back as 67.1), so near enough is done; resending
+            # every tick would never settle.
+            if have is None or abs(float(have) - sp) > 0.3:
+                _LOGGER.info("SEND %s temperature %s -> %s (%s)", unit.entity, have, round(sp, 1), cmd.reason)
+                await self._call(unit, SERVICE_SET_TEMPERATURE, {ATTR_TEMPERATURE: round(sp, 1)})
+
+    async def _call(self, unit: core.Unit, service: str, data: dict):
+        ctx = Context()  # tagged so the unit's resulting state change is recognized as ours, not a manual change
+        self._ours = (self._ours + [ctx.id])[-50:]
+        self._sent_at[unit.id] = dt_util.utcnow()
+        await self.hass.services.async_call(CLIMATE, service, {"entity_id": unit.entity, **data}, blocking=True, context=ctx)
+        self._sent_at[unit.id] = dt_util.utcnow()
 
     def _publish(self, now, rooms):
         for r in rooms:
@@ -281,7 +331,7 @@ class Manager:
             text(f"{p}_actual_mode", f"{name} actual mode", cur.state if cur else "unavailable", "mdi:hvac",
                  action=cur.attributes.get("hvac_action") if cur else None)
         text(f"sensor.{DOMAIN}_house_mode", "House mode", info.get("mode") or "off", "mdi:home-thermometer",
-             reason=info.get("reason"), dry_run=not self.data.get("enabled", True))
+             reason=info.get("reason"))
         temp(f"sensor.{DOMAIN}_outdoor", "Outdoor (as seen by controller)", info.get("outdoor"), "mdi:home-export-outline")
         for k in ("cold", "hot"):
             self.hass.states.async_set(f"sensor.{DOMAIN}_house_{k}_demand", info.get(k) or 0.0, {
@@ -303,11 +353,12 @@ class Manager:
         out["settings_effective"] = dataclasses.asdict(settings)
         out["units_live"] = {
             ud["id"]: core.diagnose(_unit_from_dict(ud), rooms, readings, self._unit_temp(ud["entity"]),
-                                    (self.states if self.data.get("enabled", True) else self.shadow).get(ud["id"], core.UnitState()),
+                                    self.states.get(ud["id"], core.UnitState()),
                                     self.last.get(ud["id"]), now, settings)
             for ud in self.data["units"]}
         for ud in self.data["units"]:  # what each unit is really doing, next to what we would command
             cur = self.hass.states.get(ud["entity"])
+            out["units_live"][ud["id"]]["control"] = ud.get("control", THERMOSTAT)
             out["units_live"][ud["id"]]["actual"] = None if cur is None else {
                 "state": cur.state, "setpoint": cur.attributes.get("temperature"),
                 "action": cur.attributes.get("hvac_action"), "temp": self._unit_temp(ud["entity"])}
@@ -381,8 +432,26 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         _LOGGER.warning("Card error from client [%s] %s | %s | %s", msg["where"][:80], msg["message"][:400], msg["ua"][:200], msg["stack"][:800])
         connection.send_result(msg["id"])
 
-    for fn in (ws_get, ws_set_room, ws_log_client):
+    @websocket_api.websocket_command({
+        "type": f"{DOMAIN}/set_control", vol.Required("unit_id"): str,
+        vol.Required("control"): vol.In([ROOM_CLIMATE, THERMOSTAT]),
+    })
+    @websocket_api.async_response
+    async def ws_set_control(hass, connection, msg):
+        if not any(u["id"] == msg["unit_id"] for u in mgr.data["units"]):
+            connection.send_error(msg["id"], "not_found", "unknown unit")
+            return
+        await mgr.async_set_control(msg["unit_id"], msg["control"], "set in the Room Climate card")
+        connection.send_result(msg["id"], mgr.snapshot())
+
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_log_client):
         websocket_api.async_register_command(hass, fn)
+
+    unit_entities = [u["entity"] for u in mgr.data["units"]]
+    if unit_entities:
+        async_track_state_change_event(hass, unit_entities, mgr.async_unit_changed)
+    # One "Room Climate / Thermostat" control select per unit, for placing next to its thermostat card.
+    hass.async_create_task(discovery.async_load_platform(hass, "select", DOMAIN, {}, config))
 
     async def _on_sensor(event):
         await mgr.async_tick()

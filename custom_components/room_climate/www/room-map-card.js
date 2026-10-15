@@ -65,6 +65,9 @@ const CSS = `
 .rc-tile .nm { font-size: .8em; color: var(--secondary-text-color, #9aa7b8); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rc-tile .big { font-size: 1.35em; font-weight: 700; line-height: 1.3; } .rc-tile.heat .big { color: #ff8a5c; } .rc-tile.cool .big { color: #5db3ff; }
 .rc-tile .big small { font-size: .55em; font-weight: 400; color: var(--secondary-text-color, #9aa7b8); }
+.rc-ctl { display: inline-block; font-size: .68em; font-weight: 600; letter-spacing: .03em; padding: 2px 7px; border-radius: 99px; margin: 4px 0 2px;
+  background: #ffd16622; color: #ffd166; } .rc-ctl.rc { background: #3de0a522; color: #3de0a5; }
+.rc-tile button.rc-hand { width: 100%; min-height: 36px; margin-top: 6px; font-size: .75em; padding: 0 6px; }
 .rc-tile .why { font-size: .72em; color: var(--secondary-text-color, #9aa7b8); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; }
 .rc-g { position: relative; height: 8px; border-radius: 4px; background: #ffffff14; margin-top: 6px; }
 .rc-g .band { position: absolute; top: 0; bottom: 0; left: 50%; transform: translateX(-50%); background: #3de0a533; border-radius: 4px; }
@@ -126,6 +129,12 @@ class RoomMapCard extends HTMLElement {
       this._render();
     } catch (e) { this._fail("set_room", e); }
   }
+  async _setControl(unitId, control) {
+    try {
+      this._data = await this._hass.callWS({ type: "room_climate/set_control", unit_id: unitId, control });
+      this._render(); this._diagUpdate();
+    } catch (e) { this._fail("set_control", e); }
+  }
   // Show the problem in the card (instead of a blank page) and send it to the HA log so it can be diagnosed remotely.
   _fail(where, e) {
     const msg = `${where}: ${(e && e.message) || (e && e.code) || JSON.stringify(e) || e}`;
@@ -156,6 +165,7 @@ class RoomMapCard extends HTMLElement {
     const t = e.target.closest("[data-act],[data-room],[data-floor]");
     if (!t || !this._data) return;
     if (t.dataset.act === "diag") { this._openDiag(); return; }
+    if (t.dataset.act === "ctl") { this._setControl(t.dataset.u, t.dataset.c); return; }
     const room = this._data.rooms.find(r => r.id === this._sel);
     const live = room ? this._data.live[room.id] || {} : {};
     if (t.dataset.floor) { this._floor = +t.dataset.floor; this._sel = null; this._render(); return; }
@@ -208,7 +218,7 @@ class RoomMapCard extends HTMLElement {
       const sel = r.id === this._sel;
       const ctl = !!r.unit;
       const col = tech ? (live.temp == null ? palette.none : ctl ? GREEN : BLUE) : this._color(live.temp, live.target);
-      const active = tech && (live.mode === "heat" || live.mode === "cool");
+      const active = tech && ((d.units_live || {})[r.unit] || {}).control === "room_climate" && (live.mode === "heat" || live.mode === "cool");
       const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
       const txt = live.temp == null ? "no sensor" : live.temp.toFixed(1) + "°";
       if (!tech) return `<g data-room="${r.id}" style="cursor:pointer">
@@ -270,7 +280,9 @@ class RoomMapCard extends HTMLElement {
     const ptoday = todayOf(room.priority_schedule, e => `P${e.priority}`);
     const pnow = live.priority ?? room.priority;
     el.innerHTML = `<h3>${room.name}</h3>
-      <p class="rc-sub">${reading} · target ${live.target}° · unit ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}</p>
+      <p class="rc-sub">${reading} · target ${live.target}° · ${((this._data.units_live || {})[room.unit] || {}).control === "room_climate"
+        ? `Room Climate in control · unit ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}`
+        : `<span style="color:#ffd166">thermostat in control</span> · Room Climate would ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}`}</p>
       <div class="rc-row"><span class="rc-lbl">Default temp</span>${step("def", room.default_temp)}</div>
       <div class="rc-row"><span class="rc-lbl">${(room.priority_schedule || []).length ? "Default priority" : "Priority"}</span>
         <div class="rc-chips">${[1, 2, 3, 4, 5].map(n => `<button data-act="prio" data-v="${n}" class="${n === room.priority ? "on" : ""}">${n}</button>`).join("")}</div></div>
@@ -300,7 +312,12 @@ class RoomMapCard extends HTMLElement {
     const big = !a ? "—" : a.state === "unavailable" ? "N/A" : am === "off" ? "OFF" : `${am === "heat" ? "▲" : am === "cool" ? "▼" : "●"} ${sp ?? "—"}°`;
     const wantTxt = fmt(x.mode, x.mode === "off" ? null : x.setpoint != null ? Math.round(x.setpoint) : null);
     const same = a && a.state !== "unavailable" && x.mode === (am === "auto" ? "heat_cool" : am) && (x.mode === "off" || x.setpoint == null || sp === Math.round(x.setpoint));
-    return { cls, big, actual, wantTxt, same, a, dry: d.enabled === false };
+    const ours = x.control === "room_climate";
+    // Who's in control, and a button to hand the unit to the other side.
+    const badge = ours ? `<span class="rc-ctl rc" title="Room Climate sets this unit's mode and temperature">ROOM CLIMATE IN CONTROL</span>`
+      : `<span class="rc-ctl" title="The unit runs on its own thermostat mode and setpoint">THERMOSTAT IN CONTROL</span>`;
+    const hand = id => `<button class="rc-hand" data-act="ctl" data-u="${id}" data-c="${ours ? "thermostat" : "room_climate"}">${ours ? "Hand to thermostat" : "Let Room Climate control"}</button>`;
+    return { cls, big, actual, wantTxt, same, a, ours, badge, hand, wantLbl: ours ? "Commanding" : "Would set" };
   }
 
   /* ---------- system overview (nothing selected) ---------- */
@@ -310,13 +327,14 @@ class RoomMapCard extends HTMLElement {
     const tiles = units.map(u => {
       const x = ul[u.id]; if (!x) return "";
       const st = this._unitStatus(x);
-      const warn = st.a && !st.same;
+      const warn = st.ours && st.a && !st.same;
       return `<div class="rc-tile ${st.cls}"><div class="nm">${(u.name || u.id).replace(/ (air handler|minisplit)$/i, "")}</div>
-        <div class="big">${st.big}</div>
+        ${st.badge}<div class="big">${st.big}</div>
         <div class="why"><b>Actual</b> · ${st.actual}</div>
-        <div class="why" style="${warn ? "color:#ffd166" : ""}"><b>${st.dry ? "Wants (dry run)" : "Wants"}</b> · ${st.wantTxt}${x.reason ? ` · ${x.reason}` : ""}${warn ? " ⚠" : st.a ? " ✓" : ""}</div></div>`;
+        <div class="why" style="${warn ? "color:#ffd166" : ""}"><b>${st.wantLbl}</b> · ${st.wantTxt}${x.reason ? ` · ${x.reason}` : ""}${warn ? " ⚠" : st.ours && st.a ? " ✓" : ""}</div>
+        ${st.hand(u.id)}</div>`;
     }).join("");
-    const house = d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 6px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}${d.enabled === false ? " · <span style=\"color:#ffd166\">dry run, nothing sent</span>" : ""}</p>` : "";
+    const house = d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 6px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}</p>` : "";
     const db = (d.settings_effective || {}).deadband ?? 1;
     const top = units.flatMap(u => ((ul[u.id] || {}).rooms || []).map((r, _, all) => ({ ...r, drv: all.length > 1 && ul[u.id].driver === r.id })))
       .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name)).slice(0, 3);
@@ -343,6 +361,8 @@ class RoomMapCard extends HTMLElement {
     document.body.append(m);
     this._diag = true;
     m.addEventListener("click", e => {
+      const c = e.target.closest('[data-act="ctl"]');
+      if (c) { this._setControl(c.dataset.u, c.dataset.c); return; }
       const b = e.target.closest("[data-x],[data-room]");
       if (!b && !e.target.classList.contains("rc-modal")) return;
       const id = b && b.dataset.room;
@@ -373,10 +393,11 @@ class RoomMapCard extends HTMLElement {
     const short = u => (u.name || u.id).replace(/ (air handler|minisplit)$/i, "");
     const tiles = units.map(u => {
       const x = ul[u.id]; if (!x) return "";
-      const { cls, big, actual, wantTxt, same, a } = this._unitStatus(x);
-      return `<div class="rc-tile ${cls}"><div class="nm">${short(u)}</div><div class="big">${big}</div>${gauge(x.error)}
+      const { cls, big, actual, wantTxt, same, a, ours, badge, hand, wantLbl } = this._unitStatus(x);
+      return `<div class="rc-tile ${cls}"><div class="nm">${short(u)}</div>${badge}<div class="big">${big}</div>${gauge(x.error)}
         <div class="why"><b>Actual</b> · ${actual}</div>
-        <div class="why" style="${a && !same ? "color:#ffd166" : ""}"><b>${d.enabled === false ? "Wants (dry run)" : "Wants"}</b> · ${wantTxt}${x.reason ? ` · ${x.reason}` : ""}${a && !same ? " ⚠ differs" : a ? " ✓ in sync" : ""}</div></div>`;
+        <div class="why" style="${ours && a && !same ? "color:#ffd166" : ""}"><b>${wantLbl}</b> · ${wantTxt}${x.reason ? ` · ${x.reason}` : ""}${ours && a ? (same ? " ✓ in sync" : " ⚠ differs") : ""}</div>
+        ${hand(u.id)}</div>`;
     }).join("");
     const rows = units.flatMap(u => ((ul[u.id] || {}).rooms || []).map(r => ({ ...r, drv: ul[u.id].rooms.length > 1 && ul[u.id].driver === r.id })))
       .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name))
@@ -387,7 +408,8 @@ class RoomMapCard extends HTMLElement {
     const mon = monRooms.map(r => { const l = (d.live || {})[r.id] || {};
       const dup = monRooms.some(o => o !== r && o.name === r.name);  // disambiguate e.g. two baths
       return `<button data-room="${r.id}">${r.name}${dup ? ` · ${this._floorName(r.floor || 1)}` : ""}<b>${l.temp == null ? "—" : l.temp.toFixed(0) + "°"}</b></button>`; }).join("");
-    return `${d.enabled === false ? `<p class="rc-sub" style="margin:0 0 6px;color:#ffd166">DRY RUN · decisions are shown but no commands are sent</p>` : ""}
+    const ctlN = units.filter(u => (ul[u.id] || {}).control === "room_climate").length;
+    return `<p class="rc-sub" style="margin:0 0 6px">Room Climate controls <b>${ctlN} of ${units.length}</b> units${ctlN < units.length ? " · the rest run on their own thermostats" : ""}</p>
       ${d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 4px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}</p>` : ""}
       <p class="rc-sub" style="margin:0">${running} of ${units.length} units running</p>
       <div class="rc-units">${tiles}</div>

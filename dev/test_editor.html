@@ -1,14 +1,15 @@
 <!doctype html><meta charset="utf-8"><body style="width:700px"><pre id="out">running</pre><div id="m"></div>
 <script type="module">
 const out = [], ok = (n, c) => out.push((c ? "PASS " : "FAIL ") + n);
-let saved = null;
+let saved = null, ctl = null, control = "thermostat";
 const room = { id: "r", name: "R", unit: "u", default_temp: 68, priority: 3, floor: 1, shape: {x:0,y:0,w:10,h:10},
   schedule: [{days:[0,1,2,3,4,5,6], start:"07:00", temp:68}, {days:[0,1,2,3,4,5,6], start:"21:30", temp:65}] };
 const snap = () => ({ rooms: [room], live: { r: { temp: 68, target: 68, mode: "off", reason: "" } },
   units: [{ id: "u", name: "U air handler" }], settings_effective: { deadband: 1 },
-  units_live: { u: { mode: "off", setpoint: null, reason: "in deadband", error: 0, driver: null,
+  units_live: { u: { mode: "off", setpoint: null, reason: "in deadband", error: 0, driver: null, control,
     rooms: [{ id: "r", name: "R", priority: 3, temp: 68, target: 68, fresh: true, delta: 0, weight_pct: 100, pull: 0 }] } } });
-const hass = { callWS: async m => { if (m.type === "room_climate/set_room") saved = m; return snap(); } };
+const hass = { callWS: async m => { if (m.type === "room_climate/set_room") saved = m;
+  if (m.type === "room_climate/set_control") { ctl = m; control = m.control; } return snap(); } };
 await import("/room-map-card.js");
 const card = document.createElement("room-map-card"); card.setConfig({}); document.getElementById("m").append(card);
 card.hass = hass; await new Promise(r => setTimeout(r, 200));
@@ -111,6 +112,11 @@ ok("entries carry priority, not temp", ps && ps.every(e => "priority" in e && !(
 // diagnostics view
 card._sel = null; card._render();
 ok("home panel is minimal (tiles + button, no room list)", !card.querySelector(".rc-rm") && !!card.querySelector('[data-act="diag"]'));
+ok("home tile says the thermostat is in control", /THERMOSTAT IN CONTROL/.test(card.textContent) && /Would set/.test(card.textContent));
+card.querySelector('.rc-tile [data-act="ctl"]').click(); await new Promise(r => setTimeout(r, 50));
+ok("hand-over button asks for Room Climate control", ctl && ctl.unit_id === "u" && ctl.control === "room_climate");
+ok("tile then says Room Climate is in control", /ROOM CLIMATE IN CONTROL/.test(card.textContent) && /Commanding/.test(card.textContent)
+  && card.querySelector('.rc-tile [data-act="ctl"]').dataset.c === "thermostat");
 card.querySelector('[data-act="diag"]').click();
 ok("Diagnostics button opens the modal", !!document.querySelector(".rc-modal") && card._diag === true);
 const dr = document.querySelector('.rc-modal .rc-rm');

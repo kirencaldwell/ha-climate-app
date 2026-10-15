@@ -1,6 +1,5 @@
 {
   "_comment": "Seed config. Copy into .storage/room_climate (or set via the card). Entity ids are placeholders until hardware arrives.",
-  "enabled": true,
   "settings": {
     "deadband": 1.0
   },
