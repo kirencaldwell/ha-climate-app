@@ -453,6 +453,7 @@ class RoomMapCard extends HTMLElement {
       if (b && b.dataset.mx === "room") { this._mRoom = b.dataset.r; this._modelUpdate(); return; }
       if (b && b.dataset.mx === "unit") { this._mUnit = b.dataset.u; this._modelUpdate(); return; }
       if (b && b.dataset.mx === "range") { this._mHours = +b.dataset.h; this._modelLoad(); return; }
+      if (b && b.dataset.mx === "bt") { this._mBt = b.dataset.k; this._modelUpdate(); return; }
       this._closeSchedule(); this._render();
     });
     this._onKey = e => { if (e.key === "Escape") { this._closeSchedule(); this._render(); } };
@@ -554,7 +555,7 @@ class RoomMapCard extends HTMLElement {
 
   // One time-series chart. series: [{pts: [[ms, v]], color, width, dash, dots, step}]; band: [[ms, lo, hi]];
   // strips: [{label, segs: [[ms0, ms1, color]]}] drawn as thin rows above the plot (e.g. heat/cool modes).
-  _tsChart({ t0, t1, now, series = [], band = null, line = null, strips = [], fmt = v => v.toFixed(0), zero = false, H = 210 }) {
+  _tsChart({ t0, t1, now, series = [], band = null, line = null, strips = [], marks = [], fmt = v => v.toFixed(0), zero = false, H = 210 }) {
     const W = 640, L = 46, R = 10, B = 22, SH = 11, T = 8 + strips.length * (SH + 3);
     const vals = [];
     series.forEach(sr => sr.pts.forEach(p => { if (p[0] >= t0 && p[0] <= t1 && p[1] != null) vals.push(p[1]); }));
@@ -600,7 +601,10 @@ class RoomMapCard extends HTMLElement {
     const nowLine = now >= t0 && now <= t1 ? `<line x1="${x(now)}" x2="${x(now)}" y1="${T}" y2="${H - B}" stroke="currentColor" stroke-opacity=".35"/>
       <text x="${x(now) + 3}" y="${T + 10}" font-size="10" fill="currentColor" fill-opacity=".6">now</text>` : "";
     const hline = line ? `<line x1="${L}" x2="${W - R}" y1="${y(line)}" y2="${y(line)}" stroke="#3de0a5" stroke-opacity=".5" stroke-dasharray="2 4"/>` : "";
-    return `<svg class="rc-chart" viewBox="0 0 ${W} ${H}">${strip}${g}${bandSvg}${hline}${nowLine}${series.map(path).join("")}</svg>`;
+    const markSvg = marks.filter(mk => mk.t > t0 && mk.t < t1).map(mk => `<line x1="${x(mk.t)}" x2="${x(mk.t)}" y1="${T}" y2="${H - B}" stroke="#ffd166" stroke-opacity=".55" stroke-dasharray="3 3"/>
+      <text x="${x(mk.t) - 4}" y="${T + 10}" text-anchor="end" font-size="9.5" fill="#ffd166" fill-opacity=".85">${mk.left || ""}</text>
+      <text x="${x(mk.t) + 4}" y="${T + 10}" font-size="9.5" fill="#ffd166" fill-opacity=".85">${mk.right || ""}</text>`).join("");
+    return `<svg class="rc-chart" viewBox="0 0 ${W} ${H}">${strip}${g}${bandSvg}${hline}${markSvg}${nowLine}${series.map(path).join("")}</svg>`;
   }
 
   _histHtml(h, name) {
@@ -628,8 +632,14 @@ class RoomMapCard extends HTMLElement {
     const band = S.filter(x => x.r[rid] && x.r[rid][1] != null).map(x => [ms(x.t), x.r[rid][1] - h.band[0], x.r[rid][1] + h.band[1]]);
     const proj = ((h.projection || {}).temps || {})[rid] || [], plan = (h.plan || {})[rid] || [];
     const startPt = act.length ? [act[act.length - 1]] : [];
-    const tempChart = this._tsChart({ t0, t1, now, band, fmt: v => v.toFixed(1) + "°", series: [
+    const BT = ((h.backtest || {}).points || {})[rid] || {};
+    const split = (h.backtest || {}).split;
+    const btMode = this._mBt || "60";
+    const tempChart = this._tsChart({ t0, t1, now, band, fmt: v => v.toFixed(1) + "°",
+      marks: split ? [{ t: ms(split), left: "trained on ←", right: "→ tested on" }] : [],
+      series: [
       { pts: act, color: "#e6edf7", width: 2 },
+      { pts: (BT[btMode] || []).map(([t, v]) => [ms(t), v]), color: "#ffb454", width: 1.3 },
       { pts: (P["120"] || []).map(([t, v]) => [ms(t), v]), color: "#b48cff", dots: true },
       { pts: (P["60"] || []).map(([t, v]) => [ms(t), v]), color: "#3fa9ff", dots: true },
       { pts: startPt.concat(proj.map(([t, v]) => [ms(t), v])), color: "#9aa7b8", dash: "2 4", width: 2 },
@@ -660,7 +670,10 @@ class RoomMapCard extends HTMLElement {
     const lg = items => `<div class="rc-legend" style="justify-content:flex-start;gap:14px;flex-wrap:wrap">${items.map(([c, t, k]) => `<span><b style="color:${c}">${k || "—"}</b> ${t}</span>`).join("")}</div>`;
     return `<div class="rc-sect"><h4>History</h4>${ranges}
       <h4 style="margin-top:10px">Temperature: predicted vs actual, and the next 2 hours</h4>${roomTabs}${tempChart}
-      ${lg([["#e6edf7", "actual"], ["#3fa9ff", "model said 1 h before", "●"], ["#b48cff", "said 2 h before", "●"],
+      <div class="rc-seg" style="margin-top:6px">${[["60", "Backtest 1 h ahead"], ["120", "Backtest 2 h ahead"]].map(([k, l]) =>
+        `<button data-mx="bt" data-k="${k}" class="${btMode === k ? "on" : ""}">${l}</button>`).join("")}</div>
+      ${lg([["#e6edf7", "actual"], ["#ffb454", `latest model run over the logged past, ${btMode === "60" ? "1 h" : "2 h"} ahead (backtest)`],
+            ["#3fa9ff", "model said 1 h before (live)", "●"], ["#b48cff", "said 2 h before (live)", "●"],
             ["#3de0a5", "next 2 h if the model were in charge", "- -"], ["#9aa7b8", "next 2 h if settings stay", "··"], ["#3de0a5", "comfort band", "▒"]])}
       <h4 style="margin-top:14px">Prediction error by hour · ${name(rid)}</h4>${accChart}
       ${lg([["#3fa9ff", "1 h ahead"], ["#b48cff", "2 h ahead"], ["#667085", "'nothing changes', 2 h", "- -"]])}

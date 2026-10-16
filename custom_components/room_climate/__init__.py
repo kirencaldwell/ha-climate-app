@@ -44,6 +44,7 @@ OURS_GRACE_S = 30  # unit state changes this soon after we sent it something are
 BAD_STATES = ("unknown", "unavailable")
 MODEL_FILE = "room_climate_model.json"  # the fitted thermal model (model.py), refitted nightly
 FIT_HISTORY_FILE = "room_climate_model_fits.jsonl"  # one line per fit: when, data span, how well it predicts
+BACKTEST_FILE = "room_climate_model_backtest.json"  # the fitted model's predictions over the logged past (charts)
 FIT_DAYS = 14  # fit on this many days of the minute log
 HISTORY_H = 72  # the Model page's charts reach back this far (5-minute samples, rebuilt from the minute log)
 
@@ -91,6 +92,7 @@ class Manager:
         # Its accuracy scores, chart points and recent readings, so a restart doesn't throw away days of proving.
         self.track_store = Store(hass, 1, f"{DOMAIN}_tracking")
         self.hist5: deque = deque()  # compact 5-minute samples for the Model page's charts (mpc.compact)
+        self.backtest: dict = None  # {"fitted", "split", "points": {room: {"60"/"120": [[iso, F]]}}}
         self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
         self.fit_history: list = []
 
@@ -112,9 +114,11 @@ class Manager:
             m = hm.HouseModel.from_dict(json.loads(p.read_text())) if p.exists() else None
             h = pathlib.Path(self.hass.config.path(FIT_HISTORY_FILE))
             hist = [json.loads(x) for x in h.read_text().splitlines()[-60:] if x.strip()] if h.exists() else []
-            return m, hist
+            b = pathlib.Path(self.hass.config.path(BACKTEST_FILE))
+            bt = json.loads(b.read_text()) if b.exists() else None
+            return m, hist, bt
         try:
-            m, self.fit_history = await self.hass.async_add_executor_job(read)
+            m, self.fit_history, self.backtest = await self.hass.async_add_executor_job(read)
         except (OSError, ValueError) as e:
             _LOGGER.warning("couldn't load the thermal model: %s", e)
             return
@@ -168,7 +172,11 @@ class Manager:
         p = self.shadow.plan
         plan = None if p is None else {r: [[(self.shadow.plan_at + timedelta(minutes=self.shadow.ps.step_min * (k + 1))).isoformat(), v]
                                            for k, v in enumerate(traj)] for r, traj in p.predicted.items()}
-        return {"now": now.isoformat(), "hours": hours, "samples": samples, "scored": scored,
+        bt = self.backtest or {}
+        backtest = {"fitted": bt.get("fitted"), "split": bt.get("split"),
+                    "points": {r: {h: [p for p in pts if p[0] >= since] for h, pts in by.items()}
+                               for r, by in (bt.get("points") or {}).items()}}
+        return {"now": now.isoformat(), "hours": hours, "samples": samples, "scored": scored, "backtest": backtest,
                 "comfort": mpc.comfort_series(samples, scored, s), "accuracy": mpc.accuracy_by_hour(self.shadow.errors),
                 "points": points, "projection": self.shadow.projection, "plan": plan,
                 "band": [s.band_below, s.band_above],
@@ -198,6 +206,8 @@ class Manager:
         since = (dt_util.now() - timedelta(days=FIT_DAYS)).strftime("%Y-%m-%d")
         logdir = self.hass.config.path("room_climate_data")
         model_path, hist_path = self.hass.config.path(MODEL_FILE), self.hass.config.path(FIT_HISTORY_FILE)
+        bt_path = self.hass.config.path(BACKTEST_FILE)
+        recent = (dt_util.now() - timedelta(hours=HISTORY_H)).isoformat()
         t0 = time.monotonic()
 
         def work():
@@ -209,15 +219,21 @@ class Manager:
             with open(tmp, "w") as f:
                 json.dump(m.to_dict(), f, indent=1)
             os.replace(tmp, model_path)
+            # Run the new model over the logged past the charts show, to plot how well it fits it.
+            bt = {"fitted": m.meta.get("fitted"), "split": rep.get("split"),
+                  "points": fit.backtest(m, [r for r in rows if r.get("t", "") >= recent])}
+            with open(bt_path + ".tmp", "w") as f:
+                json.dump(bt, f)
+            os.replace(bt_path + ".tmp", bt_path)
             entry = {k: m.meta.get(k) for k in ("fitted", "usable", "rows", "from", "to")}
             entry["holdout"] = rep.get("holdout", {})
             entry["skipped"] = {k: v["skipped"] for k, v in rep.items() if isinstance(v, dict) and "skipped" in v}
             with open(hist_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
-            return m, entry
+            return m, entry, bt
 
         try:
-            m, entry = await self.hass.async_add_executor_job(work)
+            m, entry, self.backtest = await self.hass.async_add_executor_job(work)
             self.shadow.set_model(m)
             self.fit_history = (self.fit_history + [entry])[-60:]
             _LOGGER.info("thermal model refitted on %s minutes: usable=%s", entry["rows"], entry["usable"])

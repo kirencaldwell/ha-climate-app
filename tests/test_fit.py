@@ -68,6 +68,30 @@ def test_rooms_without_data_are_left_out_not_poisonous():
     assert "ghost" not in m.rooms["kitchen"].coupling
 
 
+def test_backtest_runs_the_model_over_logged_history():
+    truth = coupled.the_house()
+    cfg = {"rooms": [{"id": "kitchen", "unit": "air_handler", "default_temp": 67},
+                     {"id": "primary_bedroom", "unit": "minisplit_1", "default_temp": 67}],
+           "units": [{"id": u} for u in truth.units], "settings": {"floor": 63.0}}
+    rooms, units = coupled.rooms_units_from_config(cfg, truth)
+    s = coupled.settings_from_config(cfg)
+    start = datetime(2026, 10, 16)
+    log = []
+    coupled.run(truth, rooms, units, coupled.HeuristicController(rooms, units, s), start, 1,
+                coupled.Weather(start, 3, mean=55, seed=4), s, log=log, seed=4)
+    sub = coupled.the_house()
+    sub.rooms = {k: v for k, v in sub.rooms.items() if k in ("kitchen", "primary_bedroom")}
+    for r in sub.rooms.values():
+        r.coupling = {j: c for j, c in r.coupling.items() if j in sub.rooms}
+    bt = fit.backtest(sub, log)
+    actual = {row["t"]: row["rooms"]["kitchen"]["temp"] for row in log}
+    pts = bt["kitchen"]["60"]
+    assert len(pts) >= 40 and len(bt["kitchen"]["120"]) >= 40
+    errs = [p[1] - actual[p[0]] for p in pts]
+    assert (sum(e * e for e in errs) / len(errs)) ** 0.5 < 1.0  # close to the truth (rooms it doesn't model add error)
+
+
 if __name__ == "__main__":
+    test_backtest_runs_the_model_over_logged_history()
     test_rooms_without_data_are_left_out_not_poisonous()
     print("ok")

@@ -190,6 +190,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
         sr, off = (spec["sensor_rooms"], 0.0) if spec.get("sensor_rooms") is not None else detected.get(uid, ([], 0.0))
         m.units[uid] = hm.UnitModel(sensor_rooms=[r for r in sr if r in m.rooms], sensor_offset=off)
     report["holdout"] = validate(m, ts, T, out, sun, Y, split)
+    report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
     hold = [v for v in report["holdout"].values()]
     usable = bool(m.rooms) and bool(hold) and all(
         v["model_rmse_F"] is not None and v["no_change_rmse_F"] is not None and v["model_rmse_F"] < v["no_change_rmse_F"]
@@ -247,3 +248,26 @@ def layout_for(rooms: list, units: list) -> dict:
     for u in units:
         lay["units"][u.id] = {"zone": [r.id for r in sensed if r.unit == u.id]}
     return lay
+
+
+def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 30, step_min: int = 5) -> dict:
+    """The fitted model run over logged history: from the real readings every `every_min`, replay what the units, the
+    weather and the sun did and predict each room `horizons` minutes ahead. -> {room: {"60": [[iso, F]], ...}}, each
+    point at the time it's a prediction for, so it plots against the actual reading at that moment."""
+    rooms, units = list(m.rooms), sorted({u for row in rows for u in row.get("units", {})})
+    ts, T, out, sun, Y, _ = series(rows, rooms, units)
+    res = {r: {str(h): [] for h in horizons} for r in rooms}
+    hmax = max(horizons)
+    for a in range(0, len(ts) - hmax, every_min):
+        cur = {r: T[r][a] for r in rooms}
+        if any(v is None for v in cur.values()):
+            continue
+        for k in range(a, a + hmax, step_min):
+            seg = slice(k, k + step_min)
+            d = hm.derivative(m, cur, _mean(out[seg]), sum(sun[seg]) / step_min, {u: sum(Y[u][seg]) / step_min for u in Y})
+            cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
+            done = k + step_min - a
+            if done in horizons:
+                for r in rooms:
+                    res[r][str(done)].append([ts[a + done].isoformat(), round(cur[r], 2)])
+    return res
