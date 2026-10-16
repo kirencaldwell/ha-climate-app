@@ -86,6 +86,8 @@ class Manager:
         # Model-based controller in "would do" mode, and the nightly model fit (see mpc.py, fit.py).
         self.shadow = mpc.ShadowPlanner()
         self._shadow_busy = False
+        # Its accuracy scores, chart points and recent readings, so a restart doesn't throw away days of proving.
+        self.track_store = Store(hass, 1, f"{DOMAIN}_tracking")
         self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
         self.fit_history: list = []
 
@@ -115,6 +117,10 @@ class Manager:
             return
         if m is not None:
             self.shadow.set_model(m)
+        try:
+            self.shadow.load_state(await self.track_store.async_load(), dt_util.now())
+        except (ValueError, TypeError, KeyError) as e:
+            _LOGGER.warning("couldn't restore the model's accuracy scores: %s", e)
 
     def model_age_h(self):
         m = self.shadow.model
@@ -174,14 +180,13 @@ class Manager:
         return ud.get("control", THERMOSTAT)
 
     def model_rooms(self) -> set:
-        """Rooms the model-based controller scores (and so must predict well): modelled, served by a unit, and not
-        reading their own unit's sensor."""
+        """Rooms the model must predict well before it may control units: every modelled room served by a unit. That
+        includes a room reading its own unit's sensor (Bedroom 3): it's the only reading that room has, so the model has
+        to get it right too, even though the optimizer leaves it out of the cost (it measures the unit's airflow)."""
         m = self.shadow.model
         if m is None:
             return set()
-        ent = {u["id"]: u["entity"] for u in self.data["units"]}
-        return {r["id"] for r in self.data["rooms"] if r["id"] in m.rooms and r.get("unit")
-                and r.get("sensor") != ent.get(r.get("unit"))}
+        return {r["id"] for r in self.data["rooms"] if r["id"] in m.rooms and r.get("unit")}
 
     def model_ready(self, strict: bool = True):
         return self.shadow.readiness(dt_util.now(), self.model_rooms(), strict=strict)
@@ -470,6 +475,7 @@ class Manager:
             if st.entity_id.startswith(tuple(prefixes)) and st.state not in BAD_STATES:
                 row["extra"][st.entity_id] = num(st.state) if num(st.state) is not None else st.state
         row["mpc"] = self.shadow.log_fields()  # what the model-based controller would do
+        self.track_store.async_delay_save(self.shadow.to_state, 30)  # about once a minute, and on shutdown
         path = self.hass.config.path("room_climate_data")
         try:
             await self.hass.async_add_executor_job(datalog.append, path, row, now)

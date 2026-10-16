@@ -193,6 +193,26 @@ class ShadowPlanner:
                                f"({v['base_rmse']}°)")
         return not why, why
 
+    # --- surviving restarts ---
+    def to_state(self) -> dict:
+        """The scores, chart points and recent readings, JSON-ready. Predictions still in progress are left out: after
+        a restart they'd be advanced across the gap without the real inputs, so scoring them wouldn't be fair."""
+        iso = lambda t: t.isoformat()
+        return {"version": 1,
+                "errors": [[iso(t), r, h, round(e, 3), round(b, 3)] for t, r, h, e, b in self.errors],
+                "points": [[iso(t), r, h, v] for t, r, h, v in self.points],
+                "readings": {r: [[iso(t), v] for t, v in d] for r, d in self.readings.items()}}
+
+    def load_state(self, d: dict, now: datetime):
+        """Restore what to_state saved, dropping anything older than the windows it's kept for."""
+        if not d or d.get("version") != 1:
+            return
+        p = datetime.fromisoformat
+        keep_since, chart_since = now - self.keep, now - timedelta(hours=8)
+        self.errors = deque((p(t), r, h, e, b) for t, r, h, e, b in d.get("errors", []) if p(t) >= keep_since)
+        self.points = deque((p(t), r, h, v) for t, r, h, v in d.get("points", []) if p(t) >= chart_since)
+        self.readings = {r: deque((p(t), v) for t, v in pts if p(t) >= keep_since) for r, pts in d.get("readings", {}).items()}
+
     # --- reporting ---
     def log_fields(self) -> dict:
         if self.plan is None:

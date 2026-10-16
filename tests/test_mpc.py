@@ -119,6 +119,21 @@ def test_thermostat_units_are_planned_around():
     assert sh.decision["minisplit_2"]["mode"] == "thermostat" and sh.house.mode == "cool"
 
 
+def test_scores_survive_a_restart():
+    import json
+    sh, sim = _shadow_run(coupled.the_house(), 6)
+    saved = json.loads(json.dumps(sh.to_state()))  # through JSON, as it's stored
+    back = mpc.ShadowPlanner()
+    back.load_state(saved, sim.now + timedelta(minutes=5))
+    assert back.accuracy() == sh.accuracy() and back.accuracy()
+    assert len(back.points) == len(sh.points) and set(back.readings) == set(sh.readings)
+    assert not back.records  # in-progress predictions aren't restored
+    later = mpc.ShadowPlanner()
+    later.load_state(saved, sim.now + timedelta(hours=25))  # a day later: all of it has aged out
+    assert not later.errors and not later.points and all(not d for d in later.readings.values())
+    later.load_state({"version": 99}, sim.now)  # an unknown format is ignored, not an error
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
