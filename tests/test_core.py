@@ -1,6 +1,6 @@
 import os, sys
 from datetime import datetime, timedelta
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "custom_components", "room_climate"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "custom_components", "room_climate"))  # appended: its select.py must not shadow the stdlib select module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sim"))
 import core
 from core import Room, ScheduleEntry, Unit, UnitState, Settings

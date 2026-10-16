@@ -107,6 +107,12 @@ class Settings:
     mode_switch_s: int = 900  # legacy
 
 
+def settings_from(d) -> Settings:
+    """Settings from stored values, ignoring names this version doesn't know (a removed setting must not crash)."""
+    known = set(Settings.__dataclass_fields__)
+    return Settings(**{k: v for k, v in (d or {}).items() if k in known})
+
+
 @dataclass
 class UnitState:
     mode: str = "off"  # "off" | "heat" | "cool"

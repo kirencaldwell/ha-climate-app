@@ -145,7 +145,7 @@ class Manager:
         return TemperatureConverter.convert(val, unit, F), getattr(st, "last_reported", None) or st.last_updated
 
     def _outdoor_entity(self, settings: core.Settings | None = None) -> str | None:
-        settings = settings or core.Settings(**self.data.get("settings", {}))
+        settings = settings or core.settings_from(self.data.get("settings"))
         return settings.outdoor_entity or next(iter(sorted(self.hass.states.async_entity_ids("weather"))), None)
 
     def _outdoor(self, settings: core.Settings):
@@ -174,7 +174,7 @@ class Manager:
         # Room Climate would do.
         states = self.states
         now = dt_util.now()
-        settings = core.Settings(**self.data.get("settings", {}))
+        settings = core.settings_from(self.data.get("settings"))
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
         units = [_unit_from_dict(ud) for ud in self.data["units"]]
         readings, predicted = {}, {}
@@ -407,7 +407,7 @@ class Manager:
     def snapshot(self) -> dict:
         now = dt_util.now()
         out = dict(self.data)
-        settings = core.Settings(**self.data.get("settings", {}))
+        settings = core.settings_from(self.data.get("settings"))
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
         readings = {}
         for r in rooms:
