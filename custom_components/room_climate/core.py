@@ -93,9 +93,6 @@ class Settings:
     # A sensor that goes unavailable (Bluetooth sensors drop out for seconds to minutes) keeps its last reading this
     # long before the room counts as having no reading.
     dropout_grace_s: int = 900
-    # A room that reads its own unit's sensor can jump when that unit changes mode (the sensor is in the unit's airflow),
-    # so for this long after a mode change the room keeps the reading from just before it.
-    mode_settle_s: int = 900
     # Free cooling/heating (off by default): when it's at least this much colder outside than a room, a room merely
     # above its comfort band is left to cool off on its own, so only the hard ceiling asks for cooling (mirrored for
     # heat on hot days). Off because a schedule drop to a cold target should actively cool, not wait for the weather.
@@ -204,18 +201,16 @@ def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]
     return num / den, rsum / den
 
 
-def settling(changed_at: Optional[datetime], now: datetime, settings: Settings = Settings()) -> bool:
-    """True for `mode_settle_s` after a unit changed mode (None = no change seen yet)."""
-    return changed_at is not None and elapsed(now, changed_at) < settings.mode_settle_s
+def stored_setpoint_c(setpoint_f: float) -> float:
+    """The setpoint a Mitsubishi unit actually stores for `setpoint_f`, in C: it keeps 0.5 C steps, so 64 F is stored
+    as 18.0 C and reads back as 64.4 F. Compare read-backs against this, not against the F we asked for."""
+    return round((setpoint_f - 32) / 1.8 * 2) / 2
 
 
 def hold_reading(fresh: Optional[tuple[float, datetime]], last: Optional[tuple[float, datetime, datetime]],
-                 now: datetime, settings: Settings = Settings(), settle: bool = False):
+                 now: datetime, settings: Settings = Settings()):
     """Bridge a sensor dropout. `fresh` is this tick's (value, time) or None if unavailable; `last` is the previous
-    result of this function's second value: (value, time, when it was last seen). Returns (reading to use, new last).
-    With `settle`, a fresh reading is ignored in favour of the last one (see `mode_settle_s`)."""
-    if settle and last is not None:
-        return (last[0], last[1]), last
+    result of this function's second value: (value, time, when it was last seen). Returns (reading to use, new last)."""
     if fresh is not None:
         return fresh, (fresh[0], fresh[1], now)
     if last is not None and elapsed(now, last[2]) <= settings.dropout_grace_s:
@@ -391,6 +386,7 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
     # Climate *would* do stays meaningful.
     ours = {u.id for u in units} - set(manual or {})
     voters = ours or {u.id for u in units}
+    unit_entity = {u.id: u.entity for u in units}
     for r in rooms:
         if r.unit is None or r.unit not in voters:
             continue  # monitor-only rooms (and rooms of thermostat-run units) don't steer the house
@@ -402,8 +398,13 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         # works). Use the reading alone.
         driven = states.get(r.unit, UnitState()).active or r.unit in (busy or ())
         c, h = room_costs(r, got[0], None if driven else predicted.get(r.id), now, settings, outdoor)
-        cold, hot = cold + c, hot + h
         per_room[r.id] = (round(c, 2), round(h, 2))
+        if r.sensor is not None and r.sensor == unit_entity.get(r.unit):
+            # The room reads its own unit's sensor, which sits in that unit's airflow and swings with it (Bedroom 3:
+            # 55-78 F in an hour as its unit went heat -> cool). It would drive the house into a heat/cool limit cycle,
+            # so it follows the house mode and just holds its target until it has a sensor of its own.
+            continue
+        cold, hot = cold + c, hot + h
     new_house, reason = choose_mode(cold, hot, house, now, settings)
     if forced and new_house.mode != forced:
         new_house = HouseState(forced, now if house.mode != forced else house.since)

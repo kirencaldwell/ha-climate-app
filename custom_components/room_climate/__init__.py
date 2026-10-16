@@ -66,7 +66,6 @@ class Manager:
         self.house = core.HouseState()
         self.house_info: dict = {}
         self.hist: dict[str, list] = {}  # room id -> [(time, temp F)] for trend prediction
-        self._mode_seen: dict[str, tuple] = {}  # unit id -> (mode, when we saw it change; None = since startup)
         self.last_good: dict[str, tuple] = {}  # room id -> (temp F, reading time, last seen) to bridge sensor dropouts
         self.prev_busy: set = set()
         self.sent: dict = {}  # unit id -> (last setpoint command, when); for thermostat units, what we would have sent
@@ -179,34 +178,16 @@ class Manager:
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
         units = [_unit_from_dict(ud) for ud in self.data["units"]]
         readings, predicted = {}, {}
-        settle = set()  # units that changed mode recently
-        for u in units:
-            cur = self.hass.states.get(u.entity)
-            if cur is None or cur.state in BAD_STATES:
-                continue
-            seen = self._mode_seen.get(u.id)
-            if seen is None:
-                self._mode_seen[u.id] = (cur.state, None)
-            elif seen[0] != cur.state:
-                self._mode_seen[u.id] = (cur.state, now)
-                for r in rooms:  # the trend from before the change no longer applies
-                    if r.unit == u.id and self.hist.get(r.id):
-                        self.hist[r.id] = self.hist[r.id][-1:]
-            if core.settling(self._mode_seen[u.id][1], now, settings):
-                settle.add(u.id)
-        unit_entity = {u.id: u.entity for u in units}
         for r in rooms:
             if not r.sensor:
                 continue
             val, ts = self._f(r.sensor)
-            own = r.unit in settle and r.sensor == unit_entity.get(r.unit)  # reads its own unit, which just changed mode
-            got, self.last_good[r.id] = core.hold_reading(None if val is None else (val, ts), self.last_good.get(r.id), now,
-                                                          settings, settle=own)
+            got, self.last_good[r.id] = core.hold_reading(None if val is None else (val, ts), self.last_good.get(r.id), now, settings)
             if got is None:
                 continue
             readings[r.id] = got
-            if val is None or own:
-                continue  # bridging a dropout or a mode change: no new point for the trend
+            if val is None:
+                continue  # bridging a dropout: no new point for the trend
             h = self.hist.setdefault(r.id, [])
             h.append((now, val))
             del h[:max(0, next((k for k, (t, _) in enumerate(h) if core.elapsed(now, t) <= settings.history_s), len(h)))]
@@ -316,12 +297,11 @@ class Manager:
         else:
             a = cur.attributes
             actual_sp = a.get("temperature")
-            want_sp = None if cmd.setpoint is None else round(
-                TemperatureConverter.convert(cmd.setpoint, F, self.hass.config.units.temperature_unit), 1)
+            want_sp = None if cmd.setpoint is None else self._stored(cmd.setpoint)
             diffs = []
             if cur.state != cmd.mode:
                 diffs.append(f"mode want {cmd.mode} has {cur.state}")
-            if want_sp is not None and (actual_sp is None or abs(actual_sp - want_sp) > 0.3):
+            if want_sp is not None and (actual_sp is None or abs(actual_sp - want_sp) > 0.15):
                 diffs.append(f"setpoint want {want_sp} has {actual_sp}")
             line = (f"{unit.id}: command {cmd.mode}/{want_sp} ({cmd.reason}) | actual hvac={cur.state} "
                     f"setpoint={actual_sp} action={a.get('hvac_action')} unit_temp={a.get('current_temperature')} | "
@@ -343,13 +323,18 @@ class Manager:
             _LOGGER.info("SEND %s hvac_mode %s -> %s (%s)", unit.entity, cur.state, mode, cmd.reason)
             await self._call(unit, SERVICE_SET_HVAC_MODE, {ATTR_HVAC_MODE: mode})
         if cmd.setpoint is not None:
-            sp = TemperatureConverter.convert(cmd.setpoint, F, self.hass.config.units.temperature_unit)
+            sp = self._stored(cmd.setpoint)
             have = cur.attributes.get("temperature")
-            # The unit keeps setpoints in 0.5 C steps (67 F reads back as 67.1), so near enough is done; resending
-            # every tick would never settle.
-            if have is None or abs(float(have) - sp) > 0.3:
-                _LOGGER.info("SEND %s temperature %s -> %s (%s)", unit.entity, have, round(sp, 1), cmd.reason)
-                await self._call(unit, SERVICE_SET_TEMPERATURE, {ATTR_TEMPERATURE: round(sp, 1)})
+            # Send what the unit will store (0.5 C steps) and compare against that: comparing against the F we wanted
+            # (64.0 vs the 64.4 it reads back) resent the setpoint on every update, several times a minute.
+            if have is None or abs(float(have) - sp) > 0.15:
+                _LOGGER.info("SEND %s temperature %s -> %s (%s)", unit.entity, have, sp, cmd.reason)
+                await self._call(unit, SERVICE_SET_TEMPERATURE, {ATTR_TEMPERATURE: sp})
+
+    def _stored(self, setpoint_f: float) -> float:
+        """`setpoint_f` as the unit will store and report it, in HA's temperature unit."""
+        return round(TemperatureConverter.convert(core.stored_setpoint_c(setpoint_f), C,
+                                                  self.hass.config.units.temperature_unit), 1)
 
     async def _call(self, unit: core.Unit, service: str, data: dict):
         ctx = Context()  # tagged so the unit's resulting state change is recognized as ours, not a manual change

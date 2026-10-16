@@ -559,15 +559,24 @@ def test_demand_that_goes_away_or_flips_restarts_the_confirmation():
     assert h.pending == "cool" and h.pending_since == MON + timedelta(minutes=12)
 
 
-def test_unit_sensor_room_keeps_its_reading_while_the_unit_settles_after_a_mode_change():
-    s = Settings()
-    changed = MON
-    assert core.settling(changed, MON + timedelta(minutes=14), s) and not core.settling(changed, MON + timedelta(minutes=16), s)
-    assert not core.settling(None, MON, s)
-    _, last = core.hold_reading((67.1, MON), None, MON, s)
-    got, last = core.hold_reading((63.5, MON + timedelta(minutes=1)), last, MON + timedelta(minutes=1), s, settle=True)
-    assert got == (67.1, MON)  # the drop is ignored
-    got, last = core.hold_reading((64.4, MON + timedelta(minutes=20)), last, MON + timedelta(minutes=20), s, settle=False)
-    assert got == (64.4, MON + timedelta(minutes=20))  # settled: believe the sensor again
-    got, _ = core.hold_reading((63.5, MON), None, MON, s, settle=True)
-    assert got == (63.5, MON)  # nothing earlier to hold: use what there is
+# --- rooms on their unit's own sensor; what a unit stores ---
+def test_room_reading_its_own_units_sensor_follows_the_house_instead_of_voting():
+    units = [Unit("ah", "climate.ah"), Unit("ms", "climate.ms")]
+    rooms = [Room("k", "Kitchen", "ah", sensor="sensor.k", default_temp=67),
+             Room("b3", "Bedroom 3", "ms", sensor="climate.ms", default_temp=67)]
+    # Bedroom 3's unit sensor reads 77 right after heating: it must not flip a house that the kitchen needs heated.
+    house = core.HouseState("heat", MON - timedelta(hours=2))
+    cmds, h, info = core.control_step(units, rooms, {"k": (64.0, MON), "b3": (77.0, MON)}, {}, {"ms": 77.0}, {}, house, MON)
+    assert h.mode == "heat" and info["hot"] == 0 and info["rooms"]["b3"][1] > 0  # its demand is shown, not counted
+    assert cmds["ms"].mode == "heat" and cmds["ms"].setpoint == 67  # it still holds its own target
+    # ...and its swing to 55 in cool doesn't drag the house to heat
+    house = core.HouseState("cool", MON - timedelta(hours=2))
+    _, h, info = core.control_step(units, rooms, {"k": (68.0, MON), "b3": (55.0, MON)}, {}, {"ms": 55.0}, {}, house, MON)
+    assert h.mode == "cool" and info["cold"] == 0
+
+
+def test_stored_setpoint_matches_what_the_units_read_back():
+    readback_f = lambda f: round(core.stored_setpoint_c(f) * 1.8 + 32, 1)
+    # seen on the units: 64 -> 64.4, 65 -> 65.3, 67 -> 67.1, 68 -> 68.0, 61 -> 60.8, 73 -> 73.4
+    for want, got in ((64, 64.4), (65, 65.3), (67, 67.1), (68, 68.0), (61, 60.8), (73, 73.4)):
+        assert readback_f(want) == got, (want, readback_f(want))
