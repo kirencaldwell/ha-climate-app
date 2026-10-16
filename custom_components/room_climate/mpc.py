@@ -44,6 +44,7 @@ class ShadowPlanner:
         self.plan_ms: float = None
         self.error: str = None
         self.next_plan: datetime = None
+        self.projection: dict = None  # {"at", "temps": {room: [[iso, F]]}}: 2 h ahead if the units keep their settings
         self.next_track: datetime = None
         self.records: deque = deque()  # open predictions: {"t0", "t", "start", "temps", "running", "done"}
         self.errors: deque = deque()  # (t_eval, room, horizon_min, model_err, nochange_err)
@@ -106,7 +107,7 @@ class ShadowPlanner:
                         continue
                     self.errors.append((now, rid, h, pred - real, rec["start"][rid] - real))
                     self.points.append((now, rid, h, round(pred, 2)))
-        while self.points and now - self.points[0][0] > timedelta(hours=8):
+        while self.points and now - self.points[0][0] > self.keep:
             self.points.popleft()
 
     def due(self, now: datetime) -> bool:
@@ -122,9 +123,22 @@ class ShadowPlanner:
         self.next_plan = now + self.plan_every
         try:
             self._plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {})
+            self._project(now, temps, actual, outdoor, sun_at)
             self.error = None
         except Exception as e:  # never let the model take the integration down; show it instead
             self.error = f"{type(e).__name__}: {e}"
+
+    def _project(self, now, temps, actual, outdoor, sun_at, horizon_min=120, step_min=10):
+        """What the model expects over the next 2 h if every unit keeps its current mode and setpoint."""
+        start = {r: temps[r] for r in self.model.rooms if temps.get(r) is not None}
+        n = horizon_min // step_min
+        times = [now + timedelta(minutes=step_min * (k + 1)) for k in range(n)]
+        modes = {u: (a.get("mode") if a.get("mode") in ("heat", "cool") else "off") for u, a in actual.items()}
+        traj, _, _ = hm.rollout(self.model, dict(start), modes, {u: a.get("setpoint") for u, a in actual.items()},
+                                {u: bool(a.get("running")) for u, a in actual.items()}, [outdoor] * n,
+                                [sun_at(t) for t in times], step_min / 60, substeps=2)
+        self.projection = {"at": now.isoformat(), "temps": {
+            r: [[t.isoformat(), round(step[r], 2)] for t, step in zip(times, traj)] for r in start}}
 
     def _plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed):
         ps = self.ps
@@ -208,7 +222,7 @@ class ShadowPlanner:
         if not d or d.get("version") != 1:
             return
         p = datetime.fromisoformat
-        keep_since, chart_since = now - self.keep, now - timedelta(hours=8)
+        keep_since = chart_since = now - self.keep
         self.errors = deque((p(t), r, h, e, b) for t, r, h, e, b in d.get("errors", []) if p(t) >= keep_since)
         self.points = deque((p(t), r, h, v) for t, r, h, v in d.get("points", []) if p(t) >= chart_since)
         self.readings = {r: deque((p(t), v) for t, v in pts if p(t) >= keep_since) for r, pts in d.get("readings", {}).items()}
@@ -218,7 +232,7 @@ class ShadowPlanner:
         if self.plan is None:
             return None
         return {"house": self.house.mode, "units": self.decision, "cost": round(self.plan.cost, 3),
-                "costs": {k: v["cost"] for k, v in self.plan.by_mode.items()}}
+                "comfort": self.plan.comfort, "costs": {k: v["cost"] for k, v in self.plan.by_mode.items()}}
 
     def accuracy(self) -> dict:
         out = {}
@@ -269,7 +283,59 @@ class ShadowPlanner:
                 "cost": round(p.cost, 3), "by_mode": p.by_mode, "setpoints": p.setpoints, "later": p.later,
                 "step_min": self.ps.step_min},
             "decision": self.decision,
+            "projection": self.projection,
             "accuracy": self.accuracy(),
             "history": self.history(now),
             "horizons": list(HORIZONS_MIN),
         }
+
+
+# --- history for the Model page's charts (pure, so they're testable offline) ---
+def compact(row: dict) -> dict:
+    """The bits of a minute-log row the charts need: room temps/targets/priorities; per unit its real mode and setpoint,
+    what today's controller commanded and what the model would have; both house modes; the model's predicted comfort."""
+    mp = row.get("mpc") or {}
+    mu = mp.get("units") or {}
+    return {"t": row["t"], "h": row.get("house"), "mh": mp.get("house"), "mc": mp.get("comfort"),
+            "r": {rid: [v.get("temp"), v.get("target"), v.get("prio")] for rid, v in (row.get("rooms") or {}).items()
+                  if v.get("temp") is not None},
+            "u": {uid: [v.get("state"), v.get("sp"), v.get("cmd"), v.get("cmd_sp"), (mu.get(uid) or {}).get("mode"),
+                        (mu.get(uid) or {}).get("setpoint")] for uid, v in (row.get("units") or {}).items()}}
+
+
+def comfort_series(samples: list, rooms, settings: core.Settings, ahead_min: int = 120) -> list:
+    """[[iso, actual comfort score over the next `ahead_min` (band cost per hour, as an average), the model's predicted
+    score for its own plan at that moment]] for compact samples, scoring `rooms` the way the optimizer does."""
+    rate = []
+    for smp in samples:
+        c = 0.0
+        for rid in rooms:
+            v = smp["r"].get(rid)
+            if v and v[0] is not None and v[1] is not None:
+                c += optimizer.band_cost(v[0], v[1], v[2] or 3, settings)
+        rate.append((datetime.fromisoformat(smp["t"]), c))
+    out, j, acc, n = [], 0, 0.0, 0
+    for i, (t, _) in enumerate(rate):  # forward-looking average over [t, t + ahead)
+        while j < len(rate) and rate[j][0] < t + timedelta(minutes=ahead_min):
+            acc, n, j = acc + rate[j][1], n + 1, j + 1
+        if rate[j - 1][0] - t >= timedelta(minutes=ahead_min - 10):  # only once the whole window is in the past
+            out.append([samples[i]["t"], round(acc / n, 3), samples[i].get("mc")])
+        else:
+            out.append([samples[i]["t"], None, samples[i].get("mc")])
+        acc, n = acc - rate[i][1], n - 1
+    return out
+
+
+def accuracy_by_hour(errors) -> dict:
+    """room -> horizon -> [[iso hour, rmse, nothing-changes rmse, n]] from (t, room, horizon, err, base) tuples."""
+    groups = {}
+    for t, rid, h, e, b in errors:
+        hour = t.replace(minute=0, second=0, microsecond=0)
+        groups.setdefault((rid, h, hour), []).append((e, b))
+    out = {}
+    for (rid, h, hour), pairs in sorted(groups.items(), key=lambda kv: kv[0][2]):
+        n = len(pairs)
+        out.setdefault(rid, {}).setdefault(str(h), []).append(
+            [hour.isoformat(), round((sum(e * e for e, _ in pairs) / n) ** 0.5, 3),
+             round((sum(b * b for _, b in pairs) / n) ** 0.5, 3), n])
+    return out

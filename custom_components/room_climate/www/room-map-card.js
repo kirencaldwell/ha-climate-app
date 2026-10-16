@@ -451,6 +451,8 @@ class RoomMapCard extends HTMLElement {
       if (b && b.dataset.mx === "refresh") { this._modelLoad(); return; }
       if (b && b.dataset.mx === "fit") { this._modelFit(); return; }
       if (b && b.dataset.mx === "room") { this._mRoom = b.dataset.r; this._modelUpdate(); return; }
+      if (b && b.dataset.mx === "unit") { this._mUnit = b.dataset.u; this._modelUpdate(); return; }
+      if (b && b.dataset.mx === "range") { this._mHours = +b.dataset.h; this._modelLoad(); return; }
       this._closeSchedule(); this._render();
     });
     this._onKey = e => { if (e.key === "Escape") { this._closeSchedule(); this._render(); } };
@@ -459,8 +461,11 @@ class RoomMapCard extends HTMLElement {
     this._modelLoad();
   }
   async _modelLoad() {
-    try { this._mData = await this._hass.callWS({ type: "room_climate/model" }); this._modelUpdate(); }
-    catch (e) { this._fail("model", e); }
+    try {
+      const [d, h] = await Promise.all([this._hass.callWS({ type: "room_climate/model" }),
+        this._hass.callWS({ type: "room_climate/model_history", hours: this._mHours || 24 })]);
+      this._mData = d; this._mHist = h; this._modelUpdate();
+    } catch (e) { this._fail("model", e); }
   }
   async _modelFit() {
     try { await this._hass.callWS({ type: "room_climate/fit_model" }); setTimeout(() => this._modelLoad(), 1500); }
@@ -513,14 +518,8 @@ class RoomMapCard extends HTMLElement {
     const accuracy = `<div class="rc-sect"><h4>Prediction accuracy · last 24 h</h4>
       <p class="rc-sub" style="margin:4px 0">Typical error predicting each room ahead from what the units, weather and sun actually did, vs assuming nothing changes. Green: clearly better; amber: a little; red: worse.</p>
       ${accRows ? `<table class="rc-tbl"><tr><th>Room</th>${hz.map(h => `<th>${h} min</th>`).join("")}</tr>${accRows}</table>` : `<p class="rc-sub">Collecting: the first scores arrive 30 minutes after the model starts tracking.</p>`}</div>`;
-    // 4. chart
-    const hist = sh.history || {}, rooms = Object.keys(hist).filter(r => (hist[r].actual || []).length).sort();
-    if (!rooms.includes(this._mRoom)) this._mRoom = rooms.includes("kitchen") ? "kitchen" : rooms[0];
-    const chart = rooms.length ? `<div class="rc-sect"><h4>Predicted vs actual</h4>
-      <div class="rc-seg">${rooms.map(r => `<button data-mx="room" data-r="${r}" class="${r === this._mRoom ? "on" : ""}">${name(r)}</button>`).join("")}</div>
-      ${this._modelChart(hist[this._mRoom], (d.targets || {})[this._mRoom], d.now)}
-      <div class="rc-legend" style="justify-content:flex-start;gap:14px"><span><b style="color:#e6edf7">—</b> actual</span><span><b style="color:#3fa9ff">●</b> said 1 h before</span>
-        <span><b style="color:#b48cff">●</b> said 2 h before</span><span><b style="color:#3de0a5">- -</b> plan ahead</span><span><b style="color:#3de0a5">▒</b> comfort band</span></div></div>` : "";
+    // 4. history charts
+    const chart = this._histHtml(this._mHist, name);
     // 5. learned
     let learned = "";
     if (m) {
@@ -546,29 +545,125 @@ class RoomMapCard extends HTMLElement {
     return status + would + accuracy + chart + learned;
   }
 
-  _modelChart(h, tgt, nowIso) {
-    if (!h) return "";
-    const W = 640, H = 230, L = 40, R = 10, T = 10, B = 24;
-    const now = Date.parse(nowIso), t0 = now - 6 * 3600e3, t1 = now + 2 * 3600e3;
-    const pts = k => (h[k] || []).map(([t, v]) => [Date.parse(t), v]).filter(([t]) => t >= t0 && t <= t1);
-    const act = pts("actual"), p60 = pts("pred60"), p120 = pts("pred120"), plan = pts("plan");
-    const vals = [...act, ...p60, ...p120, ...plan].map(p => p[1]).concat(tgt ? tgt.band : []);
-    if (!vals.length) return "";
-    let lo = Math.floor(Math.min(...vals) - 0.5), hi = Math.ceil(Math.max(...vals) + 0.5);
-    if (hi - lo < 4) { const c = (hi + lo) / 2; lo = Math.floor(c - 2); hi = Math.ceil(c + 2); }
+  // One time-series chart. series: [{pts: [[ms, v]], color, width, dash, dots, step}]; band: [[ms, lo, hi]];
+  // strips: [{label, segs: [[ms0, ms1, color]]}] drawn as thin rows above the plot (e.g. heat/cool modes).
+  _tsChart({ t0, t1, now, series = [], band = null, line = null, strips = [], fmt = v => v.toFixed(0), zero = false, H = 210 }) {
+    const W = 640, L = 46, R = 10, B = 22, SH = 11, T = 8 + strips.length * (SH + 3);
+    const vals = [];
+    series.forEach(sr => sr.pts.forEach(p => { if (p[0] >= t0 && p[0] <= t1 && p[1] != null) vals.push(p[1]); }));
+    if (band) band.forEach(p => { if (p[0] >= t0 && p[0] <= t1) vals.push(p[1], p[2]); });
+    if (!vals.length) return `<p class="rc-sub">Nothing to plot yet.</p>`;
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    if (zero) lo = 0;
+    const span = Math.max(hi - lo, zero ? 0.5 : 3), pad = span * 0.08;
+    lo = zero ? 0 : lo - pad; hi = lo + span + 2 * pad;
     const x = t => L + (W - L - R) * (t - t0) / (t1 - t0), y = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
     let g = "";
-    for (let v = lo; v <= hi; v++) g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="currentColor" stroke-opacity=".08"/>
-      <text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="currentColor" fill-opacity=".55">${v}°</text>`;
-    for (let k = -6; k <= 2; k += 2) g += `<text x="${x(now + k * 3600e3)}" y="${H - 6}" text-anchor="middle" font-size="11" fill="currentColor" fill-opacity=".55">${k === 0 ? "now" : (k > 0 ? "+" : "") + k + "h"}</text>`;
-    const band = tgt ? `<rect x="${L}" y="${y(tgt.band[1])}" width="${W - L - R}" height="${y(tgt.band[0]) - y(tgt.band[1])}" fill="#3de0a5" fill-opacity=".08"/>
-      <line x1="${L}" x2="${W - R}" y1="${y(tgt.target)}" y2="${y(tgt.target)}" stroke="#3de0a5" stroke-opacity=".5" stroke-dasharray="2 4"/>` : "";
-    const line = (p, attrs) => p.length > 1 ? `<polyline points="${p.map(([t, v]) => `${x(t).toFixed(1)},${y(v).toFixed(1)}`).join(" ")}" fill="none" ${attrs}/>` : "";
-    const dots = (p, c) => p.map(([t, v]) => `<circle cx="${x(t).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.6" fill="${c}"/>`).join("");
-    return `<svg class="rc-chart" viewBox="0 0 ${W} ${H}">${g}${band}
-      <line x1="${x(now)}" x2="${x(now)}" y1="${T}" y2="${H - B}" stroke="currentColor" stroke-opacity=".3"/>
-      ${line(act, 'stroke="#e6edf7" stroke-width="2"')}${dots(p120, "#b48cff")}${dots(p60, "#3fa9ff")}
-      ${line(plan, 'stroke="#3de0a5" stroke-width="2" stroke-dasharray="6 4"')}</svg>`;
+    const ystep = (hi - lo) / 4;
+    for (let k = 0; k <= 4; k++) {
+      const v = lo + k * ystep;
+      g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="currentColor" stroke-opacity=".08"/>
+        <text x="${L - 5}" y="${y(v) + 4}" text-anchor="end" font-size="10" fill="currentColor" fill-opacity=".55">${fmt(v)}</text>`;
+    }
+    const hrs = (t1 - t0) / 3600e3, tick = hrs <= 9 ? 1 : hrs <= 27 ? 4 : 12;
+    const first = Math.ceil(t0 / (tick * 3600e3)) * tick * 3600e3;
+    for (let t = first; t <= t1; t += tick * 3600e3) {
+      const d = new Date(t), lab = tick >= 12 ? d.toLocaleString([], { weekday: "short", hour: "numeric" }) : d.toLocaleTimeString([], { hour: "numeric" });
+      g += `<line x1="${x(t)}" x2="${x(t)}" y1="${T}" y2="${H - B}" stroke="currentColor" stroke-opacity=".05"/>
+        <text x="${x(t)}" y="${H - 6}" text-anchor="middle" font-size="10" fill="currentColor" fill-opacity=".55">${lab}</text>`;
+    }
+    let bandSvg = "";
+    if (band && band.length > 1) {
+      const top = band.map(p => `${x(p[0]).toFixed(1)},${y(p[2]).toFixed(1)}`), bot = band.slice().reverse().map(p => `${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`);
+      bandSvg = `<polygon points="${top.concat(bot).join(" ")}" fill="#3de0a5" fill-opacity=".09"/>`;
+    }
+    const path = (sr) => {
+      const p = sr.pts.filter(q => q[0] >= t0 && q[0] <= t1 && q[1] != null);
+      if (sr.dots) return p.map(([t, v]) => `<circle cx="${x(t).toFixed(1)}" cy="${y(v).toFixed(1)}" r="${sr.r || 2.4}" fill="${sr.color}"/>`).join("");
+      if (p.length < 2) return "";
+      let d = `M${x(p[0][0]).toFixed(1)} ${y(p[0][1]).toFixed(1)}`;
+      for (let i = 1; i < p.length; i++) d += sr.step ? `H${x(p[i][0]).toFixed(1)}V${y(p[i][1]).toFixed(1)}` : `L${x(p[i][0]).toFixed(1)} ${y(p[i][1]).toFixed(1)}`;
+      return `<path d="${d}" fill="none" stroke="${sr.color}" stroke-width="${sr.width || 2}" ${sr.dash ? `stroke-dasharray="${sr.dash}"` : ""} stroke-linejoin="round"/>`;
+    };
+    const strip = strips.map((st, i) => {
+      const yy = 6 + i * (SH + 3);
+      return `<text x="${L - 5}" y="${yy + SH - 2}" text-anchor="end" font-size="9" fill="currentColor" fill-opacity=".6">${st.label}</text>` +
+        st.segs.filter(sg => sg[1] > t0 && sg[0] < t1).map(sg => `<rect x="${x(Math.max(t0, sg[0])).toFixed(1)}" y="${yy}" width="${Math.max(0.5, x(Math.min(t1, sg[1])) - x(Math.max(t0, sg[0]))).toFixed(1)}" height="${SH}" fill="${sg[2]}" fill-opacity=".75"/>`).join("");
+    }).join("");
+    const nowLine = now >= t0 && now <= t1 ? `<line x1="${x(now)}" x2="${x(now)}" y1="${T}" y2="${H - B}" stroke="currentColor" stroke-opacity=".35"/>
+      <text x="${x(now) + 3}" y="${T + 10}" font-size="10" fill="currentColor" fill-opacity=".6">now</text>` : "";
+    const hline = line ? `<line x1="${L}" x2="${W - R}" y1="${y(line)}" y2="${y(line)}" stroke="#3de0a5" stroke-opacity=".5" stroke-dasharray="2 4"/>` : "";
+    return `<svg class="rc-chart" viewBox="0 0 ${W} ${H}">${strip}${g}${bandSvg}${hline}${nowLine}${series.map(path).join("")}</svg>`;
+  }
+
+  _histHtml(h, name) {
+    if (!h) return "";
+    const ms = iso => Date.parse(iso), now = ms(h.now), t0 = now - h.hours * 3600e3, t1 = now + 2 * 3600e3;
+    const S = h.samples || [];
+    const MODE = { heat: "#ff7a45", cool: "#3fa9ff" };
+    const segs = (get) => {  // [[t0, t1, color]] runs of a mode over the samples
+      const out = [];
+      S.forEach((smp, i) => {
+        const md = get(smp), c = MODE[md] || "#667085", ta = ms(smp.t), tb = i + 1 < S.length ? ms(S[i + 1].t) : ta + 300e3;
+        if (out.length && out[out.length - 1][2] === c && out[out.length - 1][1] >= ta - 1) out[out.length - 1][1] = tb;
+        else out.push([ta, tb, c]);
+      });
+      return out;
+    };
+    const ranges = `<div class="rc-seg">${[[6, "6 h"], [24, "24 h"], [72, "3 days"]].map(([v, l]) =>
+      `<button data-mx="range" data-h="${v}" class="${(this._mHours || 24) === v ? "on" : ""}">${l}</button>`).join("")}</div>`;
+    // rooms with readings in the window
+    const rooms = [...new Set(S.flatMap(x => Object.keys(x.r || {})))].sort();
+    if (!rooms.includes(this._mRoom)) this._mRoom = rooms.includes("kitchen") ? "kitchen" : rooms[0];
+    const rid = this._mRoom, P = (h.points || {})[rid] || {};
+    const roomTabs = `<div class="rc-seg">${rooms.map(r => `<button data-mx="room" data-r="${r}" class="${r === rid ? "on" : ""}">${name(r)}</button>`).join("")}</div>`;
+    const act = S.filter(x => x.r[rid]).map(x => [ms(x.t), x.r[rid][0]]);
+    const band = S.filter(x => x.r[rid] && x.r[rid][1] != null).map(x => [ms(x.t), x.r[rid][1] - h.band[0], x.r[rid][1] + h.band[1]]);
+    const proj = ((h.projection || {}).temps || {})[rid] || [], plan = (h.plan || {})[rid] || [];
+    const startPt = act.length ? [act[act.length - 1]] : [];
+    const tempChart = this._tsChart({ t0, t1, now, band, fmt: v => v.toFixed(1) + "°", series: [
+      { pts: act, color: "#e6edf7", width: 2 },
+      { pts: (P["120"] || []).map(([t, v]) => [ms(t), v]), color: "#b48cff", dots: true },
+      { pts: (P["60"] || []).map(([t, v]) => [ms(t), v]), color: "#3fa9ff", dots: true },
+      { pts: startPt.concat(proj.map(([t, v]) => [ms(t), v])), color: "#9aa7b8", dash: "2 4", width: 2 },
+      { pts: startPt.concat(plan.map(([t, v]) => [ms(t), v])), color: "#3de0a5", dash: "6 4", width: 2 }] });
+    // prediction error by hour
+    const A = (h.accuracy || {})[rid] || {};
+    const hourly = k => (A[k] || []).map(([t, r]) => [ms(t) + 1800e3, r]);
+    const accChart = this._tsChart({ t0, t1: now, now, zero: true, H: 160, fmt: v => v.toFixed(1) + "°", series: [
+      { pts: (A["120"] || []).map(([t, , b]) => [ms(t) + 1800e3, b]), color: "#667085", dash: "4 4" },
+      { pts: hourly("60"), color: "#3fa9ff" }, { pts: hourly("120"), color: "#b48cff" },
+      { pts: hourly("60"), color: "#3fa9ff", dots: true, r: 2 }, { pts: hourly("120"), color: "#b48cff", dots: true, r: 2 }] });
+    // commands per unit
+    const units = Object.keys(h.units || {});
+    if (!units.includes(this._mUnit)) this._mUnit = units[0];
+    const uid = this._mUnit;
+    const unitTabs = `<div class="rc-seg">${units.map(u => `<button data-mx="unit" data-u="${u}" class="${u === uid ? "on" : ""}">${(h.units[u] || u).replace(/ (air handler|minisplit)$/i, "")}</button>`).join("")}</div>`;
+    const U = i => S.filter(x => x.u[uid] && x.u[uid][i] != null).map(x => [ms(x.t), x.u[uid][i]]);
+    const cmdChart = this._tsChart({ t0, t1: now, now, fmt: v => v.toFixed(0) + "°",
+      strips: [{ label: "model", segs: segs(x => (x.u[uid] || [])[4]) }, { label: "today", segs: segs(x => (x.u[uid] || [])[2]) },
+               { label: "unit", segs: segs(x => (x.u[uid] || [])[0]) }],
+      series: [{ pts: U(1), color: "#e6edf7", step: true, width: 2 }, { pts: U(3), color: "#3de0a5", step: true, dash: "5 3" },
+               { pts: U(5), color: "#b48cff", step: true, width: 2.5 }] });
+    // comfort score
+    const C = h.comfort || [];
+    const comfortChart = this._tsChart({ t0, t1: now, now, zero: true, H: 170, fmt: v => v.toFixed(1), series: [
+      { pts: C.filter(c => c[1] != null).map(c => [ms(c[0]), c[1]]), color: "#e6edf7", width: 2 },
+      { pts: C.filter(c => c[2] != null).map(c => [ms(c[0]), c[2]]), color: "#b48cff", width: 2 }] });
+    const lg = items => `<div class="rc-legend" style="justify-content:flex-start;gap:14px;flex-wrap:wrap">${items.map(([c, t, k]) => `<span><b style="color:${c}">${k || "—"}</b> ${t}</span>`).join("")}</div>`;
+    return `<div class="rc-sect"><h4>History</h4>${ranges}
+      <h4 style="margin-top:10px">Temperature: predicted vs actual, and the next 2 hours</h4>${roomTabs}${tempChart}
+      ${lg([["#e6edf7", "actual"], ["#3fa9ff", "model said 1 h before", "●"], ["#b48cff", "said 2 h before", "●"],
+            ["#3de0a5", "next 2 h if the model were in charge", "- -"], ["#9aa7b8", "next 2 h if settings stay", "··"], ["#3de0a5", "comfort band", "▒"]])}
+      <h4 style="margin-top:14px">Prediction error by hour · ${name(rid)}</h4>${accChart}
+      ${lg([["#3fa9ff", "1 h ahead"], ["#b48cff", "2 h ahead"], ["#667085", "'nothing changes', 2 h", "- -"]])}
+      <p class="rc-sub" style="margin:2px 0 0">Typical miss (°F) of predictions scored in each hour. Below the grey line = better than assuming nothing changes.</p>
+      <h4 style="margin-top:14px">Commands</h4>${unitTabs}${cmdChart}
+      ${lg([["#b48cff", "model would set"], ["#3de0a5", "today's controller set", "- -"], ["#e6edf7", "unit actually at"],
+            ["#ff7a45", "heat", "■"], ["#3fa9ff", "cool", "■"], ["#667085", "off / no change", "■"]])}
+      <h4 style="margin-top:14px">Comfort score (lower is better)</h4>${comfortChart}
+      ${lg([["#e6edf7", "actual, over the following 2 h (today's controller)"], ["#b48cff", "model's prediction for its own plan"]])}
+      <p class="rc-sub" style="margin:2px 0 0">Priority-weighted misses outside the comfort band, per hour (the cost both controllers minimize). The actual line stops 2 h before now, since those 2 hours aren't over yet.</p></div>`;
   }
 
   /* ---------- schedule editor (modal) ---------- */

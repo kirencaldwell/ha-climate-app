@@ -134,6 +134,26 @@ def test_scores_survive_a_restart():
     later.load_state({"version": 99}, sim.now)  # an unknown format is ignored, not an error
 
 
+def test_chart_history_comfort_and_accuracy_series():
+    truth, rooms, units, s = _house()
+    start = datetime.fromisoformat("2026-10-16T00:00:00-07:00")
+    log = []
+    coupled.run(truth, rooms, units, coupled.HeuristicController(rooms, units, s), start, 0.5,
+                coupled.Weather(start, 2, seed=9), s, log=log, seed=9)
+    for k, row in enumerate(log):  # as the integration logs it: what the model would do
+        row["house"] = "heat"
+        row["mpc"] = {"house": "heat", "comfort": 0.5, "units": {"air_handler": {"mode": "heat", "setpoint": 66.0}}}
+    samples = [mpc.compact(r) for r in log[::5]]
+    assert samples[0]["u"]["air_handler"][4:] == ["heat", 66.0] and samples[0]["mc"] == 0.5
+    cs = mpc.comfort_series(samples, ["kitchen", "primary_bedroom"], s)
+    assert len(cs) == len(samples) and cs[0][1] is not None and cs[-1][1] is None  # the last 2 h aren't over yet
+    assert all(c[2] == 0.5 for c in cs)
+    sh, sim = _shadow_run(coupled.the_house(), 6)
+    by = mpc.accuracy_by_hour(sh.errors)
+    assert set(by["kitchen"]) == {"30", "60", "120"} and all(len(v) >= 3 for v in by["kitchen"].values())
+    assert sh.projection and len(sh.projection["temps"]["kitchen"]) == 12  # 2 h ahead if settings stay
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

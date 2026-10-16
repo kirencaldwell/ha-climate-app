@@ -51,6 +51,7 @@ class Plan:
     predicted: dict = field(default_factory=dict)  # room id -> [F at each step] for the chosen plan
     reason: str = ""
     later: dict = field(default_factory=dict)  # unit id -> F planned for after the first block
+    comfort: float = 0.0  # predicted comfort score of the chosen plan: band cost per hour, averaged over the horizon
 
 
 def band_cost(temp: float, target: float, weight: float, settings: core.Settings) -> float:
@@ -181,6 +182,13 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
             best = (mode, c, sps, traj)
 
     mode, c, sps, traj = best
+    comfort = 0.0
+    for k, tk in enumerate(traj):
+        for r in scored:
+            tgt, w = tw[r.id][k]
+            comfort += band_cost(tk[r.id], tgt, w, settings)
+    comfort /= max(1, len(traj))  # per step = per hour, as an average rate
     others = ", ".join(f"{md} {v['cost']:.2f}" for md, v in by_mode.items() if md != mode)
     return Plan(mode, by_mode[mode]["setpoints"], c, by_mode, {r.id: [round(t[r.id], 2) for t in traj] for r in scored},
-                f"{mode}: cost {c:.2f}" + (f" (vs {others})" if others else ""), by_mode[mode]["later"])
+                f"{mode}: cost {c:.2f}" + (f" (vs {others})" if others else ""), by_mode[mode]["later"],
+                round(comfort, 3))

@@ -7,6 +7,7 @@ import logging
 import os
 import pathlib
 import time
+from collections import deque
 from datetime import datetime, timedelta
 
 import voluptuous as vol
@@ -44,6 +45,7 @@ BAD_STATES = ("unknown", "unavailable")
 MODEL_FILE = "room_climate_model.json"  # the fitted thermal model (model.py), refitted nightly
 FIT_HISTORY_FILE = "room_climate_model_fits.jsonl"  # one line per fit: when, data span, how well it predicts
 FIT_DAYS = 14  # fit on this many days of the minute log
+HISTORY_H = 72  # the Model page's charts reach back this far (5-minute samples, rebuilt from the minute log)
 
 
 def _room_from_dict(d: dict) -> core.Room:
@@ -88,6 +90,7 @@ class Manager:
         self._shadow_busy = False
         # Its accuracy scores, chart points and recent readings, so a restart doesn't throw away days of proving.
         self.track_store = Store(hass, 1, f"{DOMAIN}_tracking")
+        self.hist5: deque = deque()  # compact 5-minute samples for the Model page's charts (mpc.compact)
         self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
         self.fit_history: list = []
 
@@ -121,6 +124,56 @@ class Manager:
             self.shadow.load_state(await self.track_store.async_load(), dt_util.now())
         except (ValueError, TypeError, KeyError) as e:
             _LOGGER.warning("couldn't restore the model's accuracy scores: %s", e)
+
+    async def async_load_history(self):
+        """Rebuild the charts' 5-minute samples from the last HISTORY_H of the minute log (once, at startup)."""
+        logdir = self.hass.config.path("room_climate_data")
+        since = dt_util.now() - timedelta(hours=HISTORY_H)
+
+        def read():
+            if not os.path.isdir(logdir):
+                return []
+            out = []
+            for row in datalog.read_rows(logdir, since.strftime("%Y-%m-%d")):
+                try:
+                    t = datetime.fromisoformat(row["t"])
+                except (KeyError, ValueError):
+                    continue
+                if t >= since and t.minute % 5 == 0:
+                    out.append(mpc.compact(row))
+            return out
+
+        try:
+            rows = await self.hass.async_add_executor_job(read)
+        except OSError as e:
+            _LOGGER.warning("couldn't rebuild the model charts' history: %s", e)
+            return
+        self.hist5 = deque(rows + list(self.hist5))  # anything logged meanwhile goes after
+
+    def model_history(self, hours: float) -> dict:
+        """What the Model page's charts plot: samples, comfort score (actual vs the model's prediction), prediction
+        accuracy by hour, predictions as they were made, and the two 2 h projections."""
+        now = dt_util.now()
+        since = (now - timedelta(hours=hours)).isoformat()
+        samples = [x for x in self.hist5 if x["t"] >= since]
+        s = core.settings_from(self.data.get("settings"))
+        ent = {u["id"]: u["entity"] for u in self.data["units"]}
+        m = self.shadow.model
+        scored = [r["id"] for r in self.data["rooms"] if r.get("unit") and (m is None or r["id"] in m.rooms)
+                  and r.get("sensor") and r.get("sensor") != ent.get(r.get("unit"))]
+        points = {}
+        for t, rid, h, v in self.shadow.points:
+            if t.isoformat() >= since:
+                points.setdefault(rid, {}).setdefault(str(h), []).append([t.isoformat(), v])
+        p = self.shadow.plan
+        plan = None if p is None else {r: [[(self.shadow.plan_at + timedelta(minutes=self.shadow.ps.step_min * (k + 1))).isoformat(), v]
+                                           for k, v in enumerate(traj)] for r, traj in p.predicted.items()}
+        return {"now": now.isoformat(), "hours": hours, "samples": samples, "scored": scored,
+                "comfort": mpc.comfort_series(samples, scored, s), "accuracy": mpc.accuracy_by_hour(self.shadow.errors),
+                "points": points, "projection": self.shadow.projection, "plan": plan,
+                "band": [s.band_below, s.band_above],
+                "units": {u["id"]: u.get("name") or u["id"] for u in self.data["units"]},
+                "rooms": {r["id"]: r.get("name") or r["id"] for r in self.data["rooms"]}}
 
     def model_age_h(self):
         m = self.shadow.model
@@ -476,6 +529,11 @@ class Manager:
                 row["extra"][st.entity_id] = num(st.state) if num(st.state) is not None else st.state
         row["mpc"] = self.shadow.log_fields()  # what the model-based controller would do
         self.track_store.async_delay_save(self.shadow.to_state, 30)  # about once a minute, and on shutdown
+        if minute.minute % 5 == 0:
+            self.hist5.append(mpc.compact(row))
+            cut = (now - timedelta(hours=HISTORY_H)).isoformat()
+            while self.hist5 and self.hist5[0]["t"] < cut:
+                self.hist5.popleft()
         path = self.hass.config.path("room_climate_data")
         try:
             await self.hass.async_add_executor_job(datalog.append, path, row, now)
@@ -731,13 +789,19 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     async def ws_model(hass, connection, msg):
         connection.send_result(msg["id"], mgr.model_debug())
 
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/model_history",
+                                      vol.Optional("hours", default=24): vol.All(vol.Coerce(float), vol.Range(min=1, max=HISTORY_H))})
+    @websocket_api.async_response
+    async def ws_model_history(hass, connection, msg):
+        connection.send_result(msg["id"], mgr.model_history(msg["hours"]))
+
     @websocket_api.websocket_command({"type": f"{DOMAIN}/fit_model"})
     @websocket_api.async_response
     async def ws_fit_model(hass, connection, msg):
         hass.async_create_task(mgr.async_fit())
         connection.send_result(msg["id"], {"started": True})
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_fit_model):
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_fit_model):
         websocket_api.async_register_command(hass, fn)
 
     unit_entities = [u["entity"] for u in mgr.data["units"]]
@@ -754,6 +818,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         # Rate limiting lives in core (min run/off times), so reacting to every update is safe.
         async_track_state_change_event(hass, sensors, _on_sensor)
     async_track_time_interval(hass, mgr.async_tick, INTERVAL)
+    hass.async_create_task(mgr.async_load_history())
     # Refit the thermal model nightly, and soon after startup if there is none or it's more than a day old.
     async_track_time_change(hass, mgr.async_fit, hour=3, minute=40, second=0)
     age = mgr.model_age_h()
