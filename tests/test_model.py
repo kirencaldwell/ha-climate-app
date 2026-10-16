@@ -10,6 +10,7 @@ import model as hm  # noqa: E402
 import optimizer  # noqa: E402
 
 NIGHT = datetime(2026, 10, 5, 2, 0)  # a Monday, 2am
+NEUTRAL = core.Settings(band_below=1.0, band_above=1.5, warm_weight=1.0, aim_offset=0.0)  # see tests/test_core.py
 
 
 def two_rooms(coupling=0.0):
@@ -72,7 +73,7 @@ def _plan(m, rooms, units, temps, house, outdoor=50.0, **kw):
     ps = optimizer.PlanSettings(**kw)
     n = int(ps.horizon_h * 60 / ps.step_min)
     return optimizer.plan(m, rooms, units, temps, NIGHT, house, {"ah": 67, "ms": 67}, {}, [outdoor] * n, [0.0] * n,
-                          core.Settings(), ps)
+                          NEUTRAL, ps)
 
 
 def test_plan_heats_a_cold_house_and_cools_a_hot_one():
@@ -134,6 +135,19 @@ def test_sim_mpc_avoids_the_heuristics_zone_conflict_flip_flop():
     assert mpc["mode_switches"] <= heur["mode_switches"] / 3
     assert mpc["discomfort"] <= heur["discomfort"] * 1.25
     assert mpc["energy_unit_h"] < heur["energy_unit_h"]
+
+
+def test_plan_errs_cool_when_it_has_to_miss():
+    m, rooms, units = two_rooms()
+    house = core.HouseState("heat", NIGHT - timedelta(hours=3))
+    p = _plan(m, rooms, units, {"down": 66.5, "up": 66.5}, house, outdoor=50.0)
+    s = core.Settings()
+    ps = optimizer.PlanSettings()
+    n = int(ps.horizon_h * 60 / ps.step_min)
+    q = optimizer.plan(m, rooms, units, {"down": 66.5, "up": 66.5}, NIGHT, house, {"ah": 67, "ms": 67}, {},
+                       [50.0] * n, [0.0] * n, s, ps)
+    assert sum(q.setpoints.values()) < sum(p.setpoints.values())  # the cool-leaning defaults plan lower setpoints
+    assert optimizer.band_cost(68.5, 67, 3, s) == 2 * optimizer.band_cost(65.0, 67, 3, s)  # 0.5 past each edge
 
 
 if __name__ == "__main__":

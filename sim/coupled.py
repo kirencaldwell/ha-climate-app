@@ -255,6 +255,7 @@ def run(truth: hm.HouseModel, rooms, units, controller, start: datetime, days: f
     scored = [r for r in rooms if r.unit is not None and r.id in truth.rooms]
     disc, out_min, switches, last_mode = {r.id: 0.0 for r in scored}, {r.id: 0 for r in scored}, 0, None
     worst = {r.id: 0.0 for r in scored}
+    signed = {r.id: 0.0 for r in scored}  # minutes x (temp - target): which side rooms miss on
     for _ in range(int(days * 1440)):
         now = sim.now
         mode = controller.tick(sim, now)
@@ -271,10 +272,12 @@ def run(truth: hm.HouseModel, rooms, units, controller, start: datetime, days: f
             dev = max((tgt - settings.band_below) - t, t - (tgt + settings.band_above), 0.0)
             out_min[r.id] += dev > 0
             worst[r.id] = max(worst[r.id], dev)
+            signed[r.id] += t - tgt
     return {"controller": controller.name, "discomfort": round(sum(disc.values()), 2),
             "by_room": {k: round(v, 2) for k, v in disc.items()},
             "hours_outside_band": {k: round(v / 60, 1) for k, v in out_min.items()},
             "worst_F": {k: round(v, 2) for k, v in worst.items()},
+            "mean_vs_target_F": {k: round(v / max(1, int(days * 1440)), 2) for k, v in signed.items()},
             "mode_switches": switches, "compressor_starts": sim.starts, "commands": sim.commands,
             "energy_unit_h": round(sim.energy, 1)}
 

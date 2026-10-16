@@ -35,6 +35,8 @@ class PlanSettings:
     switch_cost: float = 3.0  # charged once for a heat <-> cool switch (weighted F^2 * h); tuned on the simulated house
     change_cost: float = 0.05  # per F^2 of setpoint change on a unit
     energy_cost: float = 0.02  # per hour of full output on a unit
+    aim_weight: float = 0.1  # small pull toward target - aim_offset inside the band (otherwise energy alone would
+    #                          park rooms at the band's warm edge in summer; the household prefers cool)
     terminal_h: float = 0.5  # the end of the horizon counts double, so a plan has to settle, not just pass through
     first_block_min: int = 30  # setpoints are planned in two blocks: this long now (what gets sent), then the rest,
     #                            which may differ (e.g. after a schedule change), so the near term isn't sacrificed
@@ -54,7 +56,7 @@ class Plan:
 def band_cost(temp: float, target: float, weight: float, settings: core.Settings) -> float:
     """Same cold + hot cost as core.room_costs for a known temperature (no prediction, no free cooling)."""
     cold = weight * max(0.0, (target - settings.band_below) - temp) ** 2 + settings.hard_weight * max(0.0, settings.floor - temp) ** 2
-    hot = weight * max(0.0, temp - (target + settings.band_above)) ** 2 + settings.hard_weight * max(0.0, temp - settings.ceiling) ** 2
+    hot = settings.warm_weight * weight * max(0.0, temp - (target + settings.band_above)) ** 2 + settings.hard_weight * max(0.0, temp - settings.ceiling) ** 2
     return cold + hot
 
 
@@ -65,14 +67,17 @@ def _pad(seq, n):
 
 def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime, house: core.HouseState,
          setpoints_now: dict, running: dict, outdoor_seq, sun_seq, settings: core.Settings = core.Settings(),
-         ps: PlanSettings = PlanSettings()) -> Plan:
+         ps: PlanSettings = PlanSettings(), ignore=()) -> Plan:
     """Best house mode and setpoints for the next `horizon_h`. `temps` are current room temperatures (rooms the model
-    knows), `running` which units are actually running now, `outdoor_seq`/`sun_seq` the expected weather per step."""
+    knows), `running` which units are actually running now, `outdoor_seq`/`sun_seq` the expected weather per step.
+    Rooms in `ignore` are simulated (their unit may regulate on them) but don't count in the cost: e.g. a room that
+    reads its own unit's sensor, which measures the unit's airflow rather than the room."""
     n = max(1, int(round(ps.horizon_h * 60 / ps.step_min)))
     dt_h = ps.step_min / 60
     times = [now + timedelta(minutes=ps.step_min * (k + 1)) for k in range(n)]
     outdoor, sun = _pad(outdoor_seq, n), [s or 0.0 for s in _pad(sun_seq, n)]
-    scored = [r for r in rooms if r.unit is not None and r.id in m.rooms and temps.get(r.id) is not None]
+    scored = [r for r in rooms if r.unit is not None and r.id in m.rooms and temps.get(r.id) is not None
+              and r.id not in ignore]
     # Targets and weights over the horizon don't depend on the plan: work them out once.
     tw = {r.id: [(core.target_temp(r, t), core.room_priority(r, t)) for t in times] for r in scored}
     end_weight = [2.0 if (times[-1] - t).total_seconds() < ps.terminal_h * 3600 else 1.0 for t in times]
@@ -87,8 +92,8 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
         if not mine:
             return float(round(setpoints_now.get(u.id) or 68.0))
         wsum = sum(tw[r.id][k][1] for r in mine)
-        zone = sum(tw[r.id][k][0] * tw[r.id][k][1] for r in mine) / wsum
-        return float(round(zone + m.units[u.id].sensor_offset))
+        zone = sum(tw[r.id][k][0] * tw[r.id][k][1] for r in mine) / wsum - settings.aim_offset
+        return core.round_cool(zone + m.units[u.id].sensor_offset)
 
     def clamp(u, v):
         return float(max(u.min_setpoint, min(u.max_setpoint, v)))
@@ -112,7 +117,9 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
         for k, tk in enumerate(traj):
             for r in scored:
                 tgt, w = tw[r.id][k]
-                c += band_cost(tk[r.id], tgt, w, settings) * dt_h * end_weight[k]
+                t = tk[r.id]
+                aim = ps.aim_weight * w * (t - (tgt - settings.aim_offset)) ** 2
+                c += (band_cost(t, tgt, w, settings) + aim) * dt_h * end_weight[k]
             c += ps.energy_cost * sum(abs(y) for y in outs[k].values()) * dt_h
         for uid, v in sps.items():
             prev = setpoints_now.get(uid)

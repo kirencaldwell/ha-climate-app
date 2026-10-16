@@ -1,4 +1,4 @@
-"""The fitter recovers the simulated house from its own logs. Needs numpy: python tests/test_fit.py"""
+"""The fitter recovers the simulated house from its own logs. Run: python3 tests/test_fit.py"""
 import os
 import sys
 from datetime import datetime
@@ -6,9 +6,8 @@ from datetime import datetime
 HERE = os.path.dirname(__file__)
 sys.path.append(os.path.join(HERE, "..", "custom_components", "room_climate"))  # appended: its select.py must not shadow the stdlib select module
 sys.path.insert(0, os.path.join(HERE, "..", "sim"))
-sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import coupled  # noqa: E402
-import fit_model  # noqa: E402
+import fit  # noqa: E402
 
 
 def test_fit_recovers_the_simulated_house():
@@ -27,8 +26,9 @@ def test_fit_recovers_the_simulated_house():
     neighbors = {rid: sorted(set(r.coupling) | {j for j, o in truth.rooms.items() if rid in o.coupling})
                  for rid, r in truth.rooms.items()}
     layout = {"rooms": {rid: {"units": list(truth.units), "neighbors": neighbors[rid]} for rid in truth.rooms},
-              "units": {u: {"sensor_rooms": v.sensor_rooms} for u, v in truth.units.items()}}
-    m, rep = fit_model.fit(log, layout)
+              "units": {u: {"zone": [r.id for r in rooms if r.unit == u]} for u in truth.units}}  # sensor rooms: detected
+    m, rep = fit.fit(log, layout)
+    assert m.meta["usable"]
     for rid, tr in truth.rooms.items():
         fr = m.rooms[rid]
         assert abs(fr.loss - tr.loss) < 0.25 * tr.loss, (rid, fr.loss, tr.loss)
@@ -39,6 +39,7 @@ def test_fit_recovers_the_simulated_house():
         assert max(others) < 0.1 * tr.heat[own], (rid, fr.heat)  # no effect where there is none
     up = m.rooms["primary_bedroom"].coupling.get("living_room", 0)
     assert 0.05 < up < 0.2, up  # the stairs (true 0.12)
+    assert {u: v.sensor_rooms for u, v in m.units.items()} == {u: v.sensor_rooms for u, v in truth.units.items()}
     for rid, v in rep["holdout"].items():
         assert v["model_rmse_F"] < 0.5 * v["no_change_rmse_F"], (rid, v)
 

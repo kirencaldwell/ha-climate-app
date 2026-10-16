@@ -67,6 +67,13 @@ const CSS = `
 .rc-tile .big small { font-size: .55em; font-weight: 400; color: var(--secondary-text-color, #9aa7b8); }
 .rc-ctl { display: inline-block; font-size: .68em; font-weight: 600; letter-spacing: .03em; padding: 2px 7px; border-radius: 99px; margin: 4px 0 2px;
   background: #ffd16622; color: #ffd166; } .rc-ctl.rc { background: #3de0a522; color: #3de0a5; }
+.rc-tbl { width: 100%; border-collapse: collapse; font-size: .82em; margin-top: 6px; }
+.rc-tbl th, .rc-tbl td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--divider-color, #ffffff1a); white-space: nowrap; }
+.rc-tbl th { color: var(--secondary-text-color, #9aa7b8); font-weight: 500; }
+.rc-tbl td.ok { color: #3de0a5; } .rc-tbl td.warn { color: #ffd166; } .rc-tbl td.bad { color: #ff7a45; }
+.rc-tbl small { color: var(--secondary-text-color, #9aa7b8); }
+.rc-badge { display: inline-block; padding: 3px 10px; border-radius: 99px; font-size: .8em; font-weight: 600; }
+.rc-badge.ok { background: #3de0a522; color: #3de0a5; } .rc-badge.warn { background: #ffd16622; color: #ffd166; }
 .rc-tile button.rc-hand { width: 100%; min-height: 36px; margin-top: 6px; font-size: .75em; padding: 0 6px; }
 .rc-tile .why { font-size: .72em; color: var(--secondary-text-color, #9aa7b8); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; }
 .rc-g { position: relative; height: 8px; border-radius: 4px; background: #ffffff14; margin-top: 6px; }
@@ -165,6 +172,7 @@ class RoomMapCard extends HTMLElement {
     const t = e.target.closest("[data-act],[data-room],[data-floor]");
     if (!t || !this._data) return;
     if (t.dataset.act === "diag") { this._openDiag(); return; }
+    if (t.dataset.act === "model") { this._openModel(); return; }
     if (t.dataset.act === "ctl") { this._setControl(t.dataset.u, t.dataset.c); return; }
     const room = this._data.rooms.find(r => r.id === this._sel);
     const live = room ? this._data.live[room.id] || {} : {};
@@ -347,7 +355,8 @@ class RoomMapCard extends HTMLElement {
     return `<h3>Heat pumps</h3>${house}<div class="rc-units">${tiles}</div>
       ${pr ? `<div class="rc-sect"><h4>Highest priority</h4>${pr}</div>` : ""}
       <p class="rc-sub" style="margin:12px 0">Tap a room to adjust it.</p>
-      <button data-act="diag" style="width:100%">Diagnostics</button>`;
+      <div class="rc-chips" style="display:flex;gap:8px"><button data-act="diag" style="flex:1">Diagnostics</button>
+        <button data-act="model" style="flex:1">Model</button></div>`;
   }
 
   _openDiag() {
@@ -419,6 +428,140 @@ class RoomMapCard extends HTMLElement {
       ${mon ? `<div class="rc-sect"><h4>Monitor only</h4><div class="rc-chips2">${mon}</div></div>` : ""}`;
   }
 
+  /* ---------- model page (modal): the model-based controller in "would do" mode, and how well the model predicts ---------- */
+  _openModel() {
+    this._closeSchedule();
+    const m = this._modal = document.createElement("div");
+    m.className = "rc-modal";
+    m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="Model">
+      <header><h3>Model</h3><button data-x="close" aria-label="Close">✕</button></header>
+      <div class="rc-body" data-slot="model"><p class="rc-sub">Loading…</p></div>
+      <footer><button data-mx="refresh">Refresh</button><button data-x="close" class="on">Close</button></footer></div>`;
+    document.body.append(m);
+    this._mOpen = true;
+    m.addEventListener("click", e => {
+      const b = e.target.closest("[data-x],[data-mx]");
+      if (!b && !e.target.classList.contains("rc-modal")) return;
+      if (b && b.dataset.mx === "refresh") { this._modelLoad(); return; }
+      if (b && b.dataset.mx === "fit") { this._modelFit(); return; }
+      if (b && b.dataset.mx === "room") { this._mRoom = b.dataset.r; this._modelUpdate(); return; }
+      this._closeSchedule(); this._render();
+    });
+    this._onKey = e => { if (e.key === "Escape") { this._closeSchedule(); this._render(); } };
+    document.addEventListener("keydown", this._onKey);
+    this._mTimer = setInterval(() => this._modelLoad(), 30000);
+    this._modelLoad();
+  }
+  async _modelLoad() {
+    try { this._mData = await this._hass.callWS({ type: "room_climate/model" }); this._modelUpdate(); }
+    catch (e) { this._fail("model", e); }
+  }
+  async _modelFit() {
+    try { await this._hass.callWS({ type: "room_climate/fit_model" }); setTimeout(() => this._modelLoad(), 1500); }
+    catch (e) { this._fail("fit_model", e); }
+  }
+  _modelUpdate() {
+    const el = this._modal && this._mOpen && this._modal.querySelector('[data-slot="model"]');
+    if (el && this._mData) el.innerHTML = this._modelHtml(this._mData);
+  }
+
+  _modelHtml(d) {
+    const m = d.model, meta = (m && m.meta) || {}, sh = d.shadow || {}, plan = sh.plan, fitS = d.fit || {};
+    const name = id => ((d.targets || {})[id] || {}).name || (d.today[id] || {}).name || id;
+    const f1 = v => v == null ? "—" : (+v).toFixed(1);
+    const when = iso => iso ? new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—";
+    // 1. status
+    const badge = !m ? `<span class="rc-badge warn">No model yet</span>`
+      : meta.usable ? `<span class="rc-badge ok">Model usable</span>`
+      : `<span class="rc-badge warn">Still learning: doesn't yet beat "nothing changes"</span>`;
+    const status = `<div class="rc-sect"><h4>Status</h4>
+      <p style="margin:6px 0">${badge}</p>
+      <p class="rc-sub" style="margin:4px 0">${m ? `Fitted ${when(meta.fitted)} on ${meta.rows || 0} minutes of log (${when(meta.from)} – ${when(meta.to)}).`
+        : "The first fit runs a few minutes after Home Assistant starts, then every night at 3:40."}
+        ${fitS.running ? " <b>Fitting now…</b>" : ""}${fitS.error ? ` <span style="color:#ffd166">Last fit: ${fitS.error}</span>` : ""}
+        ${sh.error ? ` <span style="color:#ff7a45">Planner error: ${sh.error}</span>` : ""}</p>
+      <button data-mx="fit" ${fitS.running ? "disabled" : ""}>Refit now</button></div>`;
+    // 2. would do vs today
+    const dec = sh.decision || {};
+    const md = (mode, sp) => mode == null ? "—" : mode === "off" ? "off" : `${mode} ${sp == null ? "" : Math.round(sp) + "°"}`;
+    const unitRows = Object.entries(d.today || {}).map(([u, t]) => `<tr><td>${t.name.replace(/ (air handler|minisplit)$/i, "")}</td>
+        <td><b>${md((dec[u] || {}).mode, (dec[u] || {}).setpoint)}</b></td><td>${md(t.mode, t.setpoint)}${t.control === "room_climate" ? "" : " <small>(thermostat in control)</small>"}</td>
+        <td>${md(t.actual_mode, t.actual_setpoint)}</td></tr>`).join("");
+    const costs = plan ? Object.entries(plan.by_mode).map(([k, v]) => `${k} ${(+v.cost).toFixed(2)}`).join(" · ") : "";
+    const would = `<div class="rc-sect"><h4>Would do vs today</h4>
+      ${plan ? `<p class="rc-sub" style="margin:4px 0">Model-based: <b>${sh.house}</b>${sh.pending ? ` (confirming ${sh.pending})` : ""} · plan cost ${costs} · ${when(plan.at)}, ${plan.ms} ms.
+        Today's controller: <b>${d.house_today}</b>.</p>` : `<p class="rc-sub">No plan yet${m ? " (first one within 5 minutes)" : ": needs a model"}.</p>`}
+      <table class="rc-tbl"><tr><th>Unit</th><th>Model would</th><th>Today's controller</th><th>Unit now</th></tr>${unitRows}</table>
+      <p class="rc-sub" style="margin:6px 0 0">Comfort leans cool: band ${f1(d.comfort.band_below)}° below to ${f1(d.comfort.band_above)}° above target, running warm costs ${d.comfort.warm_weight}×, heating aims ${d.comfort.aim_offset}° low.</p></div>`;
+    // 3. accuracy
+    const acc = sh.accuracy || {}, hz = sh.horizons || [30, 60, 120];
+    const cell = v => {
+      if (!v) return `<td>—</td>`;
+      const cls = v.rmse < 0.8 * v.base_rmse ? "ok" : v.rmse < v.base_rmse ? "warn" : "bad";
+      return `<td class="${cls}" title="${v.n} predictions · bias ${v.bias > 0 ? "+" : ""}${v.bias}°">${v.rmse.toFixed(2)}° <small>vs ${v.base_rmse.toFixed(2)}°</small></td>`;
+    };
+    const accRows = Object.keys(acc).sort().map(r => `<tr><td>${name(r)}</td>${hz.map(h => cell(acc[r][String(h)])).join("")}</tr>`).join("");
+    const accuracy = `<div class="rc-sect"><h4>Prediction accuracy · last 24 h</h4>
+      <p class="rc-sub" style="margin:4px 0">Typical error predicting each room ahead from what the units, weather and sun actually did, vs assuming nothing changes. Green: clearly better; amber: a little; red: worse.</p>
+      ${accRows ? `<table class="rc-tbl"><tr><th>Room</th>${hz.map(h => `<th>${h} min</th>`).join("")}</tr>${accRows}</table>` : `<p class="rc-sub">Collecting: the first scores arrive 30 minutes after the model starts tracking.</p>`}</div>`;
+    // 4. chart
+    const hist = sh.history || {}, rooms = Object.keys(hist).filter(r => (hist[r].actual || []).length).sort();
+    if (!rooms.includes(this._mRoom)) this._mRoom = rooms.includes("kitchen") ? "kitchen" : rooms[0];
+    const chart = rooms.length ? `<div class="rc-sect"><h4>Predicted vs actual</h4>
+      <div class="rc-seg">${rooms.map(r => `<button data-mx="room" data-r="${r}" class="${r === this._mRoom ? "on" : ""}">${name(r)}</button>`).join("")}</div>
+      ${this._modelChart(hist[this._mRoom], (d.targets || {})[this._mRoom], d.now)}
+      <div class="rc-legend" style="justify-content:flex-start;gap:14px"><span><b style="color:#e6edf7">—</b> actual</span><span><b style="color:#3fa9ff">●</b> said 1 h before</span>
+        <span><b style="color:#b48cff">●</b> said 2 h before</span><span><b style="color:#3de0a5">- -</b> plan ahead</span><span><b style="color:#3de0a5">▒</b> comfort band</span></div></div>` : "";
+    // 5. learned
+    let learned = "";
+    if (m) {
+      const units = Object.keys(m.units || {});
+      const rep = meta.report || {}, hold = rep.holdout || {};
+      const rows = Object.entries(m.rooms).map(([r, p]) => {
+        const top = Object.entries(p.coupling || {}).filter(([, c]) => c > 0.005).sort((a, b) => b[1] - a[1]).slice(0, 2)
+          .map(([j, c]) => `${name(j)} ${c.toFixed(2)}`).join(", ") || "—";
+        const hc = units.map(u => `<td>${f1((p.heat || {})[u])} / ${f1((p.cool || {})[u])}</td>`).join("");
+        const h = hold[r] || {};
+        const ok = h.model_rmse_F != null && h.no_change_rmse_F != null && h.model_rmse_F < h.no_change_rmse_F;
+        return `<tr><td>${name(r)}</td>${hc}<td>${(p.loss || 0).toFixed(3)}</td><td>${f1(p.solar)}</td><td style="white-space:normal;min-width:9em">${top}</td>
+          <td class="${h.model_rmse_F == null ? "" : ok ? "ok" : "bad"}">${h.model_rmse_F == null ? "—" : `${h.model_rmse_F}° vs ${h.no_change_rmse_F}°`}</td></tr>`;
+      }).join("");
+      const skipped = Object.entries(rep).filter(([, v]) => v && v.skipped).map(([r, v]) => `${name(r)}: ${v.skipped}`).join("; ");
+      const fits = (d.fits || []).slice(-7).reverse().map(f => `<tr><td>${when(f.fitted)}</td><td>${f.rows}</td><td class="${f.usable ? "ok" : "warn"}">${f.usable ? "usable" : "learning"}</td></tr>`).join("");
+      learned = `<div class="rc-sect"><h4>What the model learned</h4>
+        <p class="rc-sub" style="margin:4px 0">°F per hour each unit moves each room at full heat / full cool; loss to outdoors per hour; sun °F/h in full sun; strongest links to other rooms (per hour); and its 2-hour check on held-out data vs "nothing changes".</p>
+        <div style="overflow-x:auto"><table class="rc-tbl"><tr><th>Room</th>${units.map(u => `<th>${name(u).replace(/ (air handler|minisplit)$/i, "")}</th>`).join("")}<th>Loss</th><th>Sun</th><th>Links</th><th>2 h check</th></tr>${rows}</table></div>
+        ${skipped ? `<p class="rc-sub" style="margin:6px 0 0">Not fitted yet: ${skipped}</p>` : ""}
+        ${fits ? `<h4 style="margin-top:12px">Recent fits</h4><table class="rc-tbl"><tr><th>When</th><th>Minutes</th><th></th></tr>${fits}</table>` : ""}</div>`;
+    }
+    return status + would + accuracy + chart + learned;
+  }
+
+  _modelChart(h, tgt, nowIso) {
+    if (!h) return "";
+    const W = 640, H = 230, L = 40, R = 10, T = 10, B = 24;
+    const now = Date.parse(nowIso), t0 = now - 6 * 3600e3, t1 = now + 2 * 3600e3;
+    const pts = k => (h[k] || []).map(([t, v]) => [Date.parse(t), v]).filter(([t]) => t >= t0 && t <= t1);
+    const act = pts("actual"), p60 = pts("pred60"), p120 = pts("pred120"), plan = pts("plan");
+    const vals = [...act, ...p60, ...p120, ...plan].map(p => p[1]).concat(tgt ? tgt.band : []);
+    if (!vals.length) return "";
+    let lo = Math.floor(Math.min(...vals) - 0.5), hi = Math.ceil(Math.max(...vals) + 0.5);
+    if (hi - lo < 4) { const c = (hi + lo) / 2; lo = Math.floor(c - 2); hi = Math.ceil(c + 2); }
+    const x = t => L + (W - L - R) * (t - t0) / (t1 - t0), y = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+    let g = "";
+    for (let v = lo; v <= hi; v++) g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="currentColor" stroke-opacity=".08"/>
+      <text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="currentColor" fill-opacity=".55">${v}°</text>`;
+    for (let k = -6; k <= 2; k += 2) g += `<text x="${x(now + k * 3600e3)}" y="${H - 6}" text-anchor="middle" font-size="11" fill="currentColor" fill-opacity=".55">${k === 0 ? "now" : (k > 0 ? "+" : "") + k + "h"}</text>`;
+    const band = tgt ? `<rect x="${L}" y="${y(tgt.band[1])}" width="${W - L - R}" height="${y(tgt.band[0]) - y(tgt.band[1])}" fill="#3de0a5" fill-opacity=".08"/>
+      <line x1="${L}" x2="${W - R}" y1="${y(tgt.target)}" y2="${y(tgt.target)}" stroke="#3de0a5" stroke-opacity=".5" stroke-dasharray="2 4"/>` : "";
+    const line = (p, attrs) => p.length > 1 ? `<polyline points="${p.map(([t, v]) => `${x(t).toFixed(1)},${y(v).toFixed(1)}`).join(" ")}" fill="none" ${attrs}/>` : "";
+    const dots = (p, c) => p.map(([t, v]) => `<circle cx="${x(t).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.6" fill="${c}"/>`).join("");
+    return `<svg class="rc-chart" viewBox="0 0 ${W} ${H}">${g}${band}
+      <line x1="${x(now)}" x2="${x(now)}" y1="${T}" y2="${H - B}" stroke="currentColor" stroke-opacity=".3"/>
+      ${line(act, 'stroke="#e6edf7" stroke-width="2"')}${dots(p120, "#b48cff")}${dots(p60, "#3fa9ff")}
+      ${line(plan, 'stroke="#3de0a5" stroke-width="2" stroke-dasharray="6 4"')}</svg>`;
+  }
+
   /* ---------- schedule editor (modal) ---------- */
   _openSchedule(room, kind = "temp") {
     this._closeSchedule();
@@ -458,6 +601,8 @@ class RoomMapCard extends HTMLElement {
     if (this._modal) { this._modal.remove(); this._modal = null; }
     if (this._onKey) { document.removeEventListener("keydown", this._onKey); this._onKey = null; }
     this._ed = null; this._diag = false;
+    if (this._mTimer) { clearInterval(this._mTimer); this._mTimer = null; }
+    this._mOpen = false;
   }
 
   // Temperature in force at the start of the edited day: last point of the nearest earlier day that has any.
@@ -598,7 +743,7 @@ class RoomMapCard extends HTMLElement {
   }
 }
 // Any render/click handler that throws is caught and reported rather than leaving the card blank.
-["_render", "_click", "_panel", "_edRender", "_diagUpdate"].forEach(m => {
+["_render", "_click", "_panel", "_edRender", "_diagUpdate", "_modelUpdate"].forEach(m => {
   const f = RoomMapCard.prototype[m];
   if (typeof f === "function") RoomMapCard.prototype[m] = function (...a) { try { return f.apply(this, a); } catch (e) { this._fail(m, e); } };
 });

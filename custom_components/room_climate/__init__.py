@@ -4,7 +4,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import pathlib
+import time
 from datetime import datetime, timedelta
 
 import voluptuous as vol
@@ -15,12 +17,14 @@ from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import Context, Event, HomeAssistant
 from homeassistant.helpers import discovery
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
+from homeassistant.helpers.event import (async_call_later, async_track_state_change_event, async_track_time_change,
+                                         async_track_time_interval)
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from . import core, datalog
+from . import core, datalog, fit, mpc
+from . import model as hm
 
 DOMAIN = "room_climate"
 _LOGGER = logging.getLogger(__name__)
@@ -35,6 +39,9 @@ ROOM_CLIMATE, THERMOSTAT = "room_climate", "thermostat"
 SIGNAL_CONTROL = f"{DOMAIN}_control"  # dispatched (unit id) when a unit's control changes
 OURS_GRACE_S = 30  # unit state changes this soon after we sent it something are its echo of our command
 BAD_STATES = ("unknown", "unavailable")
+MODEL_FILE = "room_climate_model.json"  # the fitted thermal model (model.py), refitted nightly
+FIT_HISTORY_FILE = "room_climate_model_fits.jsonl"  # one line per fit: when, data span, how well it predicts
+FIT_DAYS = 14  # fit on this many days of the minute log
 
 
 def _room_from_dict(d: dict) -> core.Room:
@@ -74,6 +81,11 @@ class Manager:
         self._audit_seen: dict[str, tuple] = {}
         self._logged_minute = None
         self._unsub = []
+        # Model-based controller in "would do" mode, and the nightly model fit (see mpc.py, fit.py).
+        self.shadow = mpc.ShadowPlanner()
+        self._shadow_busy = False
+        self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
+        self.fit_history: list = []
 
     async def async_load(self):
         loaded = await self.store.async_load()
@@ -85,6 +97,75 @@ class Manager:
         for ud in loaded.get("units", []):
             ud.setdefault("control", THERMOSTAT)
         self.data = loaded
+        await self._load_model()
+
+    async def _load_model(self):
+        def read():
+            p = pathlib.Path(self.hass.config.path(MODEL_FILE))
+            m = hm.HouseModel.from_dict(json.loads(p.read_text())) if p.exists() else None
+            h = pathlib.Path(self.hass.config.path(FIT_HISTORY_FILE))
+            hist = [json.loads(x) for x in h.read_text().splitlines()[-60:] if x.strip()] if h.exists() else []
+            return m, hist
+        try:
+            m, self.fit_history = await self.hass.async_add_executor_job(read)
+        except (OSError, ValueError) as e:
+            _LOGGER.warning("couldn't load the thermal model: %s", e)
+            return
+        if m is not None:
+            self.shadow.set_model(m)
+
+    def model_age_h(self):
+        m = self.shadow.model
+        try:
+            fitted = datetime.fromisoformat(m.meta["fitted"]) if m is not None else None
+        except (KeyError, TypeError, ValueError):
+            fitted = None
+        if fitted is None:
+            return None
+        if fitted.tzinfo is None:
+            fitted = fitted.replace(tzinfo=dt_util.now().tzinfo)
+        return (dt_util.now() - fitted).total_seconds() / 3600
+
+    async def async_fit(self, _now=None):
+        """Refit the thermal model on the last FIT_DAYS of the minute log (in an executor job), save it, use it."""
+        if self.fit_state["running"]:
+            return
+        self.fit_state.update(running=True, error=None, started=dt_util.now().isoformat())
+        rooms = [_room_from_dict(r) for r in self.data["rooms"]]
+        units = [_unit_from_dict(ud) for ud in self.data["units"]]
+        layout = fit.layout_for(rooms, units)
+        since = (dt_util.now() - timedelta(days=FIT_DAYS)).strftime("%Y-%m-%d")
+        logdir = self.hass.config.path("room_climate_data")
+        model_path, hist_path = self.hass.config.path(MODEL_FILE), self.hass.config.path(FIT_HISTORY_FILE)
+        t0 = time.monotonic()
+
+        def work():
+            rows = list(datalog.read_rows(logdir, since)) if os.path.isdir(logdir) else []
+            if len(rows) < 600:
+                raise ValueError(f"only {len(rows)} minutes of log so far (need 600)")
+            m, rep = fit.fit(rows, layout)
+            tmp = model_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(m.to_dict(), f, indent=1)
+            os.replace(tmp, model_path)
+            entry = {k: m.meta.get(k) for k in ("fitted", "usable", "rows", "from", "to")}
+            entry["holdout"] = rep.get("holdout", {})
+            entry["skipped"] = {k: v["skipped"] for k, v in rep.items() if isinstance(v, dict) and "skipped" in v}
+            with open(hist_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+            return m, entry
+
+        try:
+            m, entry = await self.hass.async_add_executor_job(work)
+            self.shadow.set_model(m)
+            self.fit_history = (self.fit_history + [entry])[-60:]
+            _LOGGER.info("thermal model refitted on %s minutes: usable=%s", entry["rows"], entry["usable"])
+        except Exception as e:  # a failed fit keeps the old model; the debug page shows why
+            self.fit_state["error"] = f"{type(e).__name__}: {e}"
+            _LOGGER.warning("thermal model fit failed: %s", self.fit_state["error"])
+        finally:
+            self.fit_state.update(running=False, finished=dt_util.now().isoformat(),
+                                  seconds=round(time.monotonic() - t0, 1))
 
     def control(self, unit_id: str) -> str:
         ud = next((u for u in self.data["units"] if u["id"] == unit_id), {})
@@ -234,7 +315,65 @@ class Manager:
                     if r.unit == u.id and self.hist.get(r.id):
                         self.hist[r.id] = self.hist[r.id][-1:]
         self._publish(now, rooms)
+        await self._shadow_tick(now, rooms, units, readings, settings)
         await self._log(now, rooms, units, predicted, info)
+
+    async def _shadow_tick(self, now, rooms, units, readings, settings):
+        """Feed the model-based controller ("would do") and its accuracy tracking; plan in an executor job."""
+        temps = {rid: v[0] for rid, v in readings.items()}
+        disp = self.hass.config.units.temperature_unit
+        actual = {}
+        for u in units:
+            cur = self.hass.states.get(u.entity)
+            if cur is None or cur.state in BAD_STATES:
+                continue
+            sp = cur.attributes.get("temperature")
+            actual[u.id] = {"mode": cur.state, "running": cur.attributes.get("hvac_action") in ("heating", "cooling"),
+                            "setpoint": None if sp is None else TemperatureConverter.convert(float(sp), disp, F)}
+        outdoor = self._outdoor(settings)
+        ent = self._outdoor_entity(settings)
+        wx = self.hass.states.get(ent) if ent else None
+        cloud = wx.attributes.get("cloud_coverage") if wx is not None else None
+        lat, lon = self.hass.config.latitude, self.hass.config.longitude
+
+        def sun_at(t):
+            return hm.solar_index(hm.sun_elevation(t, lat, lon), cloud)
+
+        self.shadow.observe(now, temps, actual, outdoor, sun_at(now))
+        if self.shadow.due(now) and not self._shadow_busy:
+            unit_entity = {u.id: u.entity for u in units}
+            ignore = {r.id for r in rooms if r.sensor and r.sensor == unit_entity.get(r.unit)}
+            self._shadow_busy = True
+            try:
+                await self.hass.async_add_executor_job(self.shadow.run, now, rooms, units, temps, actual, outdoor,
+                                                       sun_at, settings, ignore)
+            finally:
+                self._shadow_busy = False
+
+    def model_debug(self) -> dict:
+        """Everything the card's Model page shows."""
+        now = dt_util.now()
+        s = core.settings_from(self.data.get("settings"))
+        rooms = [_room_from_dict(r) for r in self.data["rooms"]]
+        targets = {}
+        for r in rooms:
+            if not r.sensor:
+                continue
+            t = core.target_temp(r, now)
+            targets[r.id] = {"name": r.name, "unit": r.unit, "target": t, "band": [t - s.band_below, t + s.band_above],
+                             "prio": core.room_priority(r, now)}
+        today = {}
+        for ud in self.data["units"]:
+            cmd, cur = self.last.get(ud["id"]), self.hass.states.get(ud["entity"])
+            today[ud["id"]] = {"name": ud.get("name") or ud["id"], "control": self.control(ud["id"]),
+                               "mode": cmd.mode if cmd else None, "setpoint": cmd.setpoint if cmd else None,
+                               "actual_mode": cur.state if cur is not None else None,
+                               "actual_setpoint": cur.attributes.get("temperature") if cur is not None else None}
+        m = self.shadow.model
+        return {"now": now.isoformat(), "model": None if m is None else m.to_dict(), "age_h": self.model_age_h(),
+                "fit": self.fit_state, "fits": self.fit_history[-30:], "shadow": self.shadow.debug(now),
+                "targets": targets, "today": today, "house_today": self.house.mode,
+                "comfort": {k: getattr(s, k) for k in ("band_below", "band_above", "warm_weight", "aim_offset")}}
 
     async def _log(self, now, rooms, units, predicted, info):
         """One row per minute to the long-term log in /config/room_climate_data (see datalog.py)."""
@@ -282,6 +421,7 @@ class Manager:
         for st in self.hass.states.async_all("sensor"):
             if st.entity_id.startswith(tuple(prefixes)) and st.state not in BAD_STATES:
                 row["extra"][st.entity_id] = num(st.state) if num(st.state) is not None else st.state
+        row["mpc"] = self.shadow.log_fields()  # what the model-based controller would do
         path = self.hass.config.path("room_climate_data")
         try:
             await self.hass.async_add_executor_job(datalog.append, path, row, now)
@@ -525,7 +665,18 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         await mgr.async_tick()
         connection.send_result(msg["id"], mgr.snapshot())
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client):
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/model"})
+    @websocket_api.async_response
+    async def ws_model(hass, connection, msg):
+        connection.send_result(msg["id"], mgr.model_debug())
+
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/fit_model"})
+    @websocket_api.async_response
+    async def ws_fit_model(hass, connection, msg):
+        hass.async_create_task(mgr.async_fit())
+        connection.send_result(msg["id"], {"started": True})
+
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_fit_model):
         websocket_api.async_register_command(hass, fn)
 
     unit_entities = [u["entity"] for u in mgr.data["units"]]
@@ -542,4 +693,9 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         # Rate limiting lives in core (min run/off times), so reacting to every update is safe.
         async_track_state_change_event(hass, sensors, _on_sensor)
     async_track_time_interval(hass, mgr.async_tick, INTERVAL)
+    # Refit the thermal model nightly, and soon after startup if there is none or it's more than a day old.
+    async_track_time_change(hass, mgr.async_fit, hour=3, minute=40, second=0)
+    age = mgr.model_age_h()
+    if age is None or age > 26:
+        async_call_later(hass, 180, mgr.async_fit)
     return True

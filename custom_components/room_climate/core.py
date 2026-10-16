@@ -9,6 +9,7 @@ instead of stopping and starting.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
@@ -66,8 +67,12 @@ class Unit:
 @dataclass
 class Settings:
     # Comfort band around each room's target: inside it a room is "fine" and asks for nothing.
-    band_below: float = 1.0
-    band_above: float = 1.5
+    # Comfort leans cool: the household would rather add a sweater than be too warm. So the band sits mostly below the
+    # target, a miss above it costs `warm_weight` times a miss below, and heating aims `aim_offset` under the target.
+    band_below: float = 1.5
+    band_above: float = 1.0
+    warm_weight: float = 2.0
+    aim_offset: float = 0.5
     # House-wide hard limits: a room past these outweighs any priority.
     floor: float = 63.0  # below every schedule's night target, so a target at 65 doesn't sit on the hard limit
     ceiling: float = 72.0
@@ -105,6 +110,12 @@ class Settings:
     min_run_s: int = 300  # legacy
     min_off_s: int = 300  # legacy
     mode_switch_s: int = 900  # legacy
+
+
+def round_cool(x: float) -> float:
+    """Nearest whole degree, ties going down: with setpoints aimed half a degree under whole-degree targets, a tie
+    rounding to even would land cool one degree and warm the next (66.5 -> 66 but 67.5 -> 68)."""
+    return float(math.floor(x + 0.5 - 1e-9))
 
 
 def settings_from(d) -> Settings:
@@ -259,7 +270,7 @@ def room_costs(room: Room, current: float, predicted: Optional[float], now: date
     free_heat = free and outdoor >= current + settings.free_delta
     cold = (0.0 if free_heat else w * max(0.0, (t - settings.band_below) - lo) ** 2) \
         + settings.hard_weight * max(0.0, settings.floor - lo) ** 2
-    hot = (0.0 if free_cool else w * max(0.0, hi - (t + settings.band_above)) ** 2) \
+    hot = (0.0 if free_cool else settings.warm_weight * w * max(0.0, hi - (t + settings.band_above)) ** 2) \
         + settings.hard_weight * max(0.0, hi - settings.ceiling) ** 2
     return cold, hot
 
@@ -324,7 +335,10 @@ def unit_command(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float,
         # it is rather than jumping to a limit; stabilize keeps our last setpoint if we have one.
         return Command(mode, None, "no fresh sensors; holding setpoint")
     err, avg = res
-    target = avg - err
+    # Aim a little cool while heating (less heat). Not while cooling: aiming under the target there parks rooms near
+    # the cool edge of the band, and the evening cool-down then tips the house into heat. The band's tighter warm
+    # edge and the doubled cost of running warm already make cooling start sooner.
+    target = avg - err - (settings.aim_offset if mode == "heat" else 0.0)
     offset = 0.0
     if unit_temp is not None:  # make the unit's own thermostat chase the *room* temperature
         offset = max(-settings.max_offset, min(settings.max_offset, unit_temp - avg))
@@ -332,7 +346,7 @@ def unit_command(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float,
     needs = avg < target if mode == "heat" else avg > target
     # Whole degrees in the reason: it is logged whenever it changes, and tenths tick over through every ramp.
     why = (("heating" if mode == "heat" else "cooling") + f" toward {target:.0f}°") if needs else "at target; idling"
-    return Command(mode, float(round(raw)), why, needs, raw)
+    return Command(mode, round_cool(raw), why, needs, raw)
 
 
 def stabilize(cmd: Command, prev: Optional[tuple[Command, datetime]], now: datetime,
@@ -393,6 +407,7 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
     ours = {u.id for u in units} - set(manual or {})
     voters = ours or {u.id for u in units}
     unit_entity = {u.id: u.entity for u in units}
+    zones: dict[str, list] = {}  # unit id -> [cold, hot] of its voting rooms
     for r in rooms:
         if r.unit is None or r.unit not in voters:
             continue  # monitor-only rooms (and rooms of thermostat-run units) don't steer the house
@@ -410,7 +425,18 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
             # 55-78 F in an hour as its unit went heat -> cool). It would drive the house into a heat/cool limit cycle,
             # so it follows the house mode and just holds its target until it has a sensor of its own.
             continue
-        cold, hot = cold + c, hot + h
+        zone = zones.setdefault(r.unit, [0.0, 0.0])
+        zone[0] += c
+        zone[1] += h
+    # A unit can't heat one of its rooms and cool another, so a zone's rooms vote together, by their net demand. Rooms
+    # sharing the air handler at different targets (a kitchen set to 65 at night among rooms at 67) would otherwise
+    # vote for opposite modes in turn: heating for the zone overheats the kitchen -> cool -> the zone is cold -> heat.
+    # Netted, the zone asks for what most of it (by priority) needs, and the kitchen's miss is a trade-off, not a flip.
+    for zc, zh in zones.values():
+        if zc > zh:
+            cold += zc - zh
+        else:
+            hot += zh - zc
     new_house, reason = choose_mode(cold, hot, house, now, settings)
     if forced and new_house.mode != forced:
         new_house = HouseState(forced, now if house.mode != forced else house.since)

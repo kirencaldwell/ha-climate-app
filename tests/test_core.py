@@ -1,4 +1,4 @@
-import os, sys
+import dataclasses, os, sys
 from datetime import datetime, timedelta
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "custom_components", "room_climate"))  # appended: its select.py must not shadow the stdlib select module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sim"))
@@ -7,6 +7,8 @@ from core import Room, ScheduleEntry, Unit, UnitState, Settings
 from house import SimHouse
 
 MON = datetime(2026, 10, 5, 12, 0)  # a Monday
+# Symmetric comfort, no cool aim: for tests about other mechanics. The cool-leaning defaults have their own tests.
+NEUTRAL = Settings(band_below=1.0, band_above=1.5, warm_weight=1.0, aim_offset=0.0)
 
 
 def sched_room(**kw):
@@ -65,7 +67,7 @@ def test_sim_holds_68_in_cold_weather_with_biased_unit_sensor():
     settled = temps[6 * 60:]
     for rid in h.sim:
         vals = [t[rid] for t in settled]
-        assert 66.5 <= min(vals) and max(vals) <= 69.5, (rid, min(vals), max(vals))
+        assert 66.0 <= min(vals) and max(vals) <= 69.0, (rid, min(vals), max(vals))  # band 66.5-69, aimed at 67.5
 
 
 def test_sim_follows_overnight_setback():
@@ -128,7 +130,7 @@ def _house(bed=67.0, down=67.0, bed_pred=None, down_pred=None, house=None, at=MO
     units = [Unit("ah", "c1"), Unit("ms", "c2")]
     readings = {"bed": (bed, at), "down": (down, at)}
     pred = {"bed": bed_pred, "down": down_pred}
-    return core.control_step(units, rooms, readings, pred, {}, states or {}, house or core.HouseState(), at, busy=busy)
+    return core.control_step(units, rooms, readings, pred, {}, states or {}, house or core.HouseState(), at, NEUTRAL, busy=busy)
 
 
 def _started(rooms, units, readings, pred=None, manual=None, busy=None):
@@ -137,7 +139,7 @@ def _started(rooms, units, readings, pred=None, manual=None, busy=None):
     for minutes in (0, 11):
         now = MON + timedelta(minutes=minutes)
         rd = {k: (v[0], now) for k, v in readings.items()}
-        cmds, house, info = core.control_step(units, rooms, rd, pred or {}, {}, {}, house, now, manual=manual, busy=busy)
+        cmds, house, info = core.control_step(units, rooms, rd, pred or {}, {}, {}, house, now, NEUTRAL, manual=manual, busy=busy)
     return cmds, house, info
 
 
@@ -148,15 +150,15 @@ def _house_started(bed=67.0, down=67.0, bed_pred=None, down_pred=None, busy=None
 
 
 def test_costs_zero_inside_band_and_floor_beats_priority():
-    s = core.Settings()
+    s = NEUTRAL
     hi_pri = Room("a", "A", "u", priority=5, default_temp=67)
     lo_pri = Room("b", "B", "u", priority=1, default_temp=67)
-    assert core.room_costs(hi_pri, 66.2, None, MON) == (0.0, 0.0)  # inside 66-68.5
-    assert core.room_costs(hi_pri, 68.4, None, MON) == (0.0, 0.0)
-    slightly_cold = core.room_costs(hi_pri, 65.5, None, MON)[0]
-    freezing = core.room_costs(lo_pri, 60.0, None, MON)[0]
+    assert core.room_costs(hi_pri, 66.2, None, MON, s) == (0.0, 0.0)  # inside 66-68.5
+    assert core.room_costs(hi_pri, 68.4, None, MON, s) == (0.0, 0.0)
+    slightly_cold = core.room_costs(hi_pri, 65.5, None, MON, s)[0]
+    freezing = core.room_costs(lo_pri, 60.0, None, MON, s)[0]
     assert freezing > 10 * slightly_cold  # below the 65 floor wins regardless of priority
-    assert core.room_costs(lo_pri, 73.0, None, MON)[1] > core.room_costs(hi_pri, 69.5, None, MON)[1]
+    assert core.room_costs(lo_pri, 73.0, None, MON, s)[1] > core.room_costs(hi_pri, 69.5, None, MON, s)[1]
 
 
 def test_prediction_counts_before_it_happens():
@@ -374,7 +376,7 @@ def test_free_cooling_is_off_by_default():
 
 
 def test_free_cooling_when_enabled_lets_a_slightly_warm_room_coast():
-    s = Settings(free_delta=5.0)
+    s = dataclasses.replace(NEUTRAL, free_delta=5.0)
     at = MON.replace(hour=0, minute=35)
     r = Room("bed", "Primary", "ms", priority=5, schedule=[ScheduleEntry(list(range(7)), "21:30", 65)])
     assert core.room_costs(r, 67.1, None, at, s, outdoor=55.0)[1] == 0
@@ -383,7 +385,7 @@ def test_free_cooling_when_enabled_lets_a_slightly_warm_room_coast():
 
 
 def test_free_heating_when_enabled_lets_a_slightly_cool_room_coast():
-    s = Settings(free_delta=5.0)
+    s = dataclasses.replace(NEUTRAL, free_delta=5.0)
     r = Room("r", "R", "u", priority=5, default_temp=70)
     assert core.room_costs(r, 68.5, None, MON, s, outdoor=88.0)[0] == 0
     assert core.room_costs(r, 68.5, None, MON, s, outdoor=70.0)[0] > 0
@@ -566,12 +568,12 @@ def test_room_reading_its_own_units_sensor_follows_the_house_instead_of_voting()
              Room("b3", "Bedroom 3", "ms", sensor="climate.ms", default_temp=67)]
     # Bedroom 3's unit sensor reads 77 right after heating: it must not flip a house that the kitchen needs heated.
     house = core.HouseState("heat", MON - timedelta(hours=2))
-    cmds, h, info = core.control_step(units, rooms, {"k": (64.0, MON), "b3": (77.0, MON)}, {}, {"ms": 77.0}, {}, house, MON)
+    cmds, h, info = core.control_step(units, rooms, {"k": (64.0, MON), "b3": (77.0, MON)}, {}, {"ms": 77.0}, {}, house, MON, NEUTRAL)
     assert h.mode == "heat" and info["hot"] == 0 and info["rooms"]["b3"][1] > 0  # its demand is shown, not counted
     assert cmds["ms"].mode == "heat" and cmds["ms"].setpoint == 67  # it still holds its own target
     # ...and its swing to 55 in cool doesn't drag the house to heat
     house = core.HouseState("cool", MON - timedelta(hours=2))
-    _, h, info = core.control_step(units, rooms, {"k": (68.0, MON), "b3": (55.0, MON)}, {}, {"ms": 55.0}, {}, house, MON)
+    _, h, info = core.control_step(units, rooms, {"k": (68.0, MON), "b3": (55.0, MON)}, {}, {"ms": 55.0}, {}, house, MON, NEUTRAL)
     assert h.mode == "cool" and info["cold"] == 0
 
 
@@ -580,3 +582,51 @@ def test_stored_setpoint_matches_what_the_units_read_back():
     # seen on the units: 64 -> 64.4, 65 -> 65.3, 67 -> 67.1, 68 -> 68.0, 61 -> 60.8, 73 -> 73.4
     for want, got in ((64, 64.4), (65, 65.3), (67, 67.1), (68, 68.0), (61, 60.8), (73, 73.4)):
         assert readback_f(want) == got, (want, readback_f(want))
+
+
+def test_rooms_sharing_a_unit_vote_with_their_net_demand():
+    # The kitchen at 65 at night shares the air handler with a living room and bedroom at 67. Heating for them pushes
+    # the kitchen over its band; that alone must not flip the house to cool.
+    units = [Unit("ah", "climate.ah")]
+    rooms = [Room("k", "Kitchen", "ah", sensor="s.k", priority=2, default_temp=65),
+             Room("lr", "Living", "ah", sensor="s.lr", priority=1, default_temp=67),
+             Room("b1", "Bedroom 1", "ah", sensor="s.b1", priority=1, default_temp=67)]
+    heating = core.HouseState("heat", MON - timedelta(hours=2))
+    readings = {"k": (67.0, MON), "lr": (65.3, MON), "b1": (65.2, MON)}  # kitchen 0.5 over (P2); the others 0.7-0.8 under
+    _, h, info = core.control_step(units, rooms, readings, {}, {}, {}, heating, MON, NEUTRAL)
+    assert h.mode == "heat" and h.pending is None and info["hot"] == 0
+    # Only when the zone as a whole is too warm does it ask for cooling.
+    readings = {"k": (68.5, MON), "lr": (69.5, MON), "b1": (69.6, MON)}
+    _, h, info = core.control_step(units, rooms, readings, {}, {}, {}, heating, MON, NEUTRAL)
+    assert info["hot"] > 0 and info["cold"] == 0 and h.pending == "cool"
+
+
+def test_separate_zones_still_vote_separately():
+    # A hot bedroom on its own minisplit and a cold first floor are a real conflict: both count.
+    units = [Unit("ah", "climate.ah"), Unit("ms", "climate.ms")]
+    rooms = [Room("k", "Kitchen", "ah", sensor="s.k", priority=1, default_temp=67),
+             Room("bed", "Bedroom", "ms", sensor="s.bed", priority=5, default_temp=65)]
+    _, _, info = core.control_step(units, rooms, {"k": (64.0, MON), "bed": (69.0, MON)}, {}, {}, {},
+                                   core.HouseState("heat", MON - timedelta(hours=2)), MON)
+    assert info["cold"] > 0 and info["hot"] > 0
+
+
+# --- comfort leans cool (the household prefers a sweater to being too warm) ---
+def test_comfort_band_and_costs_lean_cool():
+    s = Settings()
+    r = Room("r", "R", "u", priority=3, default_temp=67)
+    assert core.room_costs(r, 65.6, None, MON, s) == (0.0, 0.0)  # 1.4 under: still comfortable
+    assert core.room_costs(r, 68.4, None, MON, s)[1] > 0  # 1.4 over: too warm
+    below = core.room_costs(r, 65.5 - 0.5, None, MON, s)[0]  # 0.5 past the cool edge
+    above = core.room_costs(r, 68.0 + 0.5, None, MON, s)[1]  # 0.5 past the warm edge
+    assert abs(above - 2 * below) < 1e-9
+
+
+def test_heating_aims_half_a_degree_cool_and_ties_round_down():
+    u = Unit("u", "climate.u")
+    for target, want in ((67, 66.0), (68, 67.0)):
+        r = Room("r", "R", "u", sensor="s.r", default_temp=target)
+        heat = core.unit_command(u, [r], {"r": (target, MON)}, {}, "heat", None, UnitState("heat"), MON, Settings())
+        cool = core.unit_command(u, [r], {"r": (target, MON)}, {}, "cool", None, UnitState("cool"), MON, Settings())
+        assert heat.setpoint == want and cool.setpoint == target, (target, heat.setpoint, cool.setpoint)
+    assert core.round_cool(66.5) == 66 and core.round_cool(66.51) == 67 and core.round_cool(67.49) == 67

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -72,6 +73,20 @@ def solar_index(elevation_deg, cloud_pct=None) -> float:
     return clear * (1.0 - 0.75 * cloud)
 
 
+def sun_elevation(t: datetime, lat: float, lon: float) -> float:
+    """Sun elevation in degrees at time `t` (timezone-aware; naive = UTC) for latitude/longitude, within ~1 degree."""
+    u = t.astimezone(timezone.utc) if t.tzinfo else t
+    doy = u.timetuple().tm_yday
+    decl = math.radians(23.44) * math.sin(2 * math.pi * (284 + doy) / 365)
+    b = 2 * math.pi * (doy - 81) / 364
+    eot_min = 9.87 * math.sin(2 * b) - 7.53 * math.cos(b) - 1.5 * math.sin(b)  # equation of time
+    solar_hour = u.hour + u.minute / 60 + lon / 15 + eot_min / 60
+    ha = math.radians(15 * (solar_hour - 12))
+    la = math.radians(lat)
+    s = math.sin(la) * math.sin(decl) + math.cos(la) * math.cos(decl) * math.cos(ha)
+    return math.degrees(math.asin(max(-1.0, min(1.0, s))))
+
+
 def unit_reading(m: HouseModel, unit_id: str, temps: dict):
     u = m.units[unit_id]
     vals = [temps[r] for r in u.sensor_rooms if temps.get(r) is not None]
@@ -116,12 +131,14 @@ def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict) -
     return out
 
 
-def step(m: HouseModel, temps: dict, outdoor, sun: float, mode: str, setpoints: dict, running: dict, dt_h: float):
+def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict, running: dict, dt_h: float):
     """Advance one step: (new temps, new running flags, outputs used). Units decide output from their reading at the
-    start of the step (as a real inverter does, with a little lag)."""
+    start of the step (as a real inverter does, with a little lag). `mode` is one mode for every unit, or a dict of
+    unit id -> mode (what the units are really set to, which may differ)."""
     outputs, run2 = {}, {}
     for uid, u in m.units.items():
-        y, run2[uid] = unit_output(u, mode, setpoints.get(uid), unit_reading(m, uid, temps), running.get(uid, False))
+        md = mode.get(uid, "off") if isinstance(mode, dict) else mode
+        y, run2[uid] = unit_output(u, md, setpoints.get(uid), unit_reading(m, uid, temps), running.get(uid, False))
         outputs[uid] = y
     d = derivative(m, temps, outdoor, sun, outputs)
     new = dict(temps)
@@ -130,7 +147,7 @@ def step(m: HouseModel, temps: dict, outdoor, sun: float, mode: str, setpoints: 
     return new, run2, outputs
 
 
-def rollout(m: HouseModel, temps: dict, mode: str, setpoints: dict, running: dict, outdoor_seq, sun_seq,
+def rollout(m: HouseModel, temps: dict, mode, setpoints: dict, running: dict, outdoor_seq, sun_seq,
             dt_h: float, substeps: int = 1):
     """Simulate len(outdoor_seq) steps of dt_h with setpoints held. Returns ([temps after each step], [outputs per step],
     final running flags)."""

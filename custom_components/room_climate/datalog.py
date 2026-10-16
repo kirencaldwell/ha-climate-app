@@ -38,9 +38,10 @@ def _gzip(path: str) -> None:
     os.remove(path)
 
 
-def read_rows(directory: str):
-    """Every logged row, oldest first (plain and gzipped days)."""
-    names = sorted(n for n in os.listdir(directory) if n.endswith((".jsonl", ".jsonl.gz")))
+def read_rows(directory: str, since: str = None):
+    """Every logged row, oldest first (plain and gzipped days); `since` = "YYYY-MM-DD" skips earlier days."""
+    names = sorted(n for n in os.listdir(directory)
+                   if n.endswith((".jsonl", ".jsonl.gz")) and (since is None or n[:10] >= since))
     for name in names:
         path = os.path.join(directory, name)
         opener = gzip.open if name.endswith(".gz") else open
