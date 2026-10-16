@@ -483,14 +483,15 @@ class RoomMapCard extends HTMLElement {
       <button data-mx="fit" ${fitS.running ? "disabled" : ""}>Refit now</button></div>`;
     // 2. would do vs today
     const dec = sh.decision || {};
-    const md = (mode, sp) => mode == null ? "—" : mode === "off" ? "off" : `${mode} ${sp == null ? "" : Math.round(sp) + "°"}`;
+    // A controller "off" is its idle state (nothing to change; nothing is sent), not the unit switched off.
+    const md = (mode, sp, ctl) => mode == null ? "—" : mode === "off" ? (ctl ? "no change" : "off") : `${mode} ${sp == null ? "" : Math.round(sp) + "°"}`;
     const unitRows = Object.entries(d.today || {}).map(([u, t]) => `<tr><td>${t.name.replace(/ (air handler|minisplit)$/i, "")}</td>
-        <td><b>${md((dec[u] || {}).mode, (dec[u] || {}).setpoint)}</b></td><td>${md(t.mode, t.setpoint)}${t.control === "room_climate" ? "" : " <small>(thermostat in control)</small>"}</td>
+        <td><b>${md((dec[u] || {}).mode, (dec[u] || {}).setpoint, true)}</b></td><td>${md(t.mode, t.setpoint, true)}${t.control === "room_climate" ? "" : " <small>(thermostat in control)</small>"}</td>
         <td>${md(t.actual_mode, t.actual_setpoint)}</td></tr>`).join("");
     const costs = plan ? Object.entries(plan.by_mode).map(([k, v]) => `${k} ${(+v.cost).toFixed(2)}`).join(" · ") : "";
     const would = `<div class="rc-sect"><h4>Would do vs today</h4>
-      ${plan ? `<p class="rc-sub" style="margin:4px 0">Model-based: <b>${sh.house}</b>${sh.pending ? ` (confirming ${sh.pending})` : ""} · plan cost ${costs} · ${when(plan.at)}, ${plan.ms} ms.
-        Today's controller: <b>${d.house_today}</b>.</p>` : `<p class="rc-sub">No plan yet${m ? " (first one within 5 minutes)" : ": needs a model"}.</p>`}
+      ${plan ? `<p class="rc-sub" style="margin:4px 0">Model-based: <b>${sh.house === "off" ? "no change needed" : sh.house}</b>${sh.pending ? ` (confirming ${sh.pending})` : ""} · plan cost ${costs} · ${when(plan.at)}, ${plan.ms} ms.
+        Today's controller: <b>${d.house_today === "off" ? "no change needed" : d.house_today}</b>.</p>` : `<p class="rc-sub">No plan yet${m ? " (first one within 5 minutes)" : ": needs a model"}.</p>`}
       <table class="rc-tbl"><tr><th>Unit</th><th>Model would</th><th>Today's controller</th><th>Unit now</th></tr>${unitRows}</table>
       <p class="rc-sub" style="margin:6px 0 0">Comfort leans cool: band ${f1(d.comfort.band_below)}° below to ${f1(d.comfort.band_above)}° above target, running warm costs ${d.comfort.warm_weight}×, heating aims ${d.comfort.aim_offset}° low.</p></div>`;
     // 3. accuracy
