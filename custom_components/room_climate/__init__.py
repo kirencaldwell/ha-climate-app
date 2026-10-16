@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta
 
 import voluptuous as vol
-from homeassistant.components import websocket_api
+from homeassistant.components import persistent_notification, websocket_api
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.climate import ATTR_HVAC_MODE, DOMAIN as CLIMATE, SERVICE_SET_HVAC_MODE, SERVICE_SET_TEMPERATURE
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
@@ -34,8 +34,10 @@ F, C = UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
 
 CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({vol.Optional("enabled"): bool})}, extra=vol.ALLOW_EXTRA)  # legacy key, ignored
 
-# Who drives a unit. "thermostat": its own mode and setpoint, set by hand (the default). "room_climate": we command it.
-ROOM_CLIMATE, THERMOSTAT = "room_climate", "thermostat"
+# Who drives a unit. "thermostat": its own mode and setpoint, set by hand (the default). "room_climate": today's
+# controller commands it. "model": the model-based controller (mpc.py) does, once the model has proven itself.
+ROOM_CLIMATE, THERMOSTAT, MODEL = "room_climate", "thermostat", "model"
+OURS = (ROOM_CLIMATE, MODEL)
 SIGNAL_CONTROL = f"{DOMAIN}_control"  # dispatched (unit id) when a unit's control changes
 OURS_GRACE_S = 30  # unit state changes this soon after we sent it something are its echo of our command
 BAD_STATES = ("unknown", "unavailable")
@@ -171,10 +173,28 @@ class Manager:
         ud = next((u for u in self.data["units"] if u["id"] == unit_id), {})
         return ud.get("control", THERMOSTAT)
 
+    def model_rooms(self) -> set:
+        """Rooms the model-based controller scores (and so must predict well): modelled, served by a unit, and not
+        reading their own unit's sensor."""
+        m = self.shadow.model
+        if m is None:
+            return set()
+        ent = {u["id"]: u["entity"] for u in self.data["units"]}
+        return {r["id"] for r in self.data["rooms"] if r["id"] in m.rooms and r.get("unit")
+                and r.get("sensor") != ent.get(r.get("unit"))}
+
+    def model_ready(self, strict: bool = True):
+        return self.shadow.readiness(dt_util.now(), self.model_rooms(), strict=strict)
+
     async def async_set_control(self, unit_id: str, control: str, why: str):
+        """Raises ValueError (with the reasons) when asked to hand a unit to a model that isn't ready."""
         ud = next((u for u in self.data["units"] if u["id"] == unit_id), None)
         if ud is None or ud.get("control") == control:
             return
+        if control == MODEL:
+            ok, reasons = self.model_ready(strict=True)
+            if not ok:
+                raise ValueError("the model isn't ready to control units: " + "; ".join(reasons))
         ud["control"] = control
         self.sent.pop(unit_id, None)  # taking over: send our setpoint now, not after the change interval
         _LOGGER.info("%s control -> %s (%s)", unit_id, control, why)
@@ -187,7 +207,7 @@ class Manager:
         remote. Hand it to the thermostat so we don't fight them."""
         ud = next((u for u in self.data["units"] if u["entity"] == event.data["entity_id"]), None)
         old, new = event.data.get("old_state"), event.data.get("new_state")
-        if ud is None or ud.get("control") != ROOM_CLIMATE or old is None or new is None:
+        if ud is None or ud.get("control") not in OURS or old is None or new is None:
             return
         if old.state in BAD_STATES or new.state in BAD_STATES:
             return  # dropping off and reconnecting is not a change of mind
@@ -273,8 +293,23 @@ class Manager:
             h.append((now, val))
             del h[:max(0, next((k for k, (t, _) in enumerate(h) if core.elapsed(now, t) <= settings.history_s), len(h)))]
             predicted[r.id] = core.predict(h, now, settings)
+        # Units under model control go back to today's controller as soon as the model stops being trustworthy.
+        model_units = [u for u in units if self.control(u.id) == MODEL]
+        if model_units:
+            ok, reasons = self.model_ready(strict=False)
+            if not ok:
+                for u in model_units:
+                    await self.async_set_control(u.id, ROOM_CLIMATE, "model not ready: " + reasons[0])
+                persistent_notification.async_create(
+                    self.hass, "The model-based controller handed " + ", ".join(u.id for u in model_units)
+                    + " back to Room Climate: " + "; ".join(reasons[:3]), title="Room Climate",
+                    notification_id=f"{DOMAIN}_model_fallback")
+                return  # async_set_control already ran a tick with the new control
         manual, busy = {}, set()
         for u in units:
+            if self.control(u.id) == MODEL and self.shadow.house.mode in ("heat", "cool"):
+                # The model decides these units, and today's controller follows its mode for the shared compressor.
+                manual[u.id] = self.shadow.house.mode
             cur = self.hass.states.get(u.entity)
             if self.control(u.id) == THERMOSTAT:  # even when unavailable: still not ours to drive
                 manual[u.id] = cur.state if cur is not None else "unavailable"
@@ -305,7 +340,16 @@ class Manager:
                 sent[u.id] = (cmd, now)
             state = states.setdefault(u.id, core.UnitState())
             self.last[u.id] = cmd
-            ours = self.control(u.id) == ROOM_CLIMATE
+            ctl = self.control(u.id)
+            ours = ctl in OURS
+            if ctl == MODEL:
+                d = self.shadow.decision.get(u.id) or {}
+                if d.get("mode") in ("heat", "cool"):
+                    reason = "model: " + (self.shadow.plan.reason if self.shadow.plan else "")
+                    cmd = core.Command(d["mode"], d.get("setpoint"), reason, True, d.get("setpoint"))
+                else:
+                    cmd = core.Command(state.mode, None, "model: no change needed")  # never switches a unit off
+                self.last[u.id] = cmd
             if ours:
                 await self._send(u, state, cmd)
             self._audit(u, cmd, ours, now)
@@ -343,10 +387,12 @@ class Manager:
         if self.shadow.due(now) and not self._shadow_busy:
             unit_entity = {u.id: u.entity for u in units}
             ignore = {r.id for r in rooms if r.sensor and r.sensor == unit_entity.get(r.unit)}
+            fixed = {u.id: (actual[u.id]["mode"], actual[u.id]["setpoint"]) for u in units
+                     if self.control(u.id) == THERMOSTAT and u.id in actual}
             self._shadow_busy = True
             try:
                 await self.hass.async_add_executor_job(self.shadow.run, now, rooms, units, temps, actual, outdoor,
-                                                       sun_at, settings, ignore)
+                                                       sun_at, settings, ignore, fixed)
             finally:
                 self._shadow_busy = False
 
@@ -370,7 +416,9 @@ class Manager:
                                "actual_mode": cur.state if cur is not None else None,
                                "actual_setpoint": cur.attributes.get("temperature") if cur is not None else None}
         m = self.shadow.model
+        ok, reasons = self.model_ready(strict=True)
         return {"now": now.isoformat(), "model": None if m is None else m.to_dict(), "age_h": self.model_age_h(),
+                "ready": {"ok": ok, "why": reasons},
                 "fit": self.fit_state, "fits": self.fit_history[-30:], "shadow": self.shadow.debug(now),
                 "targets": targets, "today": today, "house_today": self.house.mode,
                 "comfort": {k: getattr(s, k) for k in ("band_below", "band_above", "warm_weight", "aim_offset")}}
@@ -450,7 +498,8 @@ class Manager:
         key = (ours, *key)
         if self._audit_seen.get(unit.id) != key:
             self._audit_seen[unit.id] = key
-            _LOGGER.info("%s %s", "CONTROL" if ours else "THERMOSTAT (would)", line)
+            ctl = self.control(unit.id)
+            _LOGGER.info("%s %s", "MODEL" if ctl == MODEL else "CONTROL" if ours else "THERMOSTAT (would)", line)
 
     async def _send(self, unit: core.Unit, state: core.UnitState, cmd: core.Command):
         cur = self.hass.states.get(unit.entity)
@@ -569,6 +618,8 @@ class Manager:
                 "state": cur.state, "setpoint": cur.attributes.get("temperature"),
                 "action": cur.attributes.get("hvac_action"), "temp": self._unit_temp(ud["entity"])}
         out["house"] = self.house_info
+        ok, reasons = self.model_ready(strict=True)
+        out["model_ready"] = {"ok": ok, "why": reasons}
         out["live"] = {}
         for rd in self.data["rooms"]:
             r = _room_from_dict(rd)
@@ -640,14 +691,18 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
 
     @websocket_api.websocket_command({
         "type": f"{DOMAIN}/set_control", vol.Required("unit_id"): str,
-        vol.Required("control"): vol.In([ROOM_CLIMATE, THERMOSTAT]),
+        vol.Required("control"): vol.In([ROOM_CLIMATE, THERMOSTAT, MODEL]),
     })
     @websocket_api.async_response
     async def ws_set_control(hass, connection, msg):
         if not any(u["id"] == msg["unit_id"] for u in mgr.data["units"]):
             connection.send_error(msg["id"], "not_found", "unknown unit")
             return
-        await mgr.async_set_control(msg["unit_id"], msg["control"], "set in the Room Climate card")
+        try:
+            await mgr.async_set_control(msg["unit_id"], msg["control"], "set in the Room Climate card")
+        except ValueError as e:
+            connection.send_error(msg["id"], "not_ready", str(e))
+            return
         connection.send_result(msg["id"], mgr.snapshot())
 
     @websocket_api.websocket_command({"type": f"{DOMAIN}/set_settings", vol.Required("settings"): dict})

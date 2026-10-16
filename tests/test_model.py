@@ -150,6 +150,17 @@ def test_plan_errs_cool_when_it_has_to_miss():
     assert optimizer.band_cost(68.5, 67, 3, s) == 2 * optimizer.band_cost(65.0, 67, 3, s)  # 0.5 past each edge
 
 
+def test_units_on_their_thermostat_are_left_alone_and_set_the_mode():
+    m, rooms, units = two_rooms(coupling=0.2)
+    house = core.HouseState("heat", NIGHT - timedelta(hours=3))
+    ps = optimizer.PlanSettings()
+    n = int(ps.horizon_h * 60 / ps.step_min)
+    p = optimizer.plan(m, rooms, units, {"down": 66.0, "up": 71.0}, NIGHT, house, {"ah": 67, "ms": 67}, {"ms": True},
+                       [50.0] * n, [0.0] * n, NEUTRAL, ps, fixed={"ms": ("cool", 66.0)})
+    assert p.mode == "cool" and set(p.by_mode) == {"cool"}  # follows the thermostat unit's cool
+    assert "ms" not in p.setpoints and "ah" in p.setpoints  # only plans the unit it can command
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

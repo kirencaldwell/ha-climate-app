@@ -66,7 +66,7 @@ const CSS = `
 .rc-tile .big { font-size: 1.35em; font-weight: 700; line-height: 1.3; } .rc-tile.heat .big { color: #ff8a5c; } .rc-tile.cool .big { color: #5db3ff; }
 .rc-tile .big small { font-size: .55em; font-weight: 400; color: var(--secondary-text-color, #9aa7b8); }
 .rc-ctl { display: inline-block; font-size: .68em; font-weight: 600; letter-spacing: .03em; padding: 2px 7px; border-radius: 99px; margin: 4px 0 2px;
-  background: #ffd16622; color: #ffd166; } .rc-ctl.rc { background: #3de0a522; color: #3de0a5; }
+  background: #ffd16622; color: #ffd166; } .rc-ctl.rc { background: #3de0a522; color: #3de0a5; } .rc-ctl.md { background: #b48cff22; color: #b48cff; }
 .rc-tbl { width: 100%; border-collapse: collapse; font-size: .82em; margin-top: 6px; }
 .rc-tbl th, .rc-tbl td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--divider-color, #ffffff1a); white-space: nowrap; }
 .rc-tbl th { color: var(--secondary-text-color, #9aa7b8); font-weight: 500; }
@@ -320,11 +320,17 @@ class RoomMapCard extends HTMLElement {
     const big = !a ? "—" : a.state === "unavailable" ? "N/A" : am === "off" ? "OFF" : `${am === "heat" ? "▲" : am === "cool" ? "▼" : "●"} ${sp ?? "—"}°`;
     const wantTxt = fmt(x.mode, x.mode === "off" ? null : x.setpoint != null ? Math.round(x.setpoint) : null);
     const same = a && a.state !== "unavailable" && x.mode === (am === "auto" ? "heat_cool" : am) && (x.mode === "off" || x.setpoint == null || sp === Math.round(x.setpoint));
-    const ours = x.control === "room_climate";
-    // Who's in control, and a button to hand the unit to the other side.
-    const badge = ours ? `<span class="rc-ctl rc" title="Room Climate sets this unit's mode and temperature">ROOM CLIMATE IN CONTROL</span>`
+    const ctl = x.control || "thermostat", ours = ctl !== "thermostat";
+    const ready = d.model_ready || { ok: false, why: [] };
+    // Who's in control, and buttons to hand the unit over.
+    const badge = ctl === "model" ? `<span class="rc-ctl md" title="The model-based controller sets this unit's mode and temperature">MODEL IN CONTROL</span>`
+      : ours ? `<span class="rc-ctl rc" title="Room Climate sets this unit's mode and temperature">ROOM CLIMATE IN CONTROL</span>`
       : `<span class="rc-ctl" title="The unit runs on its own thermostat mode and setpoint">THERMOSTAT IN CONTROL</span>`;
-    const hand = id => `<button class="rc-hand" data-act="ctl" data-u="${id}" data-c="${ours ? "thermostat" : "room_climate"}">${ours ? "Hand to thermostat" : "Let Room Climate control"}</button>`;
+    const btn = (id, c, label, extra = "") => `<button class="rc-hand" data-act="ctl" data-u="${id}" data-c="${c}" ${extra}>${label}</button>`;
+    const why = ready.ok ? "Hand this unit to the model-based controller" : "Not ready yet: " + (ready.why || []).slice(0, 3).join("; ").replace(/"/g, "'");
+    const hand = id => ctl === "thermostat" ? btn(id, "room_climate", "Let Room Climate control")
+      : ctl === "model" ? btn(id, "thermostat", "Hand to thermostat") + btn(id, "room_climate", "Back to Room Climate")
+      : btn(id, "thermostat", "Hand to thermostat") + btn(id, "model", "Let the model control", `title="${why}" ${ready.ok ? "" : "disabled"}`);
     return { cls, big, actual, wantTxt, same, a, ours, badge, hand, wantLbl: ours ? "Commanding" : "Would set" };
   }
 
@@ -480,6 +486,8 @@ class RoomMapCard extends HTMLElement {
         : "The first fit runs a few minutes after Home Assistant starts, then every night at 3:40."}
         ${fitS.running ? " <b>Fitting now…</b>" : ""}${fitS.error ? ` <span style="color:#ffd166">Last fit: ${fitS.error}</span>` : ""}
         ${sh.error ? ` <span style="color:#ff7a45">Planner error: ${sh.error}</span>` : ""}</p>
+      ${d.ready ? (d.ready.ok ? `<p style="margin:6px 0"><span class="rc-badge ok">Ready to control units</span></p>`
+        : `<p class="rc-sub" style="margin:6px 0"><b>Not ready to control units yet:</b></p><ul class="rc-sub" style="margin:0 0 8px 18px;padding:0">${d.ready.why.slice(0, 6).map(w => `<li>${w}</li>`).join("")}${d.ready.why.length > 6 ? `<li>…and ${d.ready.why.length - 6} more</li>` : ""}</ul>`) : ""}
       <button data-mx="fit" ${fitS.running ? "disabled" : ""}>Refit now</button></div>`;
     // 2. would do vs today
     const dec = sh.decision || {};

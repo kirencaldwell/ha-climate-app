@@ -51,11 +51,10 @@ class ShadowPlanner:
         self.readings: dict = {}  # room -> deque[(t, F)]
 
     def set_model(self, m: hm.HouseModel):
+        """Use a (re)fitted model. Accuracy history is kept: a nightly refit changes the model a little, has passed its
+        own held-out check, and wiping the scores would knock any unit under model control back out every night."""
         self.model = m
-        self.records.clear()  # predictions from the old model would be scored against the new one
-        self.errors.clear()
-        self.points.clear()
-        self.next_plan = self.next_track = None
+        self.next_plan = None
 
     # --- every tick (cheap) ---
     def observe(self, now: datetime, temps: dict, actual: dict = None, outdoor=None, sun: float = 0.0):
@@ -115,18 +114,19 @@ class ShadowPlanner:
 
     # --- heavy part (executor) ---
     def run(self, now: datetime, rooms: list, units: list, temps: dict, actual: dict, outdoor, sun_at,
-            settings: core.Settings, ignore=()):
-        """Plan, if due. actual: unit id -> {"mode", "setpoint" (F), "running"}; sun_at(datetime) -> 0..1."""
+            settings: core.Settings, ignore=(), fixed=None):
+        """Plan, if due. actual: unit id -> {"mode", "setpoint" (F), "running"}; sun_at(datetime) -> 0..1; fixed: unit
+        id -> (mode, setpoint) for units on their own thermostats (planned around, not for)."""
         if self.model is None or not (self.next_plan is None or now >= self.next_plan):
             return
         self.next_plan = now + self.plan_every
         try:
-            self._plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore)
+            self._plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {})
             self.error = None
         except Exception as e:  # never let the model take the integration down; show it instead
             self.error = f"{type(e).__name__}: {e}"
 
-    def _plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore):
+    def _plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed):
         ps = self.ps
         n = int(round(ps.horizon_h * 60 / ps.step_min))
         times = [now + timedelta(minutes=ps.step_min * k) for k in range(n)]
@@ -135,9 +135,12 @@ class ShadowPlanner:
                   for u in units}
         t0 = time.perf_counter()
         p = optimizer.plan(self.model, rooms, units, temps, now, self.house, now_sp, running, [outdoor] * n,
-                           [sun_at(t) for t in times], settings, ps, ignore=set(ignore))
+                           [sun_at(t) for t in times], settings, ps, ignore=set(ignore), fixed=fixed)
         setpoints = p.setpoints
-        if self.house.mode not in ("heat", "cool"):
+        forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)
+        if forced and self.house.mode != forced:
+            self.house = core.HouseState(forced, now)  # a unit on its own thermostat sets the shared mode
+        elif self.house.mode not in ("heat", "cool"):
             # Starting from off: the "demand" is how much better the best mode is than staying off; same start
             # threshold and confirmation time as today's controller.
             want = p.mode if p.mode != "off" else "heat"
@@ -149,6 +152,9 @@ class ShadowPlanner:
             self.house = core.HouseState(p.mode, now)
         self.decision = {}
         for u in units:
+            if u.id in fixed:
+                self.decision[u.id] = {"mode": "thermostat", "setpoint": None}
+                continue
             sp = setpoints.get(u.id)
             if self.house.mode not in ("heat", "cool"):
                 self.decision[u.id] = {"mode": "off", "setpoint": None}
@@ -160,6 +166,32 @@ class ShadowPlanner:
             self.decision[u.id] = {"mode": cmd.mode, "setpoint": cmd.setpoint}
         self.plan, self.plan_at = p, now
         self.plan_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    def readiness(self, now: datetime, rooms_needed, strict: bool = True, min_n: int = 36):
+        """(ready to control units?, reasons it isn't). Strict, for handing a unit over: a usable fit, a fresh plan,
+        and for every room it scores, 60- and 120-min predictions (at least `min_n` each, about 6 h) beating "nothing
+        changes". Not strict, for staying in control: 10% slack and fewer scores, so it doesn't flap."""
+        why = []
+        m = self.model
+        if m is None:
+            return False, ["no model yet"]
+        if not (m.meta or {}).get("usable"):
+            why.append("the latest fit doesn't beat 'nothing changes' on held-out data")
+        if self.error:
+            why.append(f"planner error: {self.error}")
+        if self.plan_at is None or now - self.plan_at > timedelta(minutes=15):
+            why.append("no fresh plan")
+        acc = self.accuracy()
+        slack, need = (1.0, min_n) if strict else (1.1, max(1, min_n // 3))
+        for rid in sorted(rooms_needed):
+            for h in ("60", "120"):
+                v = acc.get(rid, {}).get(h)
+                if not v or v["n"] < need:
+                    why.append(f"{rid}: {0 if not v else v['n']}/{need} {h}-min predictions scored so far")
+                elif v["rmse"] >= v["base_rmse"] * slack:
+                    why.append(f"{rid}: {h}-min predictions off by {v['rmse']}°, no better than 'nothing changes' "
+                               f"({v['base_rmse']}°)")
+        return not why, why
 
     # --- reporting ---
     def log_fields(self) -> dict:

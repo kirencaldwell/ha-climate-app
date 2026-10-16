@@ -117,6 +117,8 @@ card.querySelector('.rc-tile [data-act="ctl"]').click(); await new Promise(r => 
 ok("hand-over button asks for Room Climate control", ctl && ctl.unit_id === "u" && ctl.control === "room_climate");
 ok("tile then says Room Climate is in control", /ROOM CLIMATE IN CONTROL/.test(card.textContent) && /Commanding/.test(card.textContent)
   && card.querySelector('.rc-tile [data-act="ctl"]').dataset.c === "thermostat");
+const modelBtn = card.querySelector('.rc-tile [data-act="ctl"][data-c="model"]');
+ok("model hand-over offered but disabled until the model is ready", modelBtn && modelBtn.disabled && /Not ready/.test(modelBtn.title));
 card.querySelector('[data-act="diag"]').click();
 ok("Diagnostics button opens the modal", !!document.querySelector(".rc-modal") && card._diag === true);
 const dr = document.querySelector('.rc-modal .rc-rm');

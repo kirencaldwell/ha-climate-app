@@ -1,7 +1,7 @@
 """The "would do" planner and live accuracy tracking, run against the simulated house. Run: python3 tests/test_mpc.py"""
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "custom_components", "room_climate"))  # appended: its select.py must not shadow the stdlib select module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sim"))
@@ -82,6 +82,41 @@ def test_ignored_rooms_are_not_scored_and_errors_are_contained():
     shadow.observe(sim.now + timedelta(minutes=1), temps, {}, 50.0, 0.0)
     assert shadow.error  # reported, not raised
     shadow.run(sim.now, [], [], temps, {}, 50.0, lambda t: 0.0, core.Settings())
+
+
+def test_readiness_gate():
+    good, sim = _shadow_run(coupled.the_house(), 12)
+    rooms = {"kitchen", "primary_bedroom", "bedroom_3"}
+    ok, why = good.readiness(sim.now, rooms, strict=False)
+    assert not ok and any("fit" in w for w in why)  # the truth model wasn't fitted, so it isn't marked usable
+    good.model.meta["usable"] = True
+    ok, why = good.readiness(sim.now, rooms)
+    assert ok, why
+    assert not good.readiness(sim.now + timedelta(minutes=20), rooms)[0]  # plan gone stale
+    fresh = mpc.ShadowPlanner()
+    assert fresh.readiness(sim.now, rooms) == (False, ["no model yet"])
+    bad = coupled.the_house()
+    for r in bad.rooms.values():
+        r.heat = {u: 0.0 for u in r.heat}
+        r.cool = {u: 0.0 for u in r.cool}
+        r.loss = 0.0
+    poor, sim2 = _shadow_run(bad, 12)
+    poor.model.meta["usable"] = True
+    ok, why = poor.readiness(sim2.now, rooms)
+    assert not ok and any("no better" in w for w in why), why
+
+
+def test_thermostat_units_are_planned_around():
+    truth, rooms, units, s = _house()
+    start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
+    w = coupled.Weather(start, 2, mean=50, seed=5)
+    sh = mpc.ShadowPlanner()
+    sh.set_model(truth)
+    temps = {r.id: 64.0 for r in rooms}
+    actual = {u.id: {"mode": "heat", "setpoint": 66.0, "running": False} for u in units}
+    sh.run(start, rooms, units, temps, actual, w.outdoor(start), w.sun, s, fixed={"minisplit_2": ("cool", 66.0)})
+    assert sh.error is None, sh.error
+    assert sh.decision["minisplit_2"]["mode"] == "thermostat" and sh.house.mode == "cool"
 
 
 if __name__ == "__main__":

@@ -1,13 +1,15 @@
-"""Per-unit control select: "Room Climate" (we command the unit) or "Thermostat" (its own mode and setpoint)."""
+"""Per-unit control select: "Room Climate" (today's controller commands the unit), "Model" (the model-based controller
+does, once it's ready) or "Thermostat" (its own mode and setpoint)."""
 from __future__ import annotations
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from . import DOMAIN, ROOM_CLIMATE, SIGNAL_CONTROL, THERMOSTAT
+from . import DOMAIN, MODEL, ROOM_CLIMATE, SIGNAL_CONTROL, THERMOSTAT
 
-LABELS = {ROOM_CLIMATE: "Room Climate", THERMOSTAT: "Thermostat"}
+LABELS = {ROOM_CLIMATE: "Room Climate", MODEL: "Model", THERMOSTAT: "Thermostat"}
 
 
 async def async_setup_platform(hass: HomeAssistant, config, async_add_entities, discovery_info=None):
@@ -35,7 +37,10 @@ class ControlSelect(SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         control = next(k for k, v in LABELS.items() if v == option)
-        await self._mgr.async_set_control(self._unit, control, "set from its control select")
+        try:
+            await self._mgr.async_set_control(self._unit, control, "set from its control select")
+        except ValueError as e:
+            raise HomeAssistantError(str(e)) from e
 
     async def async_added_to_hass(self) -> None:
         @callback

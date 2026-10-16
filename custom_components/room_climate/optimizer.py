@@ -67,11 +67,14 @@ def _pad(seq, n):
 
 def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime, house: core.HouseState,
          setpoints_now: dict, running: dict, outdoor_seq, sun_seq, settings: core.Settings = core.Settings(),
-         ps: PlanSettings = PlanSettings(), ignore=()) -> Plan:
+         ps: PlanSettings = PlanSettings(), ignore=(), fixed=None) -> Plan:
     """Best house mode and setpoints for the next `horizon_h`. `temps` are current room temperatures (rooms the model
     knows), `running` which units are actually running now, `outdoor_seq`/`sun_seq` the expected weather per step.
     Rooms in `ignore` are simulated (their unit may regulate on them) but don't count in the cost: e.g. a room that
-    reads its own unit's sensor, which measures the unit's airflow rather than the room."""
+    reads its own unit's sensor, which measures the unit's airflow rather than the room. Units in `fixed`
+    (unit id -> (mode, setpoint)) run on their own thermostats: simulated as they are, never planned, and one in heat or
+    cool sets the mode for the rest (they share a compressor)."""
+    fixed = fixed or {}
     n = max(1, int(round(ps.horizon_h * 60 / ps.step_min)))
     dt_h = ps.step_min / 60
     times = [now + timedelta(minutes=ps.step_min * (k + 1)) for k in range(n)]
@@ -81,7 +84,7 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
     # Targets and weights over the horizon don't depend on the plan: work them out once.
     tw = {r.id: [(core.target_temp(r, t), core.room_priority(r, t)) for t in times] for r in scored}
     end_weight = [2.0 if (times[-1] - t).total_seconds() < ps.terminal_h * 3600 else 1.0 for t in times]
-    known_units = [u for u in units if u.id in m.units]
+    known_units = [u for u in units if u.id in m.units and u.id not in fixed]
 
     b1 = min(n, max(1, int(round(ps.first_block_min / ps.step_min))))
     blocks = [(0, b1)] + ([(b1, n)] if b1 < n else [])
@@ -105,11 +108,13 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
         key = (mode, tuple(sorted(sps.items())))
         if key in cache:
             return cache[key]
-        run = {uid: (running.get(uid, False) and mode == house.mode) for uid in m.units}
+        run = {uid: running.get(uid, False) and (uid in fixed or mode == house.mode) for uid in m.units}
+        modes_by_unit = {uid: (fixed[uid][0] if uid in fixed else mode) for uid in m.units}
         traj, outs, cur = [], [], dict(temps)
         for bi, (a, b) in enumerate(blocks):
-            tr, ou, run = hm.rollout(m, cur, mode, {uid: v[bi] for uid, v in sps.items()}, run, outdoor[a:b], sun[a:b],
-                                     dt_h, ps.substeps)
+            sp_b = {uid: v[bi] for uid, v in sps.items()}
+            sp_b.update({uid: f[1] for uid, f in fixed.items()})
+            tr, ou, run = hm.rollout(m, cur, modes_by_unit, sp_b, run, outdoor[a:b], sun[a:b], dt_h, ps.substeps)
             traj += tr
             outs += ou
             cur = tr[-1]
@@ -131,7 +136,10 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
         return cache[key]
 
     modes = []
-    if house.mode in ("heat", "cool"):
+    forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)
+    if forced:
+        modes = [forced]  # a unit on its own thermostat in heat/cool sets the mode for the shared compressor
+    elif house.mode in ("heat", "cool"):
         modes.append(house.mode)
         other = "cool" if house.mode == "heat" else "heat"
         held = core.elapsed(now, house.since) if house.since else 1e9
