@@ -47,3 +47,27 @@ def test_fit_recovers_the_simulated_house():
 if __name__ == "__main__":
     test_fit_recovers_the_simulated_house()
     print("ok")
+
+
+def test_rooms_without_data_are_left_out_not_poisonous():
+    truth = coupled.the_house()
+    cfg = {"rooms": [{"id": "kitchen", "unit": "air_handler", "default_temp": 67},
+                     {"id": "primary_bedroom", "unit": "minisplit_1", "default_temp": 67}],
+           "units": [{"id": u} for u in truth.units], "settings": {"floor": 63.0}}
+    rooms, units = coupled.rooms_units_from_config(cfg, truth)
+    s = coupled.settings_from_config(cfg)
+    start = datetime(2026, 10, 16)
+    log = []
+    coupled.run(truth, rooms, units, coupled.HeuristicController(rooms, units, s), start, 3,
+                coupled.Weather(start, 5, mean=55, seed=3), s, log=log, seed=3)
+    layout = {"rooms": {r: {"units": list(truth.units), "neighbors": [o for o in ("kitchen", "primary_bedroom", "ghost") if o != r]}
+                        for r in ("kitchen", "primary_bedroom", "ghost")},  # "ghost": configured, never reported
+              "units": {u: {"zone": []} for u in truth.units}}
+    m, rep = fit.fit(log, layout)
+    assert set(m.rooms) == {"kitchen", "primary_bedroom"} and "no data" in rep["ghost"]["skipped"]
+    assert "ghost" not in m.rooms["kitchen"].coupling
+
+
+if __name__ == "__main__":
+    test_rooms_without_data_are_left_out_not_poisonous()
+    print("ok")

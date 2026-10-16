@@ -140,7 +140,17 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     split = int(n * (1 - holdout))
     m = hm.HouseModel()
     report = {}
+    # Rooms with (almost) no readings yet - a sensor that isn't installed, or arrived only today - are left out, as
+    # rooms and as anyone's neighbour; otherwise a missing neighbour would void every window of every room.
+    min_cover = 0.5
+    cover = {r: (sum(v is not None for v in T[r]) / n if n else 0.0) for r in rooms}
+    for r in rooms:
+        if cover[r] < min_cover:
+            report[r] = {"skipped": f"no data yet ({cover[r]:.0%} of the time has readings)"}
+    T = {r: v for r, v in T.items() if cover[r] >= min_cover}
     for rid, spec in layout["rooms"].items():
+        if rid not in T:
+            continue
         nbrs = [j for j in spec.get("neighbors", []) if j in T and j != rid]
         us = [u for u in spec.get("units", units) if u in Y]
         cols = ["loss"] + [f"c:{j}" for j in nbrs] + ["solar", "bias"] + [f"h:{u}" for u in us] + [f"k:{u}" for u in us]
