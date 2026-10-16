@@ -93,6 +93,8 @@ class Manager:
         self.track_store = Store(hass, 1, f"{DOMAIN}_tracking")
         self.hist5: deque = deque()  # compact 5-minute samples for the Model page's charts (mpc.compact)
         self.backtest: dict = None  # {"fitted", "split", "points": {room: {"60"/"120": [[iso, F]]}}}
+        self.forecast: dict = None  # {"at", "entity", "points": [(datetime, F, cloud %)]}: hourly, for planning
+        self._forecast_logged = None
         self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
         self.fit_history: list = []
 
@@ -182,6 +184,42 @@ class Manager:
                 "band": [s.band_below, s.band_above],
                 "units": {u["id"]: u.get("name") or u["id"] for u in self.data["units"]},
                 "rooms": {r["id"]: r.get("name") or r["id"] for r in self.data["rooms"]}}
+
+    async def async_update_forecast(self, _now=None):
+        """Fetch the hourly forecast (outdoor temperature and cloud cover) for the planner's next hours."""
+        ent = self._outdoor_entity()
+        st = self.hass.states.get(ent) if ent else None
+        if st is None or not ent.startswith("weather."):
+            return
+        try:
+            resp = await self.hass.services.async_call("weather", "get_forecasts", {"entity_id": ent, "type": "hourly"},
+                                                       blocking=True, return_response=True)
+            items = (resp or {}).get(ent, {}).get("forecast") or []
+        except Exception as e:  # no hourly forecast from this integration, or it's down: plan on current weather
+            _LOGGER.debug("hourly forecast unavailable from %s: %s", ent, e)
+            return
+        unit = st.attributes.get("temperature_unit") or self.hass.config.units.temperature_unit
+        now, pts = dt_util.now(), []
+        for it in items:
+            t = dt_util.parse_datetime(it.get("datetime") or "")
+            if t is None or t > now + timedelta(hours=12):
+                continue
+            temp = it.get("temperature")
+            try:
+                temp = None if temp is None else TemperatureConverter.convert(float(temp), unit, F)
+            except (TypeError, ValueError):
+                temp = None
+            pts.append((t, temp, it.get("cloud_coverage")))
+        if pts:
+            self.forecast = {"at": now, "entity": ent, "points": pts}
+
+    def _weather_ahead(self, now, outdoor, cloud):
+        """(outdoor(t) or the current value, cloud(t)) for the planner: the hourly forecast when fresh, else now."""
+        f = self.forecast
+        if f is None or now - f["at"] > timedelta(hours=3):
+            return outdoor, (lambda t: cloud)
+        return (mpc.along(now, outdoor, [(t, v) for t, v, _ in f["points"]]),
+                mpc.along(now, cloud, [(t, c) for t, _, c in f["points"]]))
 
     def model_age_h(self):
         m = self.shadow.model
@@ -454,8 +492,10 @@ class Manager:
         cloud = wx.attributes.get("cloud_coverage") if wx is not None else None
         lat, lon = self.hass.config.latitude, self.hass.config.longitude
 
+        outdoor_ahead, cloud_ahead = self._weather_ahead(now, outdoor, cloud)
+
         def sun_at(t):
-            return hm.solar_index(hm.sun_elevation(t, lat, lon), cloud)
+            return hm.solar_index(hm.sun_elevation(t, lat, lon), cloud_ahead(t))
 
         self.shadow.observe(now, temps, actual, outdoor, sun_at(now))
         if self.shadow.due(now) and not self._shadow_busy:
@@ -465,7 +505,7 @@ class Manager:
                      if self.control(u.id) == THERMOSTAT and u.id in actual}
             self._shadow_busy = True
             try:
-                await self.hass.async_add_executor_job(self.shadow.run, now, rooms, units, temps, actual, outdoor,
+                await self.hass.async_add_executor_job(self.shadow.run, now, rooms, units, temps, actual, outdoor_ahead,
                                                        sun_at, settings, ignore, fixed)
             finally:
                 self._shadow_busy = False
@@ -491,7 +531,11 @@ class Manager:
                                "actual_setpoint": cur.attributes.get("temperature") if cur is not None else None}
         m = self.shadow.model
         ok, reasons = self.model_ready(strict=True)
+        f = self.forecast
+        fc = None if f is None else {"at": f["at"].isoformat(), "entity": f["entity"], "stale": now - f["at"] > timedelta(hours=3),
+                                     "next": [[t.isoformat(), v, c] for t, v, c in f["points"] if now < t <= now + timedelta(hours=3)]}
         return {"now": now.isoformat(), "model": None if m is None else m.to_dict(), "age_h": self.model_age_h(),
+                "forecast": fc, "outdoor_now": self._outdoor(s),
                 "ready": {"ok": ok, "why": reasons},
                 "fit": self.fit_state, "fits": self.fit_history[-30:], "shadow": self.shadow.debug(now),
                 "targets": targets, "today": today, "house_today": self.house.mode,
@@ -544,6 +588,11 @@ class Manager:
             if st.entity_id.startswith(tuple(prefixes)) and st.state not in BAD_STATES:
                 row["extra"][st.entity_id] = num(st.state) if num(st.state) is not None else st.state
         row["mpc"] = self.shadow.log_fields()  # what the model-based controller would do
+        f = self.forecast
+        if f is not None and f["at"] != self._forecast_logged:  # each fetched forecast, once (next 6 h)
+            self._forecast_logged = f["at"]
+            row["forecast"] = {"at": f["at"].isoformat(), "entity": f["entity"],
+                               "pts": [[t.isoformat(), num(v), num(c)] for t, v, c in f["points"] if t <= now + timedelta(hours=6)]}
         self.track_store.async_delay_save(self.shadow.to_state, 30)  # about once a minute, and on shutdown
         if minute.minute % 5 == 0:
             self.hist5.append(mpc.compact(row))
@@ -835,6 +884,9 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         async_track_state_change_event(hass, sensors, _on_sensor)
     async_track_time_interval(hass, mgr.async_tick, INTERVAL)
     hass.async_create_task(mgr.async_load_history())
+    # The hourly forecast for planning: soon after startup, then every hour.
+    async_call_later(hass, 30, mgr.async_update_forecast)
+    async_track_time_interval(hass, mgr.async_update_forecast, timedelta(hours=1))
     # Refit the thermal model nightly, and soon after startup if there is none or it's more than a day old.
     async_track_time_change(hass, mgr.async_fit, hour=3, minute=40, second=0)
     age = mgr.model_age_h()

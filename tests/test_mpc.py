@@ -154,6 +154,34 @@ def test_chart_history_comfort_and_accuracy_series():
     assert sh.projection and len(sh.projection["temps"]["kitchen"]) == 12  # 2 h ahead if settings stay
 
 
+def test_forecast_follows_the_hourly_points_from_the_current_reading():
+    now = datetime.fromisoformat("2026-10-16T09:10:00-07:00")
+    h = lambda k: now.replace(minute=0) + timedelta(hours=k)
+    f = mpc.along(now, 55.0, [(h(0), 54.0), (h(1), 58.0), (h(2), 61.0), (h(3), None)])  # 9:00 already started
+    assert f(now) == 55.0  # what's observed, not the forecast for this hour
+    assert abs(f(h(1)) - 58.0) < 1e-9 and abs(f(h(1) + timedelta(minutes=30)) - 59.5) < 1e-9
+    assert f(h(9)) == 61.0  # past the end: hold the last value
+    assert abs(f(now + timedelta(minutes=25)) - (55 + 3 * 25 / 50)) < 1e-9  # straight from 55 now to 58 at 10:00
+    assert mpc.along(now, 55.0, [])(h(2)) == 55.0  # no forecast: current conditions held
+    assert mpc.along(now, None, [(h(1), 58.0)])(h(1)) == 58.0  # no observation: start from the forecast
+
+
+def test_planner_and_projection_use_a_forecast():
+    truth, rooms, units, s = _house()
+    now = datetime.fromisoformat("2026-10-16T09:00:00-07:00")
+    w = coupled.Weather(now, 2, mean=52, seed=5)
+    temps = {r.id: 66.0 for r in rooms}
+    actual = {u.id: {"mode": "heat", "setpoint": 66.0, "running": False} for u in units}
+    cold, warm = mpc.ShadowPlanner(), mpc.ShadowPlanner()
+    cold.set_model(truth)
+    warm.set_model(truth)
+    cold.run(now, rooms, units, temps, actual, 50.0, w.sun, s)
+    warm.run(now, rooms, units, temps, actual, mpc.along(now, 50.0, [(now + timedelta(hours=2), 80.0)]), w.sun, s)
+    assert cold.error is None and warm.error is None, (cold.error, warm.error)
+    c, h = cold.projection["temps"]["kitchen"][-1][1], warm.projection["temps"]["kitchen"][-1][1]
+    assert h > c  # a warming forecast makes the house expected warmer in 2 h
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

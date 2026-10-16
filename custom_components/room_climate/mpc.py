@@ -29,6 +29,34 @@ except ImportError:  # offline
 HORIZONS_MIN = (30, 60, 120)
 
 
+def along(now: datetime, current, points):
+    """f(t): a forecast as a function of time. Starts at `current` (the observation now), then follows `points`
+    ([(datetime, value)], e.g. hourly forecast values) by straight lines between them, holding the last one. Points at
+    or before `now` are ignored, so a forecast hour that's already started doesn't override what's observed. With no
+    future points (no forecast), it's `current` throughout. None values are skipped."""
+    pts = sorted((t, v) for t, v in (points or []) if v is not None and t > now)
+    if current is None and pts:
+        current = pts[0][1]
+    knots = [(now, current)] + pts
+
+    def f(t):
+        if current is None:
+            return None
+        if t <= knots[0][0] or len(knots) == 1:
+            return knots[0][1]
+        for (ta, va), (tb, vb) in zip(knots, knots[1:]):
+            if t <= tb:
+                frac = (t - ta).total_seconds() / max(1.0, (tb - ta).total_seconds())
+                return va + (vb - va) * frac
+        return knots[-1][1]
+    return f
+
+
+def _seq(x, times):
+    """Weather over the plan: a function of time (a forecast) or a constant (current conditions held)."""
+    return [x(t) for t in times] if callable(x) else [x] * len(times)
+
+
 class ShadowPlanner:
     def __init__(self, ps: optimizer.PlanSettings = None, plan_every_s: int = 300, track_every_s: int = 600,
                  keep_h: int = 24):
@@ -116,8 +144,9 @@ class ShadowPlanner:
     # --- heavy part (executor) ---
     def run(self, now: datetime, rooms: list, units: list, temps: dict, actual: dict, outdoor, sun_at,
             settings: core.Settings, ignore=(), fixed=None):
-        """Plan, if due. actual: unit id -> {"mode", "setpoint" (F), "running"}; sun_at(datetime) -> 0..1; fixed: unit
-        id -> (mode, setpoint) for units on their own thermostats (planned around, not for)."""
+        """Plan, if due. actual: unit id -> {"mode", "setpoint" (F), "running"}; outdoor: F now, or outdoor(datetime) ->
+        F from a forecast; sun_at(datetime) -> 0..1; fixed: unit id -> (mode, setpoint) for units on their own
+        thermostats (planned around, not for)."""
         if self.model is None or not (self.next_plan is None or now >= self.next_plan):
             return
         self.next_plan = now + self.plan_every
@@ -135,7 +164,7 @@ class ShadowPlanner:
         times = [now + timedelta(minutes=step_min * (k + 1)) for k in range(n)]
         modes = {u: (a.get("mode") if a.get("mode") in ("heat", "cool") else "off") for u, a in actual.items()}
         traj, _, _ = hm.rollout(self.model, dict(start), modes, {u: a.get("setpoint") for u, a in actual.items()},
-                                {u: bool(a.get("running")) for u, a in actual.items()}, [outdoor] * n,
+                                {u: bool(a.get("running")) for u, a in actual.items()}, _seq(outdoor, times),
                                 [sun_at(t) for t in times], step_min / 60, substeps=2)
         self.projection = {"at": now.isoformat(), "temps": {
             r: [[t.isoformat(), round(step[r], 2)] for t, step in zip(times, traj)] for r in start}}
@@ -148,7 +177,7 @@ class ShadowPlanner:
         now_sp = {u.id: (self.sent[u.id][0].setpoint if u.id in self.sent else actual.get(u.id, {}).get("setpoint"))
                   for u in units}
         t0 = time.perf_counter()
-        p = optimizer.plan(self.model, rooms, units, temps, now, self.house, now_sp, running, [outdoor] * n,
+        p = optimizer.plan(self.model, rooms, units, temps, now, self.house, now_sp, running, _seq(outdoor, times),
                            [sun_at(t) for t in times], settings, ps, ignore=set(ignore), fixed=fixed)
         setpoints = p.setpoints
         forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)

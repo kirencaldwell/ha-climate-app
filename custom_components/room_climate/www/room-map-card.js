@@ -514,6 +514,7 @@ class RoomMapCard extends HTMLElement {
       ${plan ? `<p class="rc-sub" style="margin:4px 0">Model-based: <b>${sh.house === "off" ? "no change needed" : sh.house}</b>${sh.pending ? ` (confirming ${sh.pending})` : ""} · plan cost ${costs} · ${when(plan.at)}, ${plan.ms} ms.
         Today's controller: <b>${d.house_today === "off" ? "no change needed" : d.house_today}</b>.</p>` : `<p class="rc-sub">No plan yet${m ? " (first one within 5 minutes)" : ": needs a model"}.</p>`}
       <table class="rc-tbl"><tr><th>Unit</th><th>Model would</th><th>Today's controller</th><th>Unit now</th></tr>${unitRows}</table>
+      <p class="rc-sub" style="margin:6px 0 0">${this._weatherLine(d)}</p>
       <p class="rc-sub" style="margin:6px 0 0">Comfort leans cool: band ${f1(d.comfort.band_below)}° below to ${f1(d.comfort.band_above)}° above target, running warm costs ${d.comfort.warm_weight}×, heating aims ${d.comfort.aim_offset}° low.</p></div>`;
     // 3. accuracy
     const acc = sh.accuracy || {}, hz = sh.horizons || [30, 60, 120];
@@ -605,6 +606,16 @@ class RoomMapCard extends HTMLElement {
       <text x="${x(mk.t) - 4}" y="${T + 10}" text-anchor="end" font-size="9.5" fill="#ffd166" fill-opacity=".85">${mk.left || ""}</text>
       <text x="${x(mk.t) + 4}" y="${T + 10}" font-size="9.5" fill="#ffd166" fill-opacity=".85">${mk.right || ""}</text>`).join("");
     return `<svg class="rc-chart" viewBox="0 0 ${W} ${H}">${strip}${g}${bandSvg}${hline}${markSvg}${nowLine}${series.map(path).join("")}</svg>`;
+  }
+
+  _weatherLine(d) {
+    const f = d.forecast, now = d.outdoor_now;
+    const t = iso => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    if (!f || f.stale || !(f.next || []).length)
+      return `Weather ahead: no fresh forecast, so plans hold today's ${now == null ? "current" : Math.round(now) + "°"} weather for the next 2 hours.`;
+    const two = f.next.filter(p => Date.parse(p[0]) <= Date.parse(d.now) + 2 * 3600e3).slice(-1)[0] || f.next[0];
+    const cl = c => c == null ? "" : `, ${Math.round(c)}% cloud`;
+    return `Weather ahead (hourly forecast, ${t(f.at)}): ${now == null ? "—" : Math.round(now) + "°"} now → ${Math.round(two[1])}°${cl(two[2])} by ${t(two[0])}. Plans and projections use it; learning and scoring use the weather that actually happened.`;
   }
 
   _histHtml(h, name) {
