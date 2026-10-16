@@ -468,8 +468,15 @@ class RoomMapCard extends HTMLElement {
     } catch (e) { this._fail("model", e); }
   }
   async _modelFit() {
-    try { await this._hass.callWS({ type: "room_climate/fit_model" }); setTimeout(() => this._modelLoad(), 1500); }
-    catch (e) { this._fail("fit_model", e); }
+    try {
+      await this._hass.callWS({ type: "room_climate/fit_model" });
+      // A fit takes seconds: check every 2 s until it's done instead of waiting for the 30 s refresh.
+      for (let i = 0; i < 90 && this._mOpen; i++) {
+        await new Promise(r => setTimeout(r, i ? 2000 : 500));
+        await this._modelLoad();
+        if (this._mData && this._mData.fit && !this._mData.fit.running) break;
+      }
+    } catch (e) { this._fail("fit_model", e); }
   }
   _modelUpdate() {
     const el = this._modal && this._mOpen && this._modal.querySelector('[data-slot="model"]');
@@ -489,7 +496,7 @@ class RoomMapCard extends HTMLElement {
       <p style="margin:6px 0">${badge}</p>
       <p class="rc-sub" style="margin:4px 0">${m ? `Fitted ${when(meta.fitted)} on ${meta.rows || 0} minutes of log (${when(meta.from)} – ${when(meta.to)}).`
         : "The first fit runs a few minutes after Home Assistant starts, then every night at 3:40."}
-        ${fitS.running ? " <b>Fitting now…</b>" : ""}${fitS.error ? ` <span style="color:#ffd166">Last fit: ${fitS.error}</span>` : ""}
+        ${fitS.running ? " <b>Fitting now…</b>" : fitS.seconds != null ? ` Last fit took ${fitS.seconds} s.` : ""}${fitS.error ? ` <span style="color:#ffd166">Last fit: ${fitS.error}</span>` : ""}
         ${sh.error ? ` <span style="color:#ff7a45">Planner error: ${sh.error}</span>` : ""}</p>
       ${d.ready ? (d.ready.ok ? `<p style="margin:6px 0"><span class="rc-badge ok">Ready to control units</span></p>`
         : `<p class="rc-sub" style="margin:6px 0"><b>Not ready to control units yet:</b></p><ul class="rc-sub" style="margin:0 0 8px 18px;padding:0">${d.ready.why.slice(0, 6).map(w => `<li>${w}</li>`).join("")}${d.ready.why.length > 6 ? `<li>…and ${d.ready.why.length - 6} more</li>` : ""}</ul>`) : ""}
