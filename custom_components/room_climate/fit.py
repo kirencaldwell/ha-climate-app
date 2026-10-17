@@ -163,17 +163,26 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     rooms, units = list(layout["rooms"]), list(layout["units"])
     ts, T, out, sun, Y, U = series(rows, rooms, units)
     n = len(ts)
+    # A room's readings from before its `since` (a sensor that was replaced or moved) aren't the room: leave them out.
+    for rid, spec in layout["rooms"].items():
+        cut = spec.get("since")
+        if cut and rid in T:
+            cut = datetime.fromisoformat(cut)
+            T[rid] = [None if t < cut else v for t, v in zip(ts, T[rid])]
     split = int(n * (1 - holdout))
     m = hm.HouseModel()
     report = {}
-    # Rooms with (almost) no readings yet - a sensor that isn't installed, or arrived only today - are left out, as
-    # rooms and as anyone's neighbour; otherwise a missing neighbour would void every window of every room.
-    min_cover = 0.5
-    cover = {r: (sum(v is not None for v in T[r]) / n if n else 0.0) for r in rooms}
+    # A room is fitted once it has `min_hours` of readings (a new or moved sensor joins after a day, not after half the
+    # fit window); it's anyone's neighbour only once it covers half the log, since a neighbour missing from a window
+    # voids that window for every room it neighbours.
+    min_cover, min_hours = 0.5, 24
+    have = {r: sum(v is not None for v in T[r]) for r in rooms}
+    cover = {r: (have[r] / n if n else 0.0) for r in rooms}
     for r in rooms:
-        if cover[r] < min_cover:
-            report[r] = {"skipped": f"no data yet ({cover[r]:.0%} of the time has readings)"}
-    T = {r: v for r, v in T.items() if cover[r] >= min_cover}
+        if have[r] < min_hours * 60:
+            report[r] = {"skipped": f"not enough data yet ({have[r] / 60:.0f} of {min_hours} h of readings)"}
+    T = {r: v for r, v in T.items() if have[r] >= min_hours * 60}
+    neighbour_ok = {r for r in T if cover[r] >= min_cover}
 
     def rooms_fit(Yl):
         """Fit every room with the units' outputs `Yl` -> (room models, per-room report, training SSE)."""
@@ -181,7 +190,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
         for rid, spec in layout["rooms"].items():
             if rid not in T:
                 continue
-            nbrs = [j for j in spec.get("neighbors", []) if j in T and j != rid]
+            nbrs = [j for j in spec.get("neighbors", []) if j in neighbour_ok and j != rid]
             us = [u for u in spec.get("units", units) if u in Yl]
             cols = ["loss"] + [f"c:{j}" for j in nbrs] + ["solar", "bias"] + [f"h:{u}" for u in us] + [f"k:{u}" for u in us]
             A, b = [], []
@@ -244,7 +253,9 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     report["lags_min"] = lags
     report["holdout"] = validate(m, ts, T, out, sun, with_lags(Y, m), split)
     report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
-    hold = [v for v in report["holdout"].values()]
+    # Every room with enough held-out checks must beat "nothing changes"; at least one must have been checked. A room
+    # whose sensor only just started may have none yet: the live accuracy gate (mpc.readiness) still covers it.
+    hold = [v for v in report["holdout"].values() if v["n"] >= 5]
     usable = bool(m.rooms) and bool(hold) and all(
         v["model_rmse_F"] is not None and v["no_change_rmse_F"] is not None and v["model_rmse_F"] < v["no_change_rmse_F"]
         for v in hold)
@@ -260,8 +271,8 @@ def validate(m: hm.HouseModel, ts, T, out, sun, Y, split: int, horizon_min: int 
     base = {r: [] for r in m.rooms}
     n = len(ts)
     for a in range(split, n - horizon_min, every_min):
-        start = {r: T[r][a] for r in m.rooms}
-        if any(v is None for v in start.values()):
+        start = {r: T[r][a] for r in m.rooms if T[r][a] is not None}  # rooms without a reading sit this one out
+        if not start:
             continue
         cur = dict(start)
         for k in range(a, a + horizon_min, step_min):
@@ -271,7 +282,7 @@ def validate(m: hm.HouseModel, ts, T, out, sun, Y, split: int, horizon_min: int 
             d = hm.derivative(m, cur, o, sum(sun[seg]) / step_min, y)
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
         z = a + horizon_min
-        for r in m.rooms:
+        for r in start:
             if T[r][z] is not None:
                 errs[r].append(cur[r] - T[r][z])
                 base[r].append(start[r] - T[r][z])
@@ -286,11 +297,12 @@ def validate(m: hm.HouseModel, ts, T, out, sun, Y, split: int, horizon_min: int 
                 "n": len(errs[r])} for r in m.rooms}
 
 
-def layout_for(rooms: list, units: list) -> dict:
+def layout_for(rooms: list, units: list, since: dict = None) -> dict:
     """Fit layout from the controller's config. Every room with a sensor is modelled, with every other such room as a
     possible neighbour and every unit as a possible influence (non-negative ridge sorts out which matter). A room that
     reads its own unit's sensor is modelled (its unit regulates on it) but isn't anyone's neighbour: it measures the
-    unit's airflow, not a room. Unit sensor rooms are detected from the log."""
+    unit's airflow, not a room. Unit sensor rooms are detected from the log. `since`: room id -> ISO time before
+    which that room's readings are left out (its sensor was replaced or moved)."""
     unit_entity = {u.id: u.entity for u in units}
     sensed = [r for r in rooms if r.sensor]
     own = {r.id for r in sensed if r.sensor == unit_entity.get(r.unit)}
@@ -298,6 +310,8 @@ def layout_for(rooms: list, units: list) -> dict:
     for r in sensed:
         lay["rooms"][r.id] = {"units": [u.id for u in units],
                               "neighbors": [o.id for o in sensed if o.id != r.id and o.id not in own]}
+        if (since or {}).get(r.id):
+            lay["rooms"][r.id]["since"] = since[r.id]
     for u in units:
         lay["units"][u.id] = {"zone": [r.id for r in sensed if r.unit == u.id]}
     return lay
@@ -313,8 +327,8 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
     res = {r: {str(h): [] for h in horizons} for r in rooms}
     hmax = max(horizons)
     for a in range(0, len(ts) - hmax, every_min):
-        cur = {r: T[r][a] for r in rooms}
-        if any(v is None for v in cur.values()):
+        cur = {r: T[r][a] for r in rooms if T[r][a] is not None}
+        if not cur:
             continue
         for k in range(a, a + hmax, step_min):
             seg = slice(k, k + step_min)
@@ -322,6 +336,6 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
             done = k + step_min - a
             if done in horizons:
-                for r in rooms:
+                for r in cur:
                     res[r][str(done)].append([ts[a + done].isoformat(), round(cur[r], 2)])
     return res

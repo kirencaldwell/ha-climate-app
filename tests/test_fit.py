@@ -1,7 +1,7 @@
 """The fitter recovers the simulated house from its own logs. Run: python3 tests/test_fit.py"""
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 HERE = os.path.dirname(__file__)
 sys.path.append(os.path.join(HERE, "..", "custom_components", "room_climate"))  # appended: its select.py must not shadow the stdlib select module
@@ -64,8 +64,18 @@ def test_rooms_without_data_are_left_out_not_poisonous():
                         for r in ("kitchen", "primary_bedroom", "ghost")},  # "ghost": configured, never reported
               "units": {u: {"zone": []} for u in truth.units}}
     m, rep = fit.fit(log, layout)
-    assert set(m.rooms) == {"kitchen", "primary_bedroom"} and "no data" in rep["ghost"]["skipped"]
+    assert set(m.rooms) == {"kitchen", "primary_bedroom"} and "not enough data" in rep["ghost"]["skipped"]
     assert "ghost" not in m.rooms["kitchen"].coupling
+    # A moved sensor: its room's readings before `since` are left out. With a day left it's fitted (but nobody's
+    # neighbour yet: it covers a third of the log); with half a day it waits.
+    moved = start + timedelta(days=2)
+    layout["rooms"]["primary_bedroom"]["since"] = moved.isoformat()
+    m2, rep2 = fit.fit(log, layout)
+    assert "primary_bedroom" in m2.rooms and "primary_bedroom" not in m2.rooms["kitchen"].coupling
+    layout["rooms"]["primary_bedroom"]["since"] = (moved + timedelta(hours=12)).isoformat()
+    m3, rep3 = fit.fit(log, layout)
+    assert "primary_bedroom" not in m3.rooms and "not enough data" in rep3["primary_bedroom"]["skipped"]
+    assert rep3["holdout"]["kitchen"]["n"] > 0  # the other rooms are still checked
 
 
 def test_backtest_runs_the_model_over_logged_history():

@@ -243,7 +243,7 @@ class Manager:
         self.fit_state.update(running=True, error=None, started=dt_util.now().isoformat())
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
         units = [_unit_from_dict(ud) for ud in self.data["units"]]
-        layout = fit.layout_for(rooms, units)
+        layout = fit.layout_for(rooms, units, {r["id"]: r["fit_since"] for r in self.data["rooms"] if r.get("fit_since")})
         since = (dt_util.now() - timedelta(days=FIT_DAYS)).strftime("%Y-%m-%d")
         logdir = self.hass.config.path("room_climate_data")
         model_path, hist_path = self.hass.config.path(MODEL_FILE), self.hass.config.path(FIT_HISTORY_FILE)
@@ -328,13 +328,12 @@ class Manager:
         return ud.get("control", THERMOSTAT)
 
     def model_rooms(self) -> set:
-        """Rooms the model must predict well before it may control units: every modelled room served by a unit. That
-        includes a room reading its own unit's sensor (Bedroom 3): it's the only reading that room has, so the model has
-        to get it right too, even though the optimizer leaves it out of the cost (it measures the unit's airflow)."""
-        m = self.shadow.model
-        if m is None:
+        """Rooms the model must predict well before it may control units: every room with a sensor served by a unit,
+        modelled yet or not. A room the fit hasn't taken in yet (a new or moved sensor) has no scores, so it holds the
+        gate shut rather than letting the model drive a unit whose room it can't predict."""
+        if self.shadow.model is None:
             return set()
-        return {r["id"] for r in self.data["rooms"] if r["id"] in m.rooms and r.get("unit")}
+        return {r["id"] for r in self.data["rooms"] if r.get("unit") and r.get("sensor")}
 
     def model_ready(self, strict: bool = True):
         return self.shadow.readiness(dt_util.now(), self.model_rooms(), strict=strict)
@@ -853,6 +852,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         vol.Optional("hold_temp"): vol.Any(None, vol.Coerce(float)),
         vol.Optional("hold_hours"): vol.Any(None, vol.Coerce(float)),
         vol.Optional("sensor"): vol.Any(None, vol.Match(r"^(sensor|climate)\.[a-z0-9_]+$")),
+        vol.Optional("fit_since"): vol.Any(None, str),  # learn from this room's readings from then on (sensor moved)
     })
     @websocket_api.async_response
     async def ws_set_room(hass, connection, msg):
@@ -863,11 +863,15 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         if msg.get("sensor") and hass.states.get(msg["sensor"]) is None:
             connection.send_error(msg["id"], "not_found", f"no entity {msg['sensor']}")
             return
+        if msg.get("fit_since") and dt_util.parse_datetime(msg["fit_since"]) is None:
+            connection.send_error(msg["id"], "invalid", "fit_since must be an ISO date and time")
+            return
         if "sensor" in msg and msg["sensor"] != room.get("sensor"):
             _LOGGER.info("%s sensor %s -> %s", room["id"], room.get("sensor"), msg["sensor"])
+            room["fit_since"] = dt_util.now().isoformat()  # a different sensor: learn from its readings only
             mgr.last_good.pop(room["id"], None)  # a different sensor: don't bridge from the old one's reading
             mgr.hist.pop(room["id"], None)
-        for k in ("priority", "default_temp", "schedule", "priority_schedule", "hold_temp", "sensor"):
+        for k in ("priority", "default_temp", "schedule", "priority_schedule", "hold_temp", "sensor", "fit_since"):
             if k in msg:
                 room[k] = msg[k]
         if "hold_hours" in msg:
