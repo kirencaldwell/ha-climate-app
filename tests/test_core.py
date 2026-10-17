@@ -712,3 +712,20 @@ def test_slope_needs_enough_history():
     h = [(MON + timedelta(minutes=k), 66.0 + 0.1 * k) for k in range(11)]
     assert abs(core.slope(h, h[-1][0], 600) - 6.0) < 1e-9
     assert core.slope(h[:2], h[1][0], 600) is None
+
+
+def test_drive_always_starts_a_unit_when_clearly_short():
+    s = Settings()
+    _, st, _ = _drv(66.0, 67.0, kp=0.3, rate=0.0)  # a fresh, gentle loop
+    _, st, _ = _drv(66.0, 67.0, kp=0.3, rate=0.0, st=st, t=MON + timedelta(minutes=1))
+    cmd, _, _ = _drv(65.3, 67.0 - 0.5, kp=0.3, rate=0.0, st=st, t=MON + timedelta(minutes=10))
+    assert cmd.raw >= 65.3 + 0.9 - 1e-9  # one 0.5 C step at least: a setpoint at the room's own reading never starts it
+
+
+def test_drive_looks_ahead_by_the_units_lag():
+    _, st, _ = _drv(64.0, 67.0)
+    rising = dict(rate=15.0, st=st, t=MON + timedelta(minutes=5))
+    stop10, _, _ = _drv(65.3, 66.5, **rising)  # 10 min ahead: 67.8, past target: stop
+    cmd = core.Command("heat", None, "", True, None, 66.5, 65.3, 0.0)
+    keep5, st5, _ = core.drive(cmd, st, 15.0, 1.0, Unit("u", "climate.u"), MON + timedelta(minutes=5), Settings(), 5.0)
+    assert not stop10.active and st5.on  # a 5-minute lag: 66.55, on target, keep going

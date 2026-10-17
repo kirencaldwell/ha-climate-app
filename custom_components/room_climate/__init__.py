@@ -308,6 +308,12 @@ class Manager:
                 self.states[u.id] = core.UnitState(modes[0], now, modes[0], st.active)
             _LOGGER.info("house mode %s restored from the units after a restart", modes[0])
 
+    def drive_lead(self, unit_id: str):
+        """Look-ahead for a unit's outer loop: its learned lag in minutes (None: the default lead)."""
+        m = self.shadow.model
+        u = m.units.get(unit_id) if m is not None else None
+        return u.lag_h * 60 if u is not None and u.lag_h > 0 else None
+
     def drive_kp(self, unit_id: str, mode: str, rooms: list, settings: core.Settings) -> float:
         """Outer-loop gain for a unit, from the model's learned effect of the unit on its own rooms (core.drive_gain)."""
         m = self.shadow.model
@@ -505,7 +511,7 @@ class Manager:
                     h.popleft()
                 cmd, self.drives[u.id], changed = core.drive(
                     c, self.drives.get(u.id), core.slope(list(h), now, settings.drive_slope_s),
-                    self.drive_kp(u.id, c.mode, rooms, settings), u, now, settings)
+                    self.drive_kp(u.id, c.mode, rooms, settings), u, now, settings, self.drive_lead(u.id))
                 if ctl == MODEL:
                     cmd.reason = f"{c.reason} -> {cmd.reason}"
             elif ctl == MODEL:

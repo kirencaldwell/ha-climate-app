@@ -97,16 +97,21 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
     b1 = min(n, max(1, int(round(ps.first_block_min / ps.step_min))))
     blocks = [(0, b1)] + ([(b1, n)] if b1 < n else [])
 
-    def base_setpoint(u, k) -> float:
-        """Priority-weighted target of the unit's rooms at step k, as a setpoint on the unit's own reading."""
+    def zone_target(mine, k) -> float:
+        wsum = sum(tw[r.id][k][1] for r in mine)
+        return sum(tw[r.id][k][0] * tw[r.id][k][1] for r in mine) / wsum - settings.aim_offset
+
+    def base_setpoint(u, a, b) -> float:
+        """Priority-weighted target of the unit's rooms for the block of steps a..b, as a setpoint on the unit's own
+        reading (or, with the outer loop, as a target on the rooms' scale: the block's mean, so a schedule change
+        inside a long block is within the search's reach)."""
         mine = [r for r in scored if r.unit == u.id]
         if not mine:
             return float(round(setpoints_now.get(u.id) or 68.0))
-        wsum = sum(tw[r.id][k][1] for r in mine)
-        zone = sum(tw[r.id][k][0] * tw[r.id][k][1] for r in mine) / wsum - settings.aim_offset
         if drive:
-            return round(zone * 2) / 2  # a target for the rooms, on their own scale
-        return core.round_cool(zone + m.units[u.id].sensor_offset)
+            zone = sum(zone_target(mine, k) for k in range(a, b)) / max(1, b - a)
+            return round(zone * 2) / 2
+        return core.round_cool(zone_target(mine, a) + m.units[u.id].sensor_offset)
 
     zone_rooms = {u.id: [r for r in scored if r.unit == u.id] for u in known_units}
     kp = {}
@@ -130,8 +135,9 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
                 rate = None if rates is None else sum(rates.get(r.id, 0.0) * x for r, x in zip(rs, w)) / sum(w)
                 rd = hm.unit_reading(m, u.id, temps)
                 off = 0.0 if rd is None else rd - room
+                lag = m.units[u.id].lag_h * 60
                 push, states[u.id] = core.drive_law(states.get(u.id), mode, room, targets[u.id], rate, kp[u.id],
-                                                    clock[0], settings)
+                                                    clock[0], settings, lag if lag > 0 else None)
                 sgn = 1.0 if mode == "heat" else -1.0
                 out[u.id] = max(u.min_setpoint, min(u.max_setpoint, room + off + sgn * push))
                 if u.id not in first:
@@ -204,7 +210,7 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
             sps = {}
             c, traj, first = evaluate(mode, sps)
         else:
-            base = {u.id: tuple(clamp(u, base_setpoint(u, a)) for a, _ in blocks) for u in known_units}
+            base = {u.id: tuple(clamp(u, base_setpoint(u, a, b)) for a, b in blocks) for u in known_units}
             sps = dict(base)
             c, traj, first = evaluate(mode, sps)
             for _ in range(ps.passes):

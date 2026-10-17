@@ -168,6 +168,7 @@ class HeuristicController:
         self.house, self.states, self.hist, self.sent, self.prev_busy, self.last_good = core.HouseState(), {}, {}, {}, set(), {}
         self.drives, self.zone_hist = {}, {}
         self.kp = {}  # unit id -> outer-loop gain (from a model's learned effects; default gain when empty)
+        self.lead = {}  # unit id -> look-ahead minutes (a model's learned lag; default lead when empty)
 
     def tick(self, sim: CoupledSim, now: datetime):
         readings, predicted = {}, {}
@@ -199,7 +200,8 @@ class HeuristicController:
                     h.append((now, c.room))
                     del h[:max(0, len(h) - 60)]
                 cmd, self.drives[u.id], changed = core.drive(c, self.drives.get(u.id), core.slope(h, now, self.s.drive_slope_s),
-                                                             self.kp.get(u.id, self.s.drive_kp), u, now, self.s)
+                                                             self.kp.get(u.id, self.s.drive_kp), u, now, self.s,
+                                                             self.lead.get(u.id))
             else:
                 cmd, changed = core.stabilize(cmds[u.id], self.sent.get(u.id), now, self.s)
             if changed and cmd.setpoint is not None:
@@ -247,8 +249,9 @@ class MPCController:
             eff = [self.m.rooms[r.id].heat.get(u.id, 0.0) for r in mine if r.id in self.m.rooms]
             kp = core.drive_gain(sum(eff) / len(eff) if eff else None, self.s)
             cmd = core.Command(self.house.mode, None, "", True, None, self.targets[u.id], room, off)
+            lag = self.m.units[u.id].lag_h * 60 if u.id in self.m.units else 0.0
             cmd, self.drives[u.id], _ = core.drive(cmd, self.drives.get(u.id), core.slope(h, now, self.s.drive_slope_s),
-                                                   kp, u, now, self.s)
+                                                   kp, u, now, self.s, lag if lag > 0 else None)
             sim.command(u.id, cmd.mode, cmd.setpoint)
 
     def tick(self, sim: CoupledSim, now: datetime):

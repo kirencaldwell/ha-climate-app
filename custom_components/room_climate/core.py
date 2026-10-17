@@ -101,7 +101,8 @@ class Settings:
     drive_kp_max: float = 1.0  # 1 = never push past the target on P alone: gentler than today even for a weak unit
     drive_ti_min: float = 90.0  # integral time: removes the steady-state shortfall a pure P loop would leave
     drive_i_max: float = 2.0  # cap on the integral's share of the push (anti-windup)
-    drive_lead_min: float = 10.0  # act on where the room will be this far ahead (anticipates the coast after a stop)
+    drive_lead_min: float = 10.0  # act on where the room will be this far ahead (anticipates the coast after a stop);
+    #                               a unit's learned lag replaces it
     drive_max_push: float = 2.0  # setpoint at most this far past the room reading: limits the blast of hot/cold air
     drive_stop_push: float = 2.0  # setpoint this far behind the reading to make the unit stop (it idles ~1 C past it)
     drive_off: float = 0.5  # stop the unit once the room is predicted this far past target
@@ -436,12 +437,14 @@ def to_grid(setpoint_f: float) -> float:
 
 
 def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, rate: Optional[float], kp: float,
-              now: datetime, settings: Settings = Settings()) -> tuple[float, DriveState]:
+              now: datetime, settings: Settings = Settings(), lead_min: Optional[float] = None) -> tuple[float, DriveState]:
     """The outer loop: how far past the room reading to put the setpoint (the push, F, positive = in the mode's
-    direction), from the room's predicted miss `drive_lead_min` ahead (target minus prediction, signed so that > 0
-    means the room still needs this mode's help):
+    direction), from the room's predicted miss `lead_min` ahead (target minus prediction, signed so that > 0 means
+    the room still needs this mode's help). The lead is the unit's learned lag when there is one: with a first-order
+    lag, rate x lag is how far the room goes on after the unit stops. Else drive_lead_min.
 
-        push = kp * miss + integral      while running (clamped to -one 0.5 C step .. max_push)
+        push = kp * miss + integral      while running (clamped to -one 0.5 C step .. max_push; at least +one step
+                                         while the room is more than drive_restart short, or the unit wouldn't start)
         push = -stop_push                once the room is on track to pass target by drive_off: stop it
 
     While running, a small or slightly negative push lets the inverter's own loop settle at low output; the integral
@@ -454,7 +457,8 @@ def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, r
     fresh = st is None or st.mode != mode
     dt_h = 0.0 if fresh or st.at is None else max(0.0, min(0.25, elapsed(now, st.at) / 3600))
     r = max(-12.0, min(12.0, rate or 0.0))
-    miss = s * (target - (room + r * settings.drive_lead_min / 60))
+    lead = settings.drive_lead_min if lead_min is None else lead_min
+    miss = s * (target - (room + r * lead / 60))
     i = 0.0 if fresh else st.i
     if fresh:
         on = miss > 0
@@ -468,7 +472,10 @@ def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, r
         p = kp * miss
         if p + i < settings.drive_max_push:  # anti-windup: don't build while saturated
             i = max(0.0, min(settings.drive_i_max, i + kp * miss * dt_h / ti_h))
-        push = max(-step, min(settings.drive_max_push, p + i))
+        # Clearly short: at least one step, or a push that rounds to the room's own reading never starts the unit
+        # (Bedroom 3 sat idle at 65.3 with its setpoint 65.3 for an hour). Near target the unit may settle lower.
+        low = step if miss > settings.drive_restart else -step
+        push = max(low, min(settings.drive_max_push, p + i))
     else:
         i = max(0.0, i + kp * min(0.0, miss) * dt_h / ti_h)  # bleeds off while past target
         push = -settings.drive_stop_push
@@ -477,7 +484,7 @@ def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, r
 
 
 def drive(cmd: Command, st: Optional[DriveState], rate: Optional[float], kp: float, unit: Unit, now: datetime,
-          settings: Settings = Settings()) -> tuple[Command, DriveState, bool]:
+          settings: Settings = Settings(), lead_min: Optional[float] = None) -> tuple[Command, DriveState, bool]:
     """Turn a command's target into the setpoint to send this tick -> (command, new state, changed).
 
     Setpoints sit on the unit's 0.5 C grid. A new setpoint goes out on a start or stop, on a mode change, or when it
@@ -487,7 +494,7 @@ def drive(cmd: Command, st: Optional[DriveState], rate: Optional[float], kp: flo
         new = DriveState(cmd.mode, False, 0.0, now, keep, st.sent_at if st and keep is not None else None)
         return Command(cmd.mode, keep, cmd.reason, False, keep, cmd.target, cmd.room, cmd.offset), new, \
             st is None or st.mode != cmd.mode
-    push, new = drive_law(st, cmd.mode, cmd.room, cmd.target, rate, kp, now, settings)
+    push, new = drive_law(st, cmd.mode, cmd.room, cmd.target, rate, kp, now, settings, lead_min)
     s = 1.0 if cmd.mode == "heat" else -1.0
     raw = max(unit.min_setpoint, min(unit.max_setpoint, cmd.room + cmd.offset + s * push))
     sp = to_grid(raw)
