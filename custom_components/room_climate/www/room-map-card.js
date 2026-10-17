@@ -35,6 +35,8 @@ const CSS = `
 .rc button:disabled, .rc-modal button:disabled { opacity: .4; }
 .rc-seg { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 12px; }
 .rc-seg button { flex: 1 1 0; }
+.rc-seg.rc-chips { margin: 2px 0 8px; }
+.rc-seg.rc-chips button { flex: 0 0 auto; font-size: .8em; padding: 3px 10px; }
 .rc-main { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
 .rc-map { flex: 1 1 340px; min-width: 0; }
 .rc-map svg { display: block; width: 100%; height: auto; max-height: 72vh; margin: 0 auto; touch-action: manipulation; }
@@ -453,7 +455,12 @@ class RoomMapCard extends HTMLElement {
       if (b && b.dataset.mx === "room") { this._mRoom = b.dataset.r; this._modelUpdate(); return; }
       if (b && b.dataset.mx === "unit") { this._mUnit = b.dataset.u; this._modelUpdate(); return; }
       if (b && b.dataset.mx === "range") { this._mHours = +b.dataset.h; this._modelLoad(); return; }
-      if (b && b.dataset.mx === "bt") { this._mBt = b.dataset.k; this._modelUpdate(); return; }
+      if (b && b.dataset.mx === "hz") { this._mHz = b.dataset.k; this._modelUpdate(); return; }
+      if (b && b.dataset.mx === "show") {  // optional chart lines, off unless asked for
+        const sh = this._mShow || (this._mShow = new Set(["plan"])), k = b.dataset.k;
+        sh.has(k) ? sh.delete(k) : sh.add(k);
+        this._modelUpdate(); return;
+      }
       this._closeSchedule(); this._render();
     });
     this._onKey = e => { if (e.key === "Escape") { this._closeSchedule(); this._render(); } };
@@ -641,62 +648,73 @@ class RoomMapCard extends HTMLElement {
     if (!rooms.includes(this._mRoom)) this._mRoom = rooms.includes("kitchen") ? "kitchen" : rooms[0];
     const rid = this._mRoom, P = (h.points || {})[rid] || {};
     const roomTabs = `<div class="rc-seg">${rooms.map(r => `<button data-mx="room" data-r="${r}" class="${r === rid ? "on" : ""}">${name(r)}</button>`).join("")}</div>`;
+    // Each chart shows the essentials; everything else is a toggle (chips), so there are only a few lines at a time.
+    const show = this._mShow || (this._mShow = new Set(["plan"]));
+    const hz = this._mHz || "120", hzTxt = hz === "60" ? "1 h" : "2 h";
+    const chip = (k, label) => `<button data-mx="show" data-k="${k}" class="${show.has(k) ? "on" : ""}">${label}</button>`;
+    const chips = items => `<div class="rc-seg rc-chips">${items.map(([k, l]) => chip(k, l)).join("")}</div>`;
+    const hzSeg = `<div class="rc-seg rc-chips">${[["60", "1 h ahead"], ["120", "2 h ahead"]].map(([k, l]) =>
+      `<button data-mx="hz" data-k="${k}" class="${hz === k ? "on" : ""}">${l}</button>`).join("")}</div>`;
+    const lg = items => `<div class="rc-legend" style="justify-content:flex-start;gap:14px;flex-wrap:wrap">${items.filter(Boolean).map(([c, t, k]) => `<span><b style="color:${c}">${k || "—"}</b> ${t}</span>`).join("")}</div>`;
+    // 1. temperature: actual and its comfort band, plus what's switched on
     const act = S.filter(x => x.r[rid]).map(x => [ms(x.t), x.r[rid][0]]);
     const band = S.filter(x => x.r[rid] && x.r[rid][1] != null).map(x => [ms(x.t), x.r[rid][1] - h.band[0], x.r[rid][1] + h.band[1]]);
     const proj = ((h.projection || {}).temps || {})[rid] || [], plan = (h.plan || {})[rid] || [];
     const startPt = act.length ? [act[act.length - 1]] : [];
     const BT = ((h.backtest || {}).points || {})[rid] || {};
     const split = (h.backtest || {}).split;
-    const btMode = this._mBt || "60";
+    const tSeries = [{ pts: act, color: "#e6edf7", width: 2.2 }];
+    if (show.has("bt")) tSeries.push({ pts: (BT[hz] || []).map(([t, v]) => [ms(t), v]), color: "#ffb454", width: 1.4 });
+    if (show.has("pred")) tSeries.push({ pts: (P[hz] || []).map(([t, v]) => [ms(t), v]), color: "#3fa9ff", dots: true });
+    if (show.has("stay")) tSeries.push({ pts: startPt.concat(proj.map(([t, v]) => [ms(t), v])), color: "#9aa7b8", dash: "2 4", width: 2 });
+    if (show.has("plan")) tSeries.push({ pts: startPt.concat(plan.map(([t, v]) => [ms(t), v])), color: "#3de0a5", dash: "6 4", width: 2 });
     const tempChart = this._tsChart({ t0, t1, now, band, fmt: v => v.toFixed(1) + "°",
-      marks: split ? [{ t: ms(split), left: "trained on ←", right: "→ tested on" }] : [],
-      series: [
-      { pts: act, color: "#e6edf7", width: 2 },
-      { pts: (BT[btMode] || []).map(([t, v]) => [ms(t), v]), color: "#ffb454", width: 1.3 },
-      { pts: (P["120"] || []).map(([t, v]) => [ms(t), v]), color: "#b48cff", dots: true },
-      { pts: (P["60"] || []).map(([t, v]) => [ms(t), v]), color: "#3fa9ff", dots: true },
-      { pts: startPt.concat(proj.map(([t, v]) => [ms(t), v])), color: "#9aa7b8", dash: "2 4", width: 2 },
-      { pts: startPt.concat(plan.map(([t, v]) => [ms(t), v])), color: "#3de0a5", dash: "6 4", width: 2 }] });
-    // prediction error by hour
-    const A = (h.accuracy || {})[rid] || {};
-    const hourly = k => (A[k] || []).map(([t, r]) => [ms(t) + 1800e3, r]);
-    const accChart = this._tsChart({ t0, t1: now, now, zero: true, H: 160, fmt: v => v.toFixed(1) + "°", series: [
-      { pts: (A["120"] || []).map(([t, , b]) => [ms(t) + 1800e3, b]), color: "#667085", dash: "4 4" },
-      { pts: hourly("60"), color: "#3fa9ff" }, { pts: hourly("120"), color: "#b48cff" },
-      { pts: hourly("60"), color: "#3fa9ff", dots: true, r: 2 }, { pts: hourly("120"), color: "#b48cff", dots: true, r: 2 }] });
-    // commands per unit
+      marks: split && show.has("bt") ? [{ t: ms(split), left: "trained on ←", right: "→ tested on" }] : [], series: tSeries });
+    const needHz = show.has("bt") || show.has("pred");
+    // 2. prediction error by hour, at one horizon, against "nothing changes" at the same horizon
+    const A = ((h.accuracy || {})[rid] || {})[hz] || [];
+    const accChart = this._tsChart({ t0, t1: now, now, zero: true, H: 150, fmt: v => v.toFixed(1) + "°", series: [
+      { pts: A.map(([t, , b]) => [ms(t) + 1800e3, b]), color: "#667085", dash: "4 4" },
+      { pts: A.map(([t, r]) => [ms(t) + 1800e3, r]), color: "#3fa9ff", width: 2 },
+      { pts: A.map(([t, r]) => [ms(t) + 1800e3, r]), color: "#3fa9ff", dots: true, r: 2 }] });
+    // 3. commands per unit: what the unit was set to and its mode; the controllers' commands on request
     const units = Object.keys(h.units || {});
     if (!units.includes(this._mUnit)) this._mUnit = units[0];
     const uid = this._mUnit;
     const unitTabs = `<div class="rc-seg">${units.map(u => `<button data-mx="unit" data-u="${u}" class="${u === uid ? "on" : ""}">${(h.units[u] || u).replace(/ (air handler|minisplit)$/i, "")}</button>`).join("")}</div>`;
     const U = i => S.filter(x => x.u[uid] && x.u[uid][i] != null).map(x => [ms(x.t), x.u[uid][i]]);
-    const cmdChart = this._tsChart({ t0, t1: now, now, fmt: v => v.toFixed(0) + "°",
-      strips: [{ label: "model", segs: segs(x => (x.u[uid] || [])[4]) }, { label: "today", segs: segs(x => (x.u[uid] || [])[2]) },
-               { label: "unit", segs: segs(x => (x.u[uid] || [])[0]) }],
-      series: [{ pts: U(1), color: "#e6edf7", step: true, width: 2 }, { pts: U(3), color: "#3de0a5", step: true, dash: "5 3" },
-               { pts: U(5), color: "#b48cff", step: true, width: 2.5 }] });
-    // comfort score
+    const cSeries = [{ pts: U(1), color: "#e6edf7", step: true, width: 2 }];
+    const cStrips = [{ label: "unit", segs: segs(x => (x.u[uid] || [])[0]) }];
+    if (show.has("today")) { cSeries.push({ pts: U(3), color: "#3de0a5", step: true, dash: "5 3" }); cStrips.push({ label: "ours", segs: segs(x => (x.u[uid] || [])[2]) }); }
+    if (show.has("model")) { cSeries.push({ pts: U(5), color: "#b48cff", step: true, width: 2 }); cStrips.push({ label: "model", segs: segs(x => (x.u[uid] || [])[4]) }); }
+    const cmdChart = this._tsChart({ t0, t1: now, now, fmt: v => v.toFixed(0) + "°", strips: cStrips, series: cSeries });
+    // 4. comfort score
     const C = h.comfort || [];
-    const comfortChart = this._tsChart({ t0, t1: now, now, zero: true, H: 170, fmt: v => v.toFixed(1), series: [
+    const comfortChart = this._tsChart({ t0, t1: now, now, zero: true, H: 150, fmt: v => v.toFixed(1), series: [
       { pts: C.filter(c => c[1] != null).map(c => [ms(c[0]), c[1]]), color: "#e6edf7", width: 2 },
-      { pts: C.filter(c => c[2] != null).map(c => [ms(c[0]), c[2]]), color: "#b48cff", width: 2 }] });
-    const lg = items => `<div class="rc-legend" style="justify-content:flex-start;gap:14px;flex-wrap:wrap">${items.map(([c, t, k]) => `<span><b style="color:${c}">${k || "—"}</b> ${t}</span>`).join("")}</div>`;
+      ...(show.has("mcomfort") ? [{ pts: C.filter(c => c[2] != null).map(c => [ms(c[0]), c[2]]), color: "#b48cff", width: 2 }] : [])] });
     return `<div class="rc-sect"><h4>History</h4>${ranges}
-      <h4 style="margin-top:10px">Temperature: predicted vs actual, and the next 2 hours</h4>${roomTabs}${tempChart}
-      <div class="rc-seg" style="margin-top:6px">${[["60", "Backtest 1 h ahead"], ["120", "Backtest 2 h ahead"]].map(([k, l]) =>
-        `<button data-mx="bt" data-k="${k}" class="${btMode === k ? "on" : ""}">${l}</button>`).join("")}</div>
-      ${lg([["#e6edf7", "actual"], ["#ffb454", `latest model run over the logged past, ${btMode === "60" ? "1 h" : "2 h"} ahead (backtest)`],
-            ["#3fa9ff", "model said 1 h before (live)", "●"], ["#b48cff", "said 2 h before (live)", "●"],
-            ["#3de0a5", "next 2 h if the model were in charge", "- -"], ["#9aa7b8", "next 2 h if settings stay", "··"], ["#3de0a5", "comfort band", "▒"]])}
-      <h4 style="margin-top:14px">Prediction error by hour · ${name(rid)}</h4>${accChart}
-      ${lg([["#3fa9ff", "1 h ahead"], ["#b48cff", "2 h ahead"], ["#667085", "'nothing changes', 2 h", "- -"]])}
-      <p class="rc-sub" style="margin:2px 0 0">Typical miss (°F) of predictions scored in each hour. Below the grey line = better than assuming nothing changes.</p>
-      <h4 style="margin-top:14px">Commands</h4>${unitTabs}${cmdChart}
-      ${lg([["#b48cff", "model would set"], ["#3de0a5", "today's controller set", "- -"], ["#e6edf7", "unit actually at"],
-            ["#ff7a45", "heat", "■"], ["#3fa9ff", "cool", "■"], ["#667085", "off / no change", "■"]])}
+      <h4 style="margin-top:10px">Temperature · ${name(rid)}</h4>${roomTabs}${tempChart}
+      ${lg([["#e6edf7", "actual"], ["#3de0a5", "comfort band", "▒"],
+            show.has("plan") && ["#3de0a5", "next 2 h if the model were in charge", "- -"],
+            show.has("stay") && ["#9aa7b8", "next 2 h if settings stay", "··"],
+            show.has("pred") && ["#3fa9ff", `what the model said ${hzTxt} before`, "●"],
+            show.has("bt") && ["#ffb454", `latest model over the logged past, ${hzTxt} ahead`]])}
+      <p class="rc-sub" style="margin:6px 0 2px">Also show:</p>
+      ${chips([["plan", "Model's plan"], ["stay", "If settings stay"], ["pred", "Live predictions"], ["bt", "Backtest"]])}
+      ${needHz ? hzSeg : ""}
+      <h4 style="margin-top:14px">How far off the model was · ${name(rid)}, ${hzTxt} ahead</h4>${accChart}
+      ${lg([["#3fa9ff", "model's typical miss"], ["#667085", "assuming nothing changes", "- -"]])}
+      <p class="rc-sub" style="margin:2px 0 0">Per hour. Blue under grey = the model is beating the simple guess.</p>
+      ${needHz ? "" : hzSeg}
+      <h4 style="margin-top:14px">Unit setpoint and mode</h4>${unitTabs}${cmdChart}
+      ${lg([["#e6edf7", "setpoint the unit was at"], ["#ff7a45", "heat", "■"], ["#3fa9ff", "cool", "■"], ["#667085", "off / idle", "■"],
+            show.has("today") && ["#3de0a5", "Room Climate's command", "- -"], show.has("model") && ["#b48cff", "model would set"]])}
+      ${chips([["today", "Room Climate's command"], ["model", "Model would set"]])}
       <h4 style="margin-top:14px">Comfort score (lower is better)</h4>${comfortChart}
-      ${lg([["#e6edf7", "actual, over the following 2 h (today's controller)"], ["#b48cff", "model's prediction for its own plan"]])}
-      <p class="rc-sub" style="margin:2px 0 0">Priority-weighted misses outside the comfort band, per hour (the cost both controllers minimize). The actual line stops 2 h before now, since those 2 hours aren't over yet.</p></div>`;
+      ${lg([["#e6edf7", "actual, over the following 2 h"], show.has("mcomfort") && ["#b48cff", "model's prediction for its own plan"]])}
+      ${chips([["mcomfort", "Model's predicted score"]])}
+      <p class="rc-sub" style="margin:2px 0 0">Priority-weighted misses outside the comfort band, per hour. The line stops 2 h before now, since those hours aren't over yet.</p></div>`;
   }
 
   /* ---------- schedule editor (modal) ---------- */
