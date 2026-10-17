@@ -22,7 +22,7 @@ small room that overshoots by several degrees and can flip the whole house betwe
 setpoint is placed relative to its rooms' reading every minute:
 `setpoint = reading + kp × (target − predicted reading) + integral`, at most 2 °F past the room, with the reading
 predicted 10 min ahead from its trend. Once the room is on track to pass the target by 0.5 °F the setpoint goes 2 °F
-behind the reading so the unit stops; it restarts 0.3 °F short. The gain comes from the model's learned effect of the
+behind the reading so the unit stops; it restarts 0.6 °F short. The gain comes from the model's learned effect of the
 unit on its own rooms (a powerful unit in a small room gets a small gain; never above 1), the integral covers a cold
 night's steady load, and setpoints move at most every 5 minutes on the unit's 0.5 °C grid. The model-based controller
 plans *targets* and runs the same loop in its simulation, so its predictions match what is sent.

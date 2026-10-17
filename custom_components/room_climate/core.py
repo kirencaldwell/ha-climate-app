@@ -105,7 +105,7 @@ class Settings:
     drive_max_push: float = 2.0  # setpoint at most this far past the room reading: limits the blast of hot/cold air
     drive_stop_push: float = 2.0  # setpoint this far behind the reading to make the unit stop (it idles ~1 C past it)
     drive_off: float = 0.5  # stop the unit once the room is predicted this far past target
-    drive_restart: float = 0.3  # once stopped, restart only when the room is predicted this far short of target
+    drive_restart: float = 0.6  # once stopped, restart only when the room is predicted this far short of target
     drive_slope_s: int = 600  # the room's rate of change from this much history
     drive_min_interval_s: int = 300  # at most one setpoint change per unit this often (starts and stops excepted)
     drive_min_change: float = 0.7  # ignore setpoint moves smaller than this (most of a 0.5 C step)
