@@ -820,6 +820,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             vol.Required("priority"): vol.All(int, vol.Range(min=1, max=5))})],
         vol.Optional("hold_temp"): vol.Any(None, vol.Coerce(float)),
         vol.Optional("hold_hours"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("sensor"): vol.Any(None, vol.Match(r"^(sensor|climate)\.[a-z0-9_]+$")),
     })
     @websocket_api.async_response
     async def ws_set_room(hass, connection, msg):
@@ -827,7 +828,14 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         if room is None:
             connection.send_error(msg["id"], "not_found", "unknown room")
             return
-        for k in ("priority", "default_temp", "schedule", "priority_schedule", "hold_temp"):
+        if msg.get("sensor") and hass.states.get(msg["sensor"]) is None:
+            connection.send_error(msg["id"], "not_found", f"no entity {msg['sensor']}")
+            return
+        if "sensor" in msg and msg["sensor"] != room.get("sensor"):
+            _LOGGER.info("%s sensor %s -> %s", room["id"], room.get("sensor"), msg["sensor"])
+            mgr.last_good.pop(room["id"], None)  # a different sensor: don't bridge from the old one's reading
+            mgr.hist.pop(room["id"], None)
+        for k in ("priority", "default_temp", "schedule", "priority_schedule", "hold_temp", "sensor"):
             if k in msg:
                 room[k] = msg[k]
         if "hold_hours" in msg:
