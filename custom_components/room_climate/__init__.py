@@ -81,6 +81,7 @@ class Manager:
         self.last_good: dict[str, tuple] = {}  # room id -> (temp F, reading time, last seen) to bridge sensor dropouts
         self.prev_busy: set = set()
         self.sent: dict = {}  # unit id -> (last setpoint command, when); for thermostat units, what we would have sent
+        self._house_restored = False  # the house mode is taken from the units on the first tick (_restore_house)
         self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
         self.zone_hist: dict[str, deque] = {}  # unit id -> [(time, its rooms' weighted reading)] for the loop's rate
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
@@ -284,6 +285,29 @@ class Manager:
             self.fit_state.update(running=False, finished=dt_util.now().isoformat(),
                                   seconds=round(time.monotonic() - t0, 1))
 
+    def _restore_house(self, units: list, now):
+        """After a restart, carry on in the mode the units we control are in. The house mode isn't stored, and starting
+        from "off" left them on their old setpoints, unmanaged, until a room asked for enough (Bedroom 3's unit kept
+        cooling a 66 F room for 45 min). Done once, when every unit we control reports a mode; only if they agree."""
+        ours = [u for u in units if self.control(u.id) in OURS]
+        if not ours:
+            self._house_restored = True
+            return
+        modes = []
+        for u in ours:
+            cur = self.hass.states.get(u.entity)
+            if cur is None or cur.state in BAD_STATES:
+                return  # not reported yet: try again next tick
+            modes.append(cur.state)
+        self._house_restored = True
+        if len(set(modes)) == 1 and modes[0] in ("heat", "cool"):
+            # How long it's been in this mode isn't known: no minimum-time hold, just the usual switch confirmation.
+            self.house = core.HouseState(modes[0], None)
+            for u in ours:
+                st = self.states.get(u.id, core.UnitState())
+                self.states[u.id] = core.UnitState(modes[0], now, modes[0], st.active)
+            _LOGGER.info("house mode %s restored from the units after a restart", modes[0])
+
     def drive_kp(self, unit_id: str, mode: str, rooms: list, settings: core.Settings) -> float:
         """Outer-loop gain for a unit, from the model's learned effect of the unit on its own rooms (core.drive_gain)."""
         m = self.shadow.model
@@ -446,6 +470,8 @@ class Manager:
                         self.hist[r.id] = self.hist[r.id][-1:]
                         predicted[r.id] = None
         self.prev_busy = busy
+        if not self._house_restored:
+            self._restore_house(units, now)
         house = self.house
         cmds, new_house, info = core.control_step(
             units, rooms, readings, predicted, {u.id: self._unit_temp(u.entity) for u in units},
