@@ -1,4 +1,5 @@
 """Thermal model, optimizer and coupled simulator (no numpy needed). Run: python3 tests/test_model.py"""
+import dataclasses
 import os
 import sys
 from datetime import datetime, timedelta
@@ -126,15 +127,19 @@ def test_sim_mpc_avoids_the_heuristics_zone_conflict_flip_flop():
         {"id": "bedroom_3", "unit": "minisplit_2", "priority": 4, "default_temp": 67}],
         "units": [{"id": u} for u in truth.units], "settings": {"floor": 63.0}}
     rooms, units = coupled.rooms_units_from_config(cfg, truth)
-    s = coupled.settings_from_config(cfg)
     start = datetime(2026, 10, 16)
     w = lambda: coupled.Weather(start, 2, mean=52, seed=4)
-    heur = coupled.run(truth, rooms, units, coupled.HeuristicController(rooms, units, s), start, 1, w(), s, seed=4)
-    mpc = coupled.run(truth, rooms, units, coupled.MPCController(rooms, units, truth, s), start, 1, w(), s, seed=4)
-    assert heur["mode_switches"] >= 4  # heating for the zone overheats the kitchen -> cool -> zone cold -> heat ...
-    assert mpc["mode_switches"] <= heur["mode_switches"] / 3
-    assert mpc["discomfort"] <= heur["discomfort"] * 1.25
-    assert mpc["energy_unit_h"] < heur["energy_unit_h"]
+    for drive in (False, True):  # with the old fixed setpoints, and with the outer loop under both controllers
+        s = dataclasses.replace(coupled.settings_from_config(cfg), drive=drive)
+        heur = coupled.run(truth, rooms, units, coupled.HeuristicController(rooms, units, s), start, 1, w(), s, seed=4)
+        mpc = coupled.run(truth, rooms, units, coupled.MPCController(rooms, units, truth, s), start, 1, w(), s, seed=4)
+        if not drive:
+            old = heur
+            assert heur["mode_switches"] >= 4  # heating for the zone overheats the kitchen -> cool -> zone cold -> heat
+        assert mpc["mode_switches"] <= old["mode_switches"] / 3, (drive, mpc)
+        assert mpc["discomfort"] <= heur["discomfort"] * 1.25, (drive, mpc, heur)
+        assert mpc["energy_unit_h"] < old["energy_unit_h"], (drive, mpc)
+    assert heur["mode_switches"] <= old["mode_switches"] / 3, heur  # the outer loop alone ends the flip-flop
 
 
 def test_plan_errs_cool_when_it_has_to_miss():

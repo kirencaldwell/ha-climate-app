@@ -630,3 +630,85 @@ def test_heating_aims_half_a_degree_cool_and_ties_round_down():
         cool = core.unit_command(u, [r], {"r": (target, MON)}, {}, "cool", None, UnitState("cool"), MON, Settings())
         assert heat.setpoint == want and cool.setpoint == target, (target, heat.setpoint, cool.setpoint)
     assert core.round_cool(66.5) == 66 and core.round_cool(66.51) == 67 and core.round_cool(67.49) == 67
+
+
+# --- the outer loop (core.drive) ---
+
+def _drv(room, target, mode="heat", rate=None, st=None, t=MON, kp=1.0, s=Settings()):
+    cmd = core.Command(mode, None, "", True, None, target, room, 0.0)
+    return core.drive(cmd, st, rate, kp, Unit("u", "climate.u"), t, s)
+
+
+def test_drive_starts_gently_from_the_room_not_the_target():
+    cmd, st, changed = _drv(64.0, 67.0)
+    assert changed and st.on and cmd.active
+    assert 64.0 + 0.4 < cmd.setpoint <= 64.0 + Settings().drive_max_push + 0.5  # a couple of degrees past the room
+    assert cmd.setpoint < 67.0 - 0.4  # not the target: the old controller's 3 F blast
+    assert cmd.setpoint == core.to_grid(cmd.setpoint)  # on the unit's 0.5 C grid
+    near, _, _ = _drv(66.5, 67.0)
+    assert near.raw - 66.5 < cmd.raw - 64.0  # a small miss gets a small push
+    soft, _, _ = _drv(64.0, 67.0, kp=0.3)  # a unit that heats its room fast gets a small gain
+    assert soft.raw - 64.0 < 1.0
+    cool, _, _ = _drv(70.0, 67.0, "cool")
+    assert 70.0 - Settings().drive_max_push - 0.5 <= cool.setpoint < 70.0 - 0.4  # mirrored for cooling
+
+
+def test_drive_stops_before_an_overshoot_and_restarts_with_hysteresis():
+    s = Settings()
+    _, st, _ = _drv(65.0, 67.0)
+    # 0.3 short of target but rising 6 F/h: in 10 min it'll be 0.7 past -> stop now, with a setpoint the unit obeys
+    cmd, st, changed = _drv(66.7, 67.0, rate=6.0, st=st, t=MON + timedelta(minutes=5))
+    assert changed and not st.on and cmd.setpoint <= 66.7 - 1.5 and "easing off" in cmd.reason
+    t = MON + timedelta(minutes=6)
+    cmd2, st, changed = _drv(66.9, 67.0, rate=0.0, st=st, t=t)  # only just short now: stays stopped
+    assert not st.on and cmd2.setpoint == cmd.setpoint and not changed
+    cmd3, st, changed = _drv(67.0 - s.drive_restart - 0.1, 67.0, rate=0.0, st=st, t=t + timedelta(minutes=1))
+    assert st.on and changed and cmd3.setpoint > 66.5  # far enough short again: restart at once
+
+
+def test_drive_holds_small_and_frequent_changes():
+    cmd, st, _ = _drv(64.0, 67.0, kp=0.5)
+    c2, st2, changed = _drv(64.18, 67.0, st=st, t=MON + timedelta(minutes=1), kp=0.5)
+    assert not changed and c2.setpoint == cmd.setpoint
+    c3, st3, changed = _drv(65.5, 67.0, st=st2, t=MON + timedelta(minutes=2), kp=0.5)  # a real move, but too soon
+    assert not changed and c3.setpoint == cmd.setpoint
+    c4, _, changed = _drv(65.5, 67.0, st=st3, t=MON + timedelta(minutes=6), kp=0.5)
+    assert changed and c4.setpoint > cmd.setpoint  # the setpoint follows the room up
+
+
+def test_drive_integral_builds_while_short_is_capped_and_resets_on_mode_change():
+    s = Settings()
+    st, t = None, MON
+    for k in range(48):  # 4 h stuck 0.5 short (a cold night the unit can't quite keep up with)
+        _, st, _ = _drv(66.5, 67.0, st=st, t=t)
+        t += timedelta(minutes=5)
+    assert 0.5 < st.i <= s.drive_i_max
+    cmd, _, _ = _drv(66.5, 67.0, st=st, t=t)
+    fresh, _, _ = _drv(66.5, 67.0)
+    assert cmd.raw > fresh.raw + 0.4  # pushes harder than a fresh loop would
+    _, st, _ = _drv(66.5, 67.0, "cool", st=st, t=t)
+    assert st.i == 0.0 and st.mode == "cool"
+
+
+def test_drive_gain_follows_the_units_learned_effect():
+    s = Settings()
+    assert core.drive_gain(None, s) == s.drive_kp and core.drive_gain(0.0, s) == s.drive_kp
+    weak, strong = core.drive_gain(1.0, s), core.drive_gain(15.0, s)
+    assert weak > strong and strong == s.drive_kp_min and weak == s.drive_kp_max  # clamped both ways
+    mid = core.drive_gain(6.0, s)
+    assert s.drive_kp_min < mid < s.drive_kp_max
+
+
+def test_drive_off_or_no_target_holds_the_last_setpoint():
+    cmd, st, _ = _drv(65.0, 67.0)
+    held, st2, changed = core.drive(core.Command("heat", None, "no fresh sensors; holding setpoint"), st, None, 1.0,
+                                    Unit("u", "climate.u"), MON + timedelta(minutes=1))
+    assert held.setpoint == cmd.setpoint and not changed
+    off, _, changed = core.drive(core.Command("off", None, "house comfortable"), st, None, 1.0, Unit("u", "climate.u"), MON)
+    assert off.setpoint is None and changed
+
+
+def test_slope_needs_enough_history():
+    h = [(MON + timedelta(minutes=k), 66.0 + 0.1 * k) for k in range(11)]
+    assert abs(core.slope(h, h[-1][0], 600) - 6.0) < 1e-9
+    assert core.slope(h[:2], h[1][0], 600) is None

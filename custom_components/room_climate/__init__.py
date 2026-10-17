@@ -81,6 +81,8 @@ class Manager:
         self.last_good: dict[str, tuple] = {}  # room id -> (temp F, reading time, last seen) to bridge sensor dropouts
         self.prev_busy: set = set()
         self.sent: dict = {}  # unit id -> (last setpoint command, when); for thermostat units, what we would have sent
+        self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
+        self.zone_hist: dict[str, deque] = {}  # unit id -> [(time, its rooms' weighted reading)] for the loop's rate
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
         self._ours: list[str] = []  # context ids of our recent service calls
         self._audit_seen: dict[str, tuple] = {}
@@ -282,6 +284,15 @@ class Manager:
             self.fit_state.update(running=False, finished=dt_util.now().isoformat(),
                                   seconds=round(time.monotonic() - t0, 1))
 
+    def drive_kp(self, unit_id: str, mode: str, rooms: list, settings: core.Settings) -> float:
+        """Outer-loop gain for a unit, from the model's learned effect of the unit on its own rooms (core.drive_gain)."""
+        m = self.shadow.model
+        if m is None or unit_id not in m.units:
+            return settings.drive_kp
+        eff = [(m.rooms[r.id].heat if mode == "heat" else m.rooms[r.id].cool).get(unit_id, 0.0)
+               for r in rooms if r.unit == unit_id and r.id in m.rooms]
+        return core.drive_gain(sum(eff) / len(eff) if eff else None, settings, m.units[unit_id].k1)
+
     def control(self, unit_id: str) -> str:
         ud = next((u for u in self.data["units"] if u["id"] == unit_id), {})
         return ud.get("control", THERMOSTAT)
@@ -309,6 +320,7 @@ class Manager:
                 raise ValueError("the model isn't ready to control units: " + "; ".join(reasons))
         ud["control"] = control
         self.sent.pop(unit_id, None)  # taking over: send our setpoint now, not after the change interval
+        self.drives.pop(unit_id, None)
         _LOGGER.info("%s control -> %s (%s)", unit_id, control, why)
         await self.async_save()
         async_dispatcher_send(self.hass, SIGNAL_CONTROL, unit_id)
@@ -446,22 +458,40 @@ class Manager:
         self._tick_debug = (readings, predicted, info, settings)
         sent = self.sent
         for u in units:
-            # Keep setpoints steady (inverter efficiency): small or too-frequent changes hold the previous one.
-            cmd, changed = core.stabilize(cmds[u.id], sent.get(u.id), now, settings)
+            ctl = self.control(u.id)
+            c = cmds[u.id]
+            if ctl == MODEL:
+                d = self.shadow.decision.get(u.id) or {}
+                reason = "model: " + (self.shadow.plan.reason if self.shadow.plan else "")
+                if d.get("mode") in ("heat", "cool") and settings.drive and d.get("target") is not None:
+                    # the model picks the target; the same outer loop as today's controller sets the setpoint
+                    c = core.Command(d["mode"], None, reason, True, None, d["target"], c.room, c.offset)
+                elif d.get("mode") in ("heat", "cool"):
+                    c = core.Command(d["mode"], d.get("setpoint"), reason, True, d.get("setpoint"))
+                else:
+                    c = core.Command(states.get(u.id, core.UnitState()).mode, None, "model: no change needed")
+            if settings.drive and c.mode in ("heat", "cool") and c.target is not None:
+                # Outer loop: the setpoint follows the room, pushing gently and stopping before an overshoot.
+                h = self.zone_hist.setdefault(u.id, deque())
+                if c.room is not None and (not h or core.elapsed(now, h[-1][0]) >= 30):
+                    h.append((now, c.room))
+                while h and core.elapsed(now, h[0][0]) > 2 * settings.drive_slope_s:
+                    h.popleft()
+                cmd, self.drives[u.id], changed = core.drive(
+                    c, self.drives.get(u.id), core.slope(list(h), now, settings.drive_slope_s),
+                    self.drive_kp(u.id, c.mode, rooms, settings), u, now, settings)
+                if ctl == MODEL:
+                    cmd.reason = f"{c.reason} -> {cmd.reason}"
+            elif ctl == MODEL:
+                cmd, changed = c, False
+            else:
+                # Keep setpoints steady (inverter efficiency): small or too-frequent changes hold the previous one.
+                cmd, changed = core.stabilize(c, sent.get(u.id), now, settings)
             if changed and cmd.setpoint is not None:
                 sent[u.id] = (cmd, now)
             state = states.setdefault(u.id, core.UnitState())
             self.last[u.id] = cmd
-            ctl = self.control(u.id)
             ours = ctl in OURS
-            if ctl == MODEL:
-                d = self.shadow.decision.get(u.id) or {}
-                if d.get("mode") in ("heat", "cool"):
-                    reason = "model: " + (self.shadow.plan.reason if self.shadow.plan else "")
-                    cmd = core.Command(d["mode"], d.get("setpoint"), reason, True, d.get("setpoint"))
-                else:
-                    cmd = core.Command(state.mode, None, "model: no change needed")  # never switches a unit off
-                self.last[u.id] = cmd
             if ours:
                 await self._send(u, state, cmd)
             self._audit(u, cmd, ours, now)
@@ -506,7 +536,7 @@ class Manager:
             self._shadow_busy = True
             try:
                 await self.hass.async_add_executor_job(self.shadow.run, now, rooms, units, temps, actual, outdoor_ahead,
-                                                       sun_at, settings, ignore, fixed)
+                                                       sun_at, settings, ignore, fixed, dict(self.drives))
             finally:
                 self._shadow_busy = False
 
@@ -527,6 +557,7 @@ class Manager:
             cmd, cur = self.last.get(ud["id"]), self.hass.states.get(ud["entity"])
             today[ud["id"]] = {"name": ud.get("name") or ud["id"], "control": self.control(ud["id"]),
                                "mode": cmd.mode if cmd else None, "setpoint": cmd.setpoint if cmd else None,
+                               "target": None if cmd is None or cmd.target is None else round(cmd.target, 1),
                                "actual_mode": cur.state if cur is not None else None,
                                "actual_setpoint": cur.attributes.get("temperature") if cur is not None else None}
         m = self.shadow.model

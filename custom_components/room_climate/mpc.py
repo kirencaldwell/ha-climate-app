@@ -78,6 +78,8 @@ class ShadowPlanner:
         self.errors: deque = deque()  # (t_eval, room, horizon_min, model_err, nochange_err)
         self.points: deque = deque()  # (t_eval, room, horizon_min, predicted F): for charts
         self.readings: dict = {}  # room -> deque[(t, F)]
+        self.lagged: dict = {}  # unit id -> effective output now (model.step), followed from what the units really do
+        self.targets: dict = {}  # unit id -> target last planned (with the outer loop)
 
     def set_model(self, m: hm.HouseModel):
         """Use a (re)fitted model. Accuracy history is kept: a nightly refit changes the model a little, has passed its
@@ -98,13 +100,15 @@ class ShadowPlanner:
         if self.model is None or actual is None:
             return
         try:
+            self._follow_lag(now, temps, actual)
             self._advance(now, temps, actual, outdoor, sun)
             if self.next_track is None or now >= self.next_track:
                 self.next_track = now + self.track_every
                 start = {r: temps[r] for r in self.model.rooms if temps.get(r) is not None}
                 if start:
                     self.records.append({"t0": now, "t": now, "start": start, "temps": dict(start), "done": set(),
-                                         "running": {u: bool(a.get("running")) for u, a in actual.items()}})
+                                         "running": {u: bool(a.get("running")) for u, a in actual.items()},
+                                         "lagged": dict(self.lagged)})
         except Exception as e:  # never let the model take the integration down; show it instead
             self.error = f"{type(e).__name__}: {e}"
         while self.records and now - self.records[0]["t0"] > timedelta(minutes=max(HORIZONS_MIN) + 10):
@@ -112,9 +116,31 @@ class ShadowPlanner:
         while self.errors and now - self.errors[0][0] > self.keep:
             self.errors.popleft()
 
+    def _follow_lag(self, now, temps, actual):
+        """Each unit's effective output now: its estimated output (running or not, and how hard from its setpoint gap)
+        through its learned lag, so a plan made just after a unit stops knows the room will coast on."""
+        last = getattr(self, "_lag_at", None)
+        dt_h = 0.0 if last is None else max(0.0, min(0.5, (now - last).total_seconds() / 3600))
+        self._lag_at = now
+        for uid, u in self.model.units.items():
+            a = actual.get(uid) or {}
+            mode = a.get("mode")
+            y = 0.0
+            if a.get("running") and mode in ("heat", "cool"):
+                rd, sp = hm.unit_reading(self.model, uid, temps), a.get("setpoint")
+                y = 1.0
+                if rd is not None and sp is not None:
+                    err = (sp - rd) if mode == "heat" else (rd - sp)
+                    y = max(u.ymin, min(1.0, u.k0 + u.k1 * err))
+                y = y if mode == "heat" else -y
+            self.lagged[uid] = hm.lag(u, self.lagged.get(uid, y), y, dt_h)
+
     def _advance(self, now, temps, actual, outdoor, sun):
         modes = {u: (a.get("mode") if a.get("mode") in ("heat", "cool") else "off") for u, a in actual.items()}
         sps = {u: a.get("setpoint") for u, a in actual.items()}
+        # Whether each compressor ran is replayed too, not re-simulated: with units that cycle, a hair of temperature
+        # error would otherwise shift every simulated start and stop and swamp the score.
+        ran = {u: bool(a.get("running")) for u, a in actual.items()}
         for rec in self.records:
             if len(rec["done"]) == len(HORIZONS_MIN):
                 continue
@@ -122,7 +148,7 @@ class ShadowPlanner:
             n = max(1, int(dt * 60 / 2 + 0.999))  # steps of at most 2 min (ticks can be sparse)
             for _ in range(n if dt > 0 else 0):
                 rec["temps"], rec["running"], _ = hm.step(self.model, rec["temps"], outdoor, sun, modes, sps,
-                                                          rec["running"], dt / n)
+                                                          ran, dt / n, rec.setdefault("lagged", {}), hold=True)
             rec["t"] = now
             age = (now - rec["t0"]).total_seconds() / 60
             for h in HORIZONS_MIN:
@@ -143,15 +169,15 @@ class ShadowPlanner:
 
     # --- heavy part (executor) ---
     def run(self, now: datetime, rooms: list, units: list, temps: dict, actual: dict, outdoor, sun_at,
-            settings: core.Settings, ignore=(), fixed=None):
+            settings: core.Settings, ignore=(), fixed=None, drives=None):
         """Plan, if due. actual: unit id -> {"mode", "setpoint" (F), "running"}; outdoor: F now, or outdoor(datetime) ->
         F from a forecast; sun_at(datetime) -> 0..1; fixed: unit id -> (mode, setpoint) for units on their own
-        thermostats (planned around, not for)."""
+        thermostats (planned around, not for); drives: unit id -> core.DriveState, the outer loops as they are now."""
         if self.model is None or not (self.next_plan is None or now >= self.next_plan):
             return
         self.next_plan = now + self.plan_every
         try:
-            self._plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {})
+            self._plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {}, drives or {})
             self._project(now, temps, actual, outdoor, sun_at)
             self.error = None
         except Exception as e:  # never let the model take the integration down; show it instead
@@ -165,21 +191,25 @@ class ShadowPlanner:
         modes = {u: (a.get("mode") if a.get("mode") in ("heat", "cool") else "off") for u, a in actual.items()}
         traj, _, _ = hm.rollout(self.model, dict(start), modes, {u: a.get("setpoint") for u, a in actual.items()},
                                 {u: bool(a.get("running")) for u, a in actual.items()}, _seq(outdoor, times),
-                                [sun_at(t) for t in times], step_min / 60, substeps=2)
+                                [sun_at(t) for t in times], step_min / 60, substeps=2, lagged=dict(self.lagged))
         self.projection = {"at": now.isoformat(), "temps": {
             r: [[t.isoformat(), round(step[r], 2)] for t, step in zip(times, traj)] for r in start}}
 
-    def _plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed):
+    def _plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed, drives):
         ps = self.ps
         n = int(round(ps.horizon_h * 60 / ps.step_min))
         times = [now + timedelta(minutes=ps.step_min * k) for k in range(n)]
         running = {u: bool(a.get("running")) for u, a in actual.items()}
-        now_sp = {u.id: (self.sent[u.id][0].setpoint if u.id in self.sent else actual.get(u.id, {}).get("setpoint"))
-                  for u in units}
+        if settings.drive:  # what's planned is each unit's target; moving it is what the change cost charges
+            now_sp = {u.id: self.targets.get(u.id) for u in units}
+        else:
+            now_sp = {u.id: (self.sent[u.id][0].setpoint if u.id in self.sent else actual.get(u.id, {}).get("setpoint"))
+                      for u in units}
         t0 = time.perf_counter()
         p = optimizer.plan(self.model, rooms, units, temps, now, self.house, now_sp, running, _seq(outdoor, times),
-                           [sun_at(t) for t in times], settings, ps, ignore=set(ignore), fixed=fixed)
-        setpoints = p.setpoints
+                           [sun_at(t) for t in times], settings, ps, ignore=set(ignore), fixed=fixed,
+                           drives=drives if settings.drive else None, lagged=dict(self.lagged))
+        setpoints, first = p.setpoints, p.first
         forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)
         if forced and self.house.mode != forced:
             self.house = core.HouseState(forced, now)  # a unit on its own thermostat sets the shared mode
@@ -191,6 +221,7 @@ class ShadowPlanner:
             self.house, _ = core.choose_mode(benefit if want == "heat" else 0.0, benefit if want == "cool" else 0.0,
                                              self.house, now, settings)
             setpoints = p.by_mode.get(self.house.mode, {}).get("setpoints", {})
+            first = p.by_mode.get(self.house.mode, {}).get("first", {})
         elif p.mode != self.house.mode:
             self.house = core.HouseState(p.mode, now)
         self.decision = {}
@@ -201,6 +232,12 @@ class ShadowPlanner:
             sp = setpoints.get(u.id)
             if self.house.mode not in ("heat", "cool"):
                 self.decision[u.id] = {"mode": "off", "setpoint": None}
+                continue
+            if settings.drive:
+                # The plan is a target; the integration's outer loop turns it into setpoints. Shown: the setpoint it
+                # would send first.
+                self.targets[u.id] = sp
+                self.decision[u.id] = {"mode": self.house.mode, "target": sp, "setpoint": (first or {}).get(u.id)}
                 continue
             cmd = core.Command(self.house.mode, sp, p.reason, True, sp)
             cmd, changed = core.stabilize(cmd, self.sent.get(u.id), now, settings)

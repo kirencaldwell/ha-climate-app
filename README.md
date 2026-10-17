@@ -16,13 +16,25 @@ deadband (±1°F), stops at target, and respects minimum run/off times and a hea
 `target + (unit sensor − room sensor) ± 1`, so the unit's own thermostat chases the *room* temperature. Stale/missing
 sensors are ignored; with none, the unit is left alone.
 
+**Outer loop** (`core.drive`, on by default; `drive: false` restores fixed setpoints). Sending the target as the
+setpoint makes an inverter run hard until the room is a degree past it, and the coil keeps heating after it stops: in a
+small room that overshoots by several degrees and can flip the whole house between heat and cool. Instead each unit's
+setpoint is placed relative to its rooms' reading every minute:
+`setpoint = reading + kp × (target − predicted reading) + integral`, at most 2 °F past the room, with the reading
+predicted 10 min ahead from its trend. Once the room is on track to pass the target by 0.5 °F the setpoint goes 2 °F
+behind the reading so the unit stops; it restarts 0.3 °F short. The gain comes from the model's learned effect of the
+unit on its own rooms (a powerful unit in a small room gets a small gain; never above 1), the integral covers a cold
+night's steady load, and setpoints move at most every 5 minutes on the unit's 0.5 °C grid. The model-based controller
+plans *targets* and runs the same loop in its simulation, so its predictions match what is sent.
+
 ## Model-based control ("would do" mode: shown, not sent)
 A learned thermal model plus a model-predictive optimizer. HA refits the model every night at 3:40 on the last 14 days
 of the minute log; the optimizer plans every 5 minutes next to today's controller and its decisions are logged and
 shown on the card's **Model** page, with live prediction accuracy (30/60/120 min ahead, replaying what the units
 actually did, vs "nothing changes"), predicted-vs-actual charts and the learned room x unit sensitivities.
 - `custom_components/room_climate/model.py` – grey-box model: each room's loss to outdoors, sun gain, directed coupling
-  to other rooms (heat rising up the stairs), each unit's heating/cooling effect, and the units' own inverter loop.
+  to other rooms (heat rising up the stairs), each unit's heating/cooling effect and lag (a warm coil keeps heating
+  after the compressor stops), and the units' own inverter loop.
 - `custom_components/room_climate/optimizer.py` – every few minutes, tries heat/cool and setpoints (two blocks: now and
   later), simulates ~2 h ahead and minimizes Σ priority × (miss outside the comfort band)², plus charges for mode
   switches, setpoint moves and energy. Priorities and their schedules are the weights.

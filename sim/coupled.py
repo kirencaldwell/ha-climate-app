@@ -101,6 +101,7 @@ class CoupledSim:
         self.sp = {u: None for u in truth.units}
         self.running = {u: False for u in truth.units}
         self.output = {u: 0.0 for u in truth.units}
+        self.effect = {u: 0.0 for u in truth.units}  # output seen through each unit's lag (coil and ducts)
         self.room_step, self.unit_step, self.noise = room_step, unit_step, noise
         self.rng = random.Random(seed)
         self.starts = 0
@@ -139,8 +140,9 @@ class CoupledSim:
                 y, self.running[uid] = hm.unit_output(u, self.mode[uid], self.sp[uid], hm.unit_reading(self.m, uid, self.temps), was)
                 self.starts += (not was) and self.running[uid]
                 self.output[uid] = y
+                self.effect[uid] = hm.lag(u, self.effect[uid], y, 1 / 60)
                 self.energy += abs(y) / 60
-            d = hm.derivative(self.m, self.temps, self.weather.outdoor(self.now), self.weather.sun(self.now), self.output)
+            d = hm.derivative(self.m, self.temps, self.weather.outdoor(self.now), self.weather.sun(self.now), self.effect)
             for rid, v in d.items():
                 self.temps[rid] += v / 60
             self.now += timedelta(minutes=1)
@@ -164,6 +166,8 @@ class HeuristicController:
     def __init__(self, rooms, units, settings=core.Settings()):
         self.rooms, self.units, self.s = rooms, units, settings
         self.house, self.states, self.hist, self.sent, self.prev_busy, self.last_good = core.HouseState(), {}, {}, {}, set(), {}
+        self.drives, self.zone_hist = {}, {}
+        self.kp = {}  # unit id -> outer-loop gain (from a model's learned effects; default gain when empty)
 
     def tick(self, sim: CoupledSim, now: datetime):
         readings, predicted = {}, {}
@@ -188,7 +192,16 @@ class HeuristicController:
                                                    {u.id: sim.unit_temp(u.id) for u in self.units}, self.states, self.house,
                                                    now, self.s, {}, busy, sim.weather.outdoor(now))
         for u in self.units:
-            cmd, changed = core.stabilize(cmds[u.id], self.sent.get(u.id), now, self.s)
+            if self.s.drive:  # same outer loop as Manager.async_tick
+                c = cmds[u.id]
+                h = self.zone_hist.setdefault(u.id, [])
+                if c.room is not None:
+                    h.append((now, c.room))
+                    del h[:max(0, len(h) - 60)]
+                cmd, self.drives[u.id], changed = core.drive(c, self.drives.get(u.id), core.slope(h, now, self.s.drive_slope_s),
+                                                             self.kp.get(u.id, self.s.drive_kp), u, now, self.s)
+            else:
+                cmd, changed = core.stabilize(cmds[u.id], self.sent.get(u.id), now, self.s)
             if changed and cmd.setpoint is not None:
                 self.sent[u.id] = (cmd, now)
             state = self.states.setdefault(u.id, core.UnitState())
@@ -212,18 +225,49 @@ class MPCController:
                  every_min=10):
         self.rooms, self.units, self.m, self.s, self.ps, self.every = rooms, units, model, settings, ps, every_min
         self.house, self.sent, self.next_at, self.last_plan = core.HouseState(), {}, None, None
+        self.targets, self.drives, self.zone_hist = {}, {}, {}
+
+    def _drive(self, sim: CoupledSim, now: datetime):
+        """Every minute: the outer loop turns the planned targets into setpoints, as Manager.async_tick does."""
+        if self.house.mode not in ("heat", "cool"):
+            return
+        for u in self.units:
+            mine = [r for r in self.rooms if r.unit == u.id and r.id in sim.temps]
+            if not mine or self.targets.get(u.id) is None:
+                continue
+            res = core.weighted_error(mine, {r.id: (sim.reading(r.id), now) for r in mine}, now, self.s)
+            if res is None:
+                continue
+            room = res[1]
+            ut = sim.unit_temp(u.id)
+            off = 0.0 if ut is None else max(-self.s.max_offset, min(self.s.max_offset, ut - room))
+            h = self.zone_hist.setdefault(u.id, [])
+            h.append((now, room))
+            del h[:max(0, len(h) - 60)]
+            eff = [self.m.rooms[r.id].heat.get(u.id, 0.0) for r in mine if r.id in self.m.rooms]
+            kp = core.drive_gain(sum(eff) / len(eff) if eff else None, self.s)
+            cmd = core.Command(self.house.mode, None, "", True, None, self.targets[u.id], room, off)
+            cmd, self.drives[u.id], _ = core.drive(cmd, self.drives.get(u.id), core.slope(h, now, self.s.drive_slope_s),
+                                                   kp, u, now, self.s)
+            sim.command(u.id, cmd.mode, cmd.setpoint)
 
     def tick(self, sim: CoupledSim, now: datetime):
         if self.next_at is not None and now < self.next_at:
+            if self.s.drive:
+                self._drive(sim, now)
             return self.house.mode
         self.next_at = now + timedelta(minutes=self.every)
         temps = {r.id: sim.reading(r.id) for r in self.rooms if r.id in sim.temps and r.id in self.m.rooms}
         n = int(round(self.ps.horizon_h * 60 / self.ps.step_min))
         ts = [now + timedelta(minutes=self.ps.step_min * k) for k in range(n)]
         running = {u.id: sim.action(u.id) in ("heating", "cooling") for u in self.units}
-        now_sp = {u.id: (self.sent[u.id][0].setpoint if u.id in self.sent else None) for u in self.units}
+        if self.s.drive:
+            now_sp = dict(self.targets)
+        else:
+            now_sp = {u.id: (self.sent[u.id][0].setpoint if u.id in self.sent else None) for u in self.units}
         p = optimizer.plan(self.m, self.rooms, self.units, temps, now, self.house, now_sp, running,
-                           [sim.weather.outdoor(t) for t in ts], [sim.weather.sun(t) for t in ts], self.s, self.ps)
+                           [sim.weather.outdoor(t) for t in ts], [sim.weather.sun(t) for t in ts], self.s, self.ps,
+                           drives=dict(self.drives) if self.s.drive else None, lagged=dict(sim.effect))
         self.last_plan = p
         setpoints = p.setpoints
         if self.house.mode not in ("heat", "cool"):
@@ -238,6 +282,10 @@ class MPCController:
             setpoints = p.by_mode[self.house.mode]["setpoints"]
         elif p.mode != self.house.mode:
             self.house = core.HouseState(p.mode, now)
+        if self.s.drive:
+            self.targets = dict(setpoints)
+            self._drive(sim, now)
+            return self.house.mode
         for u in self.units:
             sp = setpoints.get(u.id)
             cmd = core.Command(self.house.mode, sp, p.reason, True, sp)

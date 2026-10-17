@@ -43,6 +43,9 @@ class UnitModel:
     ymin: float = 0.25
     start: float = 0.5
     stop: float = 1.0
+    # Its effect on the rooms lags its output by this time constant (h): a coil and ducts stay warm (or cold) and keep
+    # blowing a while after the compressor slows or stops, so a room goes on rising after its unit stops. Fitted.
+    lag_h: float = 0.0
 
 
 @dataclass
@@ -93,12 +96,15 @@ def unit_reading(m: HouseModel, unit_id: str, temps: dict):
     return None if not vals else sum(vals) / len(vals) + u.sensor_offset
 
 
-def unit_output(u: UnitModel, mode: str, setpoint, reading, running: bool):
-    """(signed output: + heating, - cooling, 0 idle; still running?) for one unit."""
+def unit_output(u: UnitModel, mode: str, setpoint, reading, running: bool, hold: bool = False):
+    """(signed output: + heating, - cooling, 0 idle; still running?) for one unit. `hold`: whether it runs is known
+    (replaying what a unit really did), so only how hard it runs is modelled."""
     if mode not in ("heat", "cool") or setpoint is None or reading is None:
         return 0.0, False
     err = (setpoint - reading) if mode == "heat" else (reading - setpoint)
-    if running and err < -u.stop:
+    if hold:
+        pass
+    elif running and err < -u.stop:
         running = False
     elif not running and err > u.start:
         running = True
@@ -131,14 +137,29 @@ def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict) -
     return out
 
 
-def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict, running: dict, dt_h: float):
+def lag(u: UnitModel, z: float, y: float, dt_h: float) -> float:
+    """A unit's effective output after dt_h: its output y seen through the unit's lag (z: effective output before)."""
+    if u.lag_h <= 0:
+        return y
+    return z + (y - z) * (1.0 - math.exp(-dt_h / u.lag_h))
+
+
+def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict, running: dict, dt_h: float,
+         lagged: dict = None, hold: bool = False):
     """Advance one step: (new temps, new running flags, outputs used). Units decide output from their reading at the
     start of the step (as a real inverter does, with a little lag). `mode` is one mode for every unit, or a dict of
-    unit id -> mode (what the units are really set to, which may differ)."""
+    unit id -> mode (what the units are really set to, which may differ). `lagged` (unit id -> effective output) carries
+    the units' lag from step to step and is updated in place; without it a unit's effect follows its output at once.
+    `hold`: `running` is what the units really did, not simulated (see unit_output)."""
     outputs, run2 = {}, {}
     for uid, u in m.units.items():
         md = mode.get(uid, "off") if isinstance(mode, dict) else mode
-        y, run2[uid] = unit_output(u, md, setpoints.get(uid), unit_reading(m, uid, temps), running.get(uid, False))
+        y, run2[uid] = unit_output(u, md, setpoints.get(uid), unit_reading(m, uid, temps), running.get(uid, False), hold)
+        if lagged is not None:
+            # the mean over the step of the lagged output, approximated by its end value halfway in
+            z = lag(u, lagged.get(uid, y), y, dt_h)
+            y = (lagged.get(uid, y) + z) / 2
+            lagged[uid] = z
         outputs[uid] = y
     d = derivative(m, temps, outdoor, sun, outputs)
     new = dict(temps)
@@ -148,16 +169,22 @@ def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict,
 
 
 def rollout(m: HouseModel, temps: dict, mode, setpoints: dict, running: dict, outdoor_seq, sun_seq,
-            dt_h: float, substeps: int = 1):
+            dt_h: float, substeps: int = 1, lagged: dict = None, control=None):
     """Simulate len(outdoor_seq) steps of dt_h with setpoints held. Returns ([temps after each step], [outputs per step],
-    final running flags)."""
+    final running flags). `lagged`: see step (updated in place). `control(temps, rates, dt_h)` -> setpoints, when given,
+    sets them before every substep instead (an outer loop on the room temperatures; rates are F/h from the last
+    substep, None at first)."""
     traj, outs = [], []
     run = dict(running)
     h = dt_h / substeps
+    rates = None
     for k in range(len(outdoor_seq)):
         acc = {}
         for _ in range(substeps):
-            temps, run, y = step(m, temps, outdoor_seq[k], sun_seq[k], mode, setpoints, run, h)
+            sps = control(temps, rates, h) if control is not None else setpoints
+            before = temps
+            temps, run, y = step(m, temps, outdoor_seq[k], sun_seq[k], mode, sps, run, h, lagged)
+            rates = {r: (temps[r] - before[r]) / h for r in temps if before.get(r) is not None}
             for uid, v in y.items():
                 acc[uid] = acc.get(uid, 0.0) + v / substeps
         traj.append(temps)

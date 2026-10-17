@@ -7,6 +7,9 @@ when the log says heating / cooling, scaled by the inverter's response to its se
 every coefficient except bias held >= 0, so the result stays physical; windows long enough to rise above sensor
 quantization (H5100 0.18 F, unit sensors 0.9 F) matter more than more points.
 
+Each unit's lag (how long its effect on the rooms trails its output: a warm coil and ducts keep heating after the
+compressor stops) is chosen from a few candidates by how well the training windows are explained.
+
 Which room(s) each unit regulates on is detected from the log: the room whose reading the unit's own reported
 temperature tracks (a remote sensor), else its zone's mean plus an offset.
 
@@ -68,19 +71,42 @@ def series(rows: list, rooms: list, units: list):
     return ts, T, out, sun, Y, U
 
 
+LAGS_MIN = (0, 5, 10, 20, 30)  # candidate unit lags
+
+
+def lagged(y: list, lag_min: float) -> list:
+    """A minute series of unit output seen through a first-order lag of `lag_min` minutes."""
+    if lag_min <= 0:
+        return list(y)
+    a = 1.0 - pow(2.718281828459045, -1.0 / lag_min)
+    out, z = [], 0.0
+    for v in y:
+        z += (v - z) * a
+        out.append(z)
+    return out
+
+
+def with_lags(Y: dict, m: hm.HouseModel) -> dict:
+    """The units' output series through the model's fitted lags."""
+    return {u: lagged(v, (m.units[u].lag_h * 60) if u in m.units else 0.0) for u, v in Y.items()}
+
+
 def detect_sensor_rooms(T: dict, U: dict, zones: dict) -> dict:
     """unit -> (sensor rooms, offset). A unit fed a room's sensor (remote temperature) reports within about half a
     degree of that room (its 0.5 C rounding); otherwise it reads its own air, taken as its zone's mean plus a bias."""
     res = {}
     for uid, readings in U.items():
         best = None
+        own = set(zones.get(uid, []))
         for rid, temps in T.items():
             diffs = [a - b for a, b in zip(readings, temps) if a is not None and b is not None]
             if len(diffs) < 60:
                 continue
             mad = _median([abs(x) for x in diffs])
-            if best is None or mad < best[0]:
-                best = (mad, rid, _median(diffs))
+            # With rooms held near the same temperature several can track the unit's reading; its own zone's wins.
+            key = (mad > 0.6, rid not in own, mad)
+            if best is None or key < best[3]:
+                best = (mad, rid, _median(diffs), key)
         if best is not None and best[0] <= 0.6:
             res[uid] = ([best[1]], round(best[2], 2))
             continue
@@ -148,48 +174,75 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
         if cover[r] < min_cover:
             report[r] = {"skipped": f"no data yet ({cover[r]:.0%} of the time has readings)"}
     T = {r: v for r, v in T.items() if cover[r] >= min_cover}
-    for rid, spec in layout["rooms"].items():
-        if rid not in T:
-            continue
-        nbrs = [j for j in spec.get("neighbors", []) if j in T and j != rid]
-        us = [u for u in spec.get("units", units) if u in Y]
-        cols = ["loss"] + [f"c:{j}" for j in nbrs] + ["solar", "bias"] + [f"h:{u}" for u in us] + [f"k:{u}" for u in us]
-        A, b = [], []
-        for a in range(0, max(0, split - window), stride):
-            z = a + window
-            Ti = T[rid][a:z]
-            if Ti[0] is None or Ti[-1] is None or sum(v is None for v in Ti) > 0.2 * window:
+
+    def rooms_fit(Yl):
+        """Fit every room with the units' outputs `Yl` -> (room models, per-room report, training SSE)."""
+        rooms_m, rep, sse = {}, {}, 0.0
+        for rid, spec in layout["rooms"].items():
+            if rid not in T:
                 continue
-            o = _mean(out[a:z])
-            nb = [_mean(T[j][a:z]) for j in nbrs]
-            if o is None or any(v is None for v in nb):
+            nbrs = [j for j in spec.get("neighbors", []) if j in T and j != rid]
+            us = [u for u in spec.get("units", units) if u in Yl]
+            cols = ["loss"] + [f"c:{j}" for j in nbrs] + ["solar", "bias"] + [f"h:{u}" for u in us] + [f"k:{u}" for u in us]
+            A, b = [], []
+            for a in range(0, max(0, split - window), stride):
+                z = a + window
+                Ti = T[rid][a:z]
+                if Ti[0] is None or Ti[-1] is None or sum(v is None for v in Ti) > 0.2 * window:
+                    continue
+                o = _mean(out[a:z])
+                nb = [_mean(T[j][a:z]) for j in nbrs]
+                if o is None or any(v is None for v in nb):
+                    continue
+                Tm = _mean(Ti)
+                row = [o - Tm] + [v - Tm for v in nb] + [sum(sun[a:z]) / window, 1.0]
+                row += [sum(max(0.0, y) for y in Yl[u][a:z]) / window for u in us]
+                row += [sum(min(0.0, y) for y in Yl[u][a:z]) / window for u in us]  # negative: cooling
+                A.append(row)
+                b.append((Ti[-1] - Ti[0]) / (window / 60))
+            if len(A) < 3 * len(cols):
+                rep[rid] = {"skipped": f"only {len(A)} usable windows (need {3 * len(cols)})"}
                 continue
-            Tm = _mean(Ti)
-            row = [o - Tm] + [v - Tm for v in nb] + [sum(sun[a:z]) / window, 1.0]
-            row += [sum(max(0.0, y) for y in Y[u][a:z]) / window for u in us]
-            row += [sum(min(0.0, y) for y in Y[u][a:z]) / window for u in us]  # negative: cooling
-            A.append(row)
-            b.append((Ti[-1] - Ti[0]) / (window / 60))
-        if len(A) < 3 * len(cols):
-            report[rid] = {"skipped": f"only {len(A)} usable windows (need {3 * len(cols)})"}
-            continue
-        x = solve(A, b, free={cols.index("bias")}, lam=lam)
-        pred = [sum(r[j] * x[j] for j in range(len(x))) for r in A]
-        mb = sum(b) / len(b)
-        ss = sum((y - mb) ** 2 for y in b)
-        r2 = 1 - sum((y - q) ** 2 for y, q in zip(b, pred)) / ss if ss > 0 else 0.0
-        p = dict(zip(cols, x))
-        m.rooms[rid] = hm.RoomModel(loss=round(p["loss"], 4), solar=round(p["solar"], 3), bias=round(p["bias"], 3),
-                                    heat={u: round(p[f"h:{u}"], 3) for u in us},
-                                    cool={u: round(p[f"k:{u}"], 3) for u in us},
-                                    coupling={j: round(p[f"c:{j}"], 4) for j in nbrs})
-        report[rid] = {"windows": len(A), "r2_rate": round(r2, 3)}
+            x = solve(A, b, free={cols.index("bias")}, lam=lam)
+            pred = [sum(r[j] * x[j] for j in range(len(x))) for r in A]
+            mb = sum(b) / len(b)
+            ss = sum((y - mb) ** 2 for y in b)
+            res = sum((y - q) ** 2 for y, q in zip(b, pred))
+            sse += res
+            r2 = 1 - res / ss if ss > 0 else 0.0
+            p = dict(zip(cols, x))
+            rooms_m[rid] = hm.RoomModel(loss=round(p["loss"], 4), solar=round(p["solar"], 3), bias=round(p["bias"], 3),
+                                        heat={u: round(p[f"h:{u}"], 3) for u in us},
+                                        cool={u: round(p[f"k:{u}"], 3) for u in us},
+                                        coupling={j: round(p[f"c:{j}"], 4) for j in nbrs})
+            rep[rid] = {"windows": len(A), "r2_rate": round(r2, 3)}
+        return rooms_m, rep, sse
+
+    # Each unit's lag: coordinate search over the candidates, by how well the training windows are explained.
+    lags = {u: 0 for u in units}
+    cache = {}
+
+    def trial(lg):
+        key = tuple(sorted(lg.items()))
+        if key not in cache:
+            cache[key] = rooms_fit({u: lagged(Y[u], lg.get(u, 0)) for u in Y})
+        return cache[key]
+
+    if any(Y[u] and any(Y[u]) for u in Y):
+        for u in units:
+            best = min(LAGS_MIN, key=lambda L: trial({**lags, u: L})[2])
+            lags[u] = best
+    fitted, rep, _ = trial(lags)
+    m.rooms.update(fitted)
+    report.update(rep)
     zones = {u: spec.get("zone", []) for u, spec in layout["units"].items()}
     detected = detect_sensor_rooms(T, U, zones)
     for uid, spec in layout["units"].items():
         sr, off = (spec["sensor_rooms"], 0.0) if spec.get("sensor_rooms") is not None else detected.get(uid, ([], 0.0))
-        m.units[uid] = hm.UnitModel(sensor_rooms=[r for r in sr if r in m.rooms], sensor_offset=off)
-    report["holdout"] = validate(m, ts, T, out, sun, Y, split)
+        m.units[uid] = hm.UnitModel(sensor_rooms=[r for r in sr if r in m.rooms], sensor_offset=off,
+                                    lag_h=round(lags.get(uid, 0) / 60, 4))
+    report["lags_min"] = lags
+    report["holdout"] = validate(m, ts, T, out, sun, with_lags(Y, m), split)
     report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
     hold = [v for v in report["holdout"].values()]
     usable = bool(m.rooms) and bool(hold) and all(
@@ -256,6 +309,7 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
     point at the time it's a prediction for, so it plots against the actual reading at that moment."""
     rooms, units = list(m.rooms), sorted({u for row in rows for u in row.get("units", {})})
     ts, T, out, sun, Y, _ = series(rows, rooms, units)
+    Y = with_lags(Y, m)
     res = {r: {str(h): [] for h in horizons} for r in rooms}
     hmax = max(horizons)
     for a in range(0, len(ts) - hmax, every_min):

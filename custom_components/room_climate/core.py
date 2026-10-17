@@ -92,6 +92,23 @@ class Settings:
     # Inverter efficiency: keep setpoints steady so the compressor modulates instead of stopping and starting.
     setpoint_min_change: float = 1.0  # ignore setpoint moves smaller than this (F)
     setpoint_min_interval_s: int = 900  # at most one setpoint change per unit this often (mode changes excepted)
+    # Outer loop (see drive): set each unit's setpoint relative to its room so it pushes gently, instead of sending
+    # the target and letting the unit blast at full output until it overshoots. Off = the old fixed-setpoint behaviour.
+    drive: bool = True
+    drive_tau_min: float = 40.0  # how fast the loop closes on target; each unit's gain follows from its learned effect
+    drive_kp: float = 1.0  # gain (F of setpoint push per F of error) when the model has nothing learned for a unit
+    drive_kp_min: float = 0.3
+    drive_kp_max: float = 1.0  # 1 = never push past the target on P alone: gentler than today even for a weak unit
+    drive_ti_min: float = 90.0  # integral time: removes the steady-state shortfall a pure P loop would leave
+    drive_i_max: float = 2.0  # cap on the integral's share of the push (anti-windup)
+    drive_lead_min: float = 10.0  # act on where the room will be this far ahead (anticipates the coast after a stop)
+    drive_max_push: float = 2.0  # setpoint at most this far past the room reading: limits the blast of hot/cold air
+    drive_stop_push: float = 2.0  # setpoint this far behind the reading to make the unit stop (it idles ~1 C past it)
+    drive_off: float = 0.5  # stop the unit once the room is predicted this far past target
+    drive_restart: float = 0.3  # once stopped, restart only when the room is predicted this far short of target
+    drive_slope_s: int = 600  # the room's rate of change from this much history
+    drive_min_interval_s: int = 300  # at most one setpoint change per unit this often (starts and stops excepted)
+    drive_min_change: float = 0.7  # ignore setpoint moves smaller than this (most of a 0.5 C step)
     # Reading older than this is ignored. Long, because Bluetooth sensors (e.g. Govee) only update when the value
     # changes; a sensor that really drops out goes unavailable instead.
     stale_s: int = 7200
@@ -139,6 +156,9 @@ class Command:
     reason: str = ""
     active: bool = False
     raw: Optional[float] = None  # setpoint before rounding, so stabilize can tell real moves from rounding jitter
+    target: Optional[float] = None  # what the unit's rooms should reach (room scale, aim included), for drive
+    room: Optional[float] = None  # the rooms' priority-weighted reading now
+    offset: float = 0.0  # the unit's own reading minus `room`
 
 
 @dataclass
@@ -346,7 +366,7 @@ def unit_command(unit: Unit, rooms: list[Room], readings: dict[str, tuple[float,
     needs = avg < target if mode == "heat" else avg > target
     # Whole degrees in the reason: it is logged whenever it changes, and tenths tick over through every ramp.
     why = (("heating" if mode == "heat" else "cooling") + f" toward {target:.0f}°") if needs else "at target; idling"
-    return Command(mode, round_cool(raw), why, needs, raw)
+    return Command(mode, round_cool(raw), why, needs, raw, target, avg, offset)
 
 
 def stabilize(cmd: Command, prev: Optional[tuple[Command, datetime]], now: datetime,
@@ -373,6 +393,124 @@ def stabilize(cmd: Command, prev: Optional[tuple[Command, datetime]], now: datet
         return Command(cmd.mode, pcmd.setpoint, f"{cmd.reason} (holding {pcmd.setpoint:g}°: recently changed)",
                        cmd.active, cmd.raw), False
     return cmd, True
+
+
+@dataclass
+class DriveState:
+    """One unit's outer loop: whether it's pushing, its integral, and the last setpoint it sent."""
+    mode: str = "off"
+    on: bool = False
+    i: float = 0.0  # F of push held by the integral
+    at: Optional[datetime] = None  # last update
+    sp: Optional[float] = None  # last setpoint sent (F, on the unit's 0.5 C grid)
+    sent_at: Optional[datetime] = None
+
+
+def slope(history: list[tuple[datetime, float]], now: datetime, window_s: int) -> Optional[float]:
+    """Least-squares rate of change (F/h) over the last `window_s`, or None with too little to go on."""
+    pts = [(t, v) for t, v in history if elapsed(now, t) <= window_s]
+    if len(pts) < 3 or elapsed(pts[-1][0], pts[0][0]) < window_s / 2:
+        return None
+    xs = [elapsed(t, pts[0][0]) / 3600 for t, _ in pts]
+    ys = [v for _, v in pts]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    if not den:
+        return None
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+
+
+def drive_gain(effect: Optional[float], settings: Settings = Settings(), k1: float = 0.5) -> float:
+    """Outer-loop gain for a unit whose full output moves its room `effect` F/h (learned by the model). The inverter
+    turns a setpoint push into output at about k1 per F, so the room closes on target at effect*k1*kp per hour; pick
+    kp for a time constant of drive_tau_min. A powerful unit in a small room gets a small gain, and the reverse."""
+    if not effect or effect <= 0:
+        return settings.drive_kp
+    kp = 1.0 / (effect * k1 * settings.drive_tau_min / 60)
+    return max(settings.drive_kp_min, min(settings.drive_kp_max, kp))
+
+
+def to_grid(setpoint_f: float) -> float:
+    """`setpoint_f` on the unit's 0.5 C grid, in F."""
+    return round(stored_setpoint_c(setpoint_f) * 1.8 + 32, 1)
+
+
+def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, rate: Optional[float], kp: float,
+              now: datetime, settings: Settings = Settings()) -> tuple[float, DriveState]:
+    """The outer loop: how far past the room reading to put the setpoint (the push, F, positive = in the mode's
+    direction), from the room's predicted miss `drive_lead_min` ahead (target minus prediction, signed so that > 0
+    means the room still needs this mode's help):
+
+        push = kp * miss + integral      while running (clamped to -one 0.5 C step .. max_push)
+        push = -stop_push                once the room is on track to pass target by drive_off: stop it
+
+    While running, a small or slightly negative push lets the inverter's own loop settle at low output; the integral
+    supplies the steady push a cold night needs. An inverter can't go below its minimum output, though, and only
+    idles once its reading is about 1 C past its setpoint, so to stop it before an overshoot takes a definite push the
+    other way. Restarting needs `drive_restart` of predicted miss, so it doesn't chatter. The integral builds only
+    while below the cap, bleeds off while stopped, and resets on a mode change. Returns (push, new state); the
+    state's sp/sent_at are the caller's."""
+    s = 1.0 if mode == "heat" else -1.0
+    fresh = st is None or st.mode != mode
+    dt_h = 0.0 if fresh or st.at is None else max(0.0, min(0.25, elapsed(now, st.at) / 3600))
+    r = max(-12.0, min(12.0, rate or 0.0))
+    miss = s * (target - (room + r * settings.drive_lead_min / 60))
+    i = 0.0 if fresh else st.i
+    if fresh:
+        on = miss > 0
+    elif st.on:
+        on = miss > -settings.drive_off
+    else:
+        on = miss > settings.drive_restart
+    ti_h = max(1e-6, settings.drive_ti_min / 60)
+    step = 0.9
+    if on:
+        p = kp * miss
+        if p + i < settings.drive_max_push:  # anti-windup: don't build while saturated
+            i = max(0.0, min(settings.drive_i_max, i + kp * miss * dt_h / ti_h))
+        push = max(-step, min(settings.drive_max_push, p + i))
+    else:
+        i = max(0.0, i + kp * min(0.0, miss) * dt_h / ti_h)  # bleeds off while past target
+        push = -settings.drive_stop_push
+    keep = DriveState(mode, on, i, now, None if fresh else st.sp, None if fresh else st.sent_at)
+    return push, keep
+
+
+def drive(cmd: Command, st: Optional[DriveState], rate: Optional[float], kp: float, unit: Unit, now: datetime,
+          settings: Settings = Settings()) -> tuple[Command, DriveState, bool]:
+    """Turn a command's target into the setpoint to send this tick -> (command, new state, changed).
+
+    Setpoints sit on the unit's 0.5 C grid. A new setpoint goes out on a start or stop, on a mode change, or when it
+    has moved at least drive_min_change and drive_min_interval_s has passed; otherwise the last one is held."""
+    if cmd.mode not in ("heat", "cool") or cmd.target is None or cmd.room is None:
+        keep = st.sp if st is not None and st.mode == cmd.mode else None
+        new = DriveState(cmd.mode, False, 0.0, now, keep, st.sent_at if st and keep is not None else None)
+        return Command(cmd.mode, keep, cmd.reason, False, keep, cmd.target, cmd.room, cmd.offset), new, \
+            st is None or st.mode != cmd.mode
+    push, new = drive_law(st, cmd.mode, cmd.room, cmd.target, rate, kp, now, settings)
+    s = 1.0 if cmd.mode == "heat" else -1.0
+    raw = max(unit.min_setpoint, min(unit.max_setpoint, cmd.room + cmd.offset + s * push))
+    sp = to_grid(raw)
+    toggled = st is None or st.mode != cmd.mode or st.on != new.on
+    prev = new.sp
+    if prev is None or toggled:
+        send = True
+    elif new.on:
+        send = abs(raw - prev) >= settings.drive_min_change and sp != prev and (
+            new.sent_at is None or elapsed(now, new.sent_at) >= settings.drive_min_interval_s)
+    else:  # stopped: the stop setpoint stays put unless the room has come back close enough to restart the unit
+        send = s * (prev - (cmd.room + cmd.offset)) > -settings.drive_stop_push / 2
+    if send:
+        new.sp, new.sent_at, changed = sp, now, sp != prev or toggled
+    else:
+        sp, changed = prev, False
+    if new.on:
+        why = f"{'heating' if cmd.mode == 'heat' else 'cooling'} toward {cmd.target:.0f}°"
+    elif s * (cmd.target - cmd.room) > 0:
+        why = f"easing off: on track for {cmd.target:.0f}°"
+    else:
+        why = "at target; idling"
+    return Command(cmd.mode, sp, why, new.on, raw, cmd.target, cmd.room, cmd.offset), new, changed
 
 
 MANUAL_MODES = ("dry", "fan_only")

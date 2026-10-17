@@ -506,8 +506,10 @@ class RoomMapCard extends HTMLElement {
     const dec = sh.decision || {};
     // A controller "off" is its idle state (nothing to change; nothing is sent), not the unit switched off.
     const md = (mode, sp, ctl) => mode == null ? "—" : mode === "off" ? (ctl ? "no change" : "off") : `${mode} ${sp == null ? "" : Math.round(sp) + "°"}`;
+    // With the outer loop the setpoint follows the room; the target is what the rooms are being brought to.
+    const aim = (mode, tgt) => tgt == null || mode == null || mode === "off" ? "" : ` <small>(rooms to ${(+tgt).toFixed(1)}°)</small>`;
     const unitRows = Object.entries(d.today || {}).map(([u, t]) => `<tr><td>${t.name.replace(/ (air handler|minisplit)$/i, "")}</td>
-        <td><b>${md((dec[u] || {}).mode, (dec[u] || {}).setpoint, true)}</b></td><td>${md(t.mode, t.setpoint, true)}${t.control === "room_climate" ? "" : " <small>(thermostat in control)</small>"}</td>
+        <td><b>${md((dec[u] || {}).mode, (dec[u] || {}).setpoint, true)}</b>${aim((dec[u] || {}).mode, (dec[u] || {}).target)}</td><td>${md(t.mode, t.setpoint, true)}${aim(t.mode, t.target)}${t.control === "room_climate" ? "" : " <small>(thermostat in control)</small>"}</td>
         <td>${md(t.actual_mode, t.actual_setpoint)}</td></tr>`).join("");
     const costs = plan ? Object.entries(plan.by_mode).map(([k, v]) => `${k} ${(+v.cost).toFixed(2)}`).join(" · ") : "";
     const would = `<div class="rc-sect"><h4>Would do vs today</h4>
