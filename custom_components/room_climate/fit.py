@@ -237,10 +237,14 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
             cache[key] = rooms_fit({u: lagged(Y[u], lg.get(u, 0)) for u in Y})
         return cache[key]
 
+    # Only a unit with one of its own rooms in the fit: otherwise the "best" lag would come from how it happens to
+    # line up with other rooms' changes (Bedroom 3's unit got 20 min from the kitchen and Primary bedroom). Those
+    # keep 0, and the controller uses its default look-ahead.
+    own_fitted = {u for u in units if any(r in T for r in layout["units"].get(u, {}).get("zone", []))}
     if any(Y[u] and any(Y[u]) for u in Y):
         for u in units:
-            best = min(LAGS_MIN, key=lambda L: trial({**lags, u: L})[2])
-            lags[u] = best
+            if u in own_fitted:
+                lags[u] = min(LAGS_MIN, key=lambda L: trial({**lags, u: L})[2])
     fitted, rep, _ = trial(lags)
     m.rooms.update(fitted)
     report.update(rep)

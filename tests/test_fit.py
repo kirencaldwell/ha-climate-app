@@ -62,7 +62,8 @@ def test_rooms_without_data_are_left_out_not_poisonous():
                 coupled.Weather(start, 5, mean=55, seed=3), s, log=log, seed=3)
     layout = {"rooms": {r: {"units": list(truth.units), "neighbors": [o for o in ("kitchen", "primary_bedroom", "ghost") if o != r]}
                         for r in ("kitchen", "primary_bedroom", "ghost")},  # "ghost": configured, never reported
-              "units": {u: {"zone": []} for u in truth.units}}
+              "units": {u: {"zone": {"air_handler": ["kitchen"], "minisplit_1": ["primary_bedroom"]}.get(u, [])}
+                        for u in truth.units}}
     m, rep = fit.fit(log, layout)
     assert set(m.rooms) == {"kitchen", "primary_bedroom"} and "not enough data" in rep["ghost"]["skipped"]
     assert "ghost" not in m.rooms["kitchen"].coupling
@@ -76,6 +77,7 @@ def test_rooms_without_data_are_left_out_not_poisonous():
     m3, rep3 = fit.fit(log, layout)
     assert "primary_bedroom" not in m3.rooms and "not enough data" in rep3["primary_bedroom"]["skipped"]
     assert rep3["holdout"]["kitchen"]["n"] > 0  # the other rooms are still checked
+    assert m3.units["minisplit_1"].lag_h == 0  # its own room isn't fitted, so no lag is learned for it
 
 
 def test_backtest_runs_the_model_over_logged_history():
