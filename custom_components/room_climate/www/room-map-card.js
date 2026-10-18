@@ -144,6 +144,16 @@ class RoomMapCard extends HTMLElement {
       this._render(); this._diagUpdate();
     } catch (e) { this._fail("set_control", e); }
   }
+  // Experiment day: run the units in a planned sequence for `hours` (0 = stop) so the model learns more.
+  async _experiment(hours) {
+    if (hours && !confirm(`Run an experiment for ${hours} hours?\n\nThe units take turns running on their own (and off) so the model can learn ` +
+      `how each one affects every room. Rooms may drift a few degrees from their targets. The last hour is normal control, ` +
+      `so the house is back on schedule when the time is up.`)) return;
+    try {
+      this._data = await this._hass.callWS(hours ? { type: "room_climate/experiment_start", hours } : { type: "room_climate/experiment_stop" });
+      this._render();
+    } catch (e) { this._fail("experiment", e); }
+  }
   // Show the problem in the card (instead of a blank page) and send it to the HA log so it can be diagnosed remotely.
   _fail(where, e) {
     const msg = `${where}: ${(e && e.message) || (e && e.code) || JSON.stringify(e) || e}`;
@@ -176,6 +186,8 @@ class RoomMapCard extends HTMLElement {
     if (t.dataset.act === "diag") { this._openDiag(); return; }
     if (t.dataset.act === "model") { this._openModel(); return; }
     if (t.dataset.act === "ctl") { this._setControl(t.dataset.u, t.dataset.c); return; }
+    if (t.dataset.act === "exp-start") { this._experiment(+t.dataset.h); return; }
+    if (t.dataset.act === "exp-stop") { this._experiment(0); return; }
     const room = this._data.rooms.find(r => r.id === this._sel);
     const live = room ? this._data.live[room.id] || {} : {};
     if (t.dataset.floor) { this._floor = +t.dataset.floor; this._sel = null; this._render(); return; }
@@ -360,7 +372,16 @@ class RoomMapCard extends HTMLElement {
         <span class="rc-pips" title="Priority ${r.priority}">${[1, 2, 3, 4, 5].map(n => `<b class="${n <= r.priority ? "on" : ""}"></b>`).join("")}</span></span>
         <span class="rc-d ${c}">${r.temp == null ? "—" : r.temp.toFixed(1) + "°"} <small>→ ${r.target}°</small></span></button>`;
     }).join("");
+    const ex = d.experiment, hm = iso => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const expSect = ex
+      ? `<div class="rc-sect" style="border:1px solid #b692f6;border-radius:10px;padding:8px 10px"><h4 style="color:#b692f6">Experiment running</h4>
+          <p class="rc-sub" style="margin:4px 0">Now: <b>${ex.now}</b>${ex.block_end ? ` until ${hm(ex.block_end)}` : ""}. Ends ${hm(ex.end)} (normal control from ${hm(new Date(Date.parse(ex.end) - 3600e3).toISOString())}).</p>
+          <button data-act="exp-stop" style="width:100%">Stop experiment</button></div>`
+      : `<div class="rc-sect"><h4>Experiment while nobody's home</h4>
+          <p class="rc-sub" style="margin:4px 0">The units take turns so the model learns faster. Rooms may drift a few degrees.</p>
+          <div class="rc-chips" style="display:flex;gap:6px">${[4, 6, 8, 10].map(h => `<button data-act="exp-start" data-h="${h}" style="flex:1">${h} h</button>`).join("")}</div></div>`;
     return `<h3>Heat pumps</h3>${house}<div class="rc-units">${tiles}</div>
+      ${expSect}
       ${pr ? `<div class="rc-sect"><h4>Highest priority</h4>${pr}</div>` : ""}
       <p class="rc-sub" style="margin:12px 0">Tap a room to adjust it.</p>
       <div class="rc-chips" style="display:flex;gap:8px"><button data-act="diag" style="flex:1">Diagnostics</button>

@@ -31,6 +31,15 @@ keeps its fan): quiet for a gentle push, then low and medium as it pushes harder
 A slower fan means less output at the compressor's lowest speed, so a strong unit in a small room runs longer and
 softer instead of in short bursts. The model learns each fan speed's share of a unit's output from the log.
 
+## Experiment days
+From the card's home panel ("Experiment while nobody's home": 4, 6, 8 or 10 h), the units under Room Climate or Model
+control take turns while the house is empty (`experiment.py`): everything idle (the house drifts), one unit at a time at
+a steady push (minisplits sweep their fan speeds quiet → auto, then back), and an idle coast after each run. One mode
+for the whole run; the house floor (63 °F) and ceiling (72 °F) still hold. The last hour is normal control, so the
+house is back on schedule when the time is up; Stop ends it at once. Every experiment minute is tagged (`exp`) in the
+log. It gives the fit what everyday running doesn't: one unit's effect on every room at a time, and fan speeds compared
+in the same conditions.
+
 ## Model-based control ("would do" mode: shown, not sent)
 A learned thermal model plus a model-predictive optimizer. HA refits the model every night at 3:40 on the last 14 days
 of the minute log; the optimizer plans every 5 minutes next to today's controller and its decisions are logged and

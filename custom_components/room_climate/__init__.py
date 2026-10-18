@@ -25,7 +25,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from . import core, datalog, fit, mpc
+from . import core, datalog, experiment, fit, mpc
 from . import model as hm
 
 DOMAIN = "room_climate"
@@ -84,6 +84,7 @@ class Manager:
         self.sent: dict = {}  # unit id -> (last setpoint command, when); for thermostat units, what we would have sent
         self._fan_set: set = set()  # units whose fan we've changed (put back to auto when handed to the thermostat)
         self._house_restored = False  # the house mode is taken from the units on the first tick (_restore_house)
+        self.exp_block = None  # the experiment block in force (experiment.py), if one is running
         self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
         self.zone_hist: dict[str, deque] = {}  # unit id -> [(time, its rooms' weighted reading)] for the loop's rate
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
@@ -310,6 +311,56 @@ class Manager:
                 self.states[u.id] = core.UnitState(modes[0], now, modes[0], st.active)
             _LOGGER.info("house mode %s restored from the units after a restart", modes[0])
 
+    async def _experiment_tick(self, now, units, rooms, readings, cmds, settings, info):
+        """While an experiment runs (experiment.py): its commands for the units we control (None otherwise, or in the
+        last hour, which is normal control). Ends it when the time is up."""
+        exp = self.data.get("experiment")
+        self.exp_block = None
+        if not exp:
+            return None
+        if now >= datetime.fromisoformat(exp["end"]):
+            _LOGGER.info("experiment finished (%s to %s)", exp["start"], exp["end"])
+            self.data.pop("experiment", None)
+            self.drives.clear()
+            await self.async_save()
+            return None
+        b = self.exp_block = experiment.current(exp, now)
+        if b is None or b["kind"] == "restore":
+            return None
+        mode = exp["mode"]
+        if self.house.mode != mode:
+            self.house = core.HouseState(mode, now)
+        info["mode"], info["reason"] = mode, "experiment: " + experiment.describe(b, self._unit_names())
+        ours = {u.id for u in units if self.control(u.id) in OURS}
+        unit_rooms = {u.id: [r.id for r in rooms if r.unit == u.id] for u in units}
+        return experiment.commands(b, mode, {k: v for k, v in cmds.items() if k in ours}, unit_rooms,
+                                   {rid: v[0] for rid, v in readings.items()}, settings)
+
+    def _unit_names(self) -> dict:
+        return {u["id"]: (u.get("name") or u["id"]).replace(" minisplit", "").replace(" air handler", "")
+                for u in self.data["units"]}
+
+    async def async_start_experiment(self, hours: float):
+        """Run an experiment for `hours` (experiment.plan). Raises ValueError if no unit is under our control."""
+        settings = core.settings_from(self.data.get("settings"))
+        ours = [u["id"] for u in self.data["units"] if self.control(u["id"]) in OURS]
+        if not ours:
+            raise ValueError("no unit is under Room Climate or Model control")
+        now = dt_util.now()
+        mode = experiment.pick_mode(self.house.mode, self._outdoor(settings))
+        fan_units = {x.strip() for x in settings.fan_units.split(",")}
+        self.data["experiment"] = experiment.plan(now, hours, ours, fan_units, mode)
+        _LOGGER.info("experiment started: %s h in %s mode for %s", hours, mode, ", ".join(ours))
+        await self.async_save()
+        await self.async_tick()
+
+    async def async_stop_experiment(self):
+        if self.data.pop("experiment", None) is not None:
+            _LOGGER.info("experiment stopped from the card")
+            self.drives.clear()
+            await self.async_save()
+            await self.async_tick()
+
     def drive_lead(self, unit_id: str):
         """Look-ahead for a unit's outer loop: its learned lag in minutes (None: the default lead)."""
         m = self.shadow.model
@@ -493,7 +544,8 @@ class Manager:
         if new_house.mode != house.mode:
             _LOGGER.info("house mode %s -> %s (%s)", house.mode, new_house.mode, info["reason"])
         self.house = new_house
-        self.house_info = {**info, "since": new_house.since.isoformat() if new_house.since else None,
+        exp_cmds = await self._experiment_tick(now, units, rooms, readings, cmds, settings, info)
+        self.house_info = {**info, "since": self.house.since.isoformat() if self.house.since else None,
                            "predicted": {k: None if v is None else round(v, 1) for k, v in predicted.items()}}
         self._tick_debug = (readings, predicted, info, settings)
         sent = self.sent
@@ -510,7 +562,10 @@ class Manager:
                     c = core.Command(d["mode"], d.get("setpoint"), reason, True, d.get("setpoint"))
                 else:
                     c = core.Command(states.get(u.id, core.UnitState()).mode, None, "model: no change needed")
-            if settings.drive and c.mode in ("heat", "cool") and c.target is not None:
+            if exp_cmds and u.id in exp_cmds:
+                cmd, changed = exp_cmds[u.id], True  # an experiment block; the outer loop starts afresh after it
+                self.drives.pop(u.id, None)
+            elif settings.drive and c.mode in ("heat", "cool") and c.target is not None:
                 # Outer loop: the setpoint follows the room, pushing gently and stopping before an overshoot.
                 h = self.zone_hist.setdefault(u.id, deque())
                 if c.room is not None and (not h or core.elapsed(now, h[-1][0]) >= 30):
@@ -661,6 +716,9 @@ class Manager:
             if st.entity_id.startswith(tuple(prefixes)) and st.state not in BAD_STATES:
                 row["extra"][st.entity_id] = num(st.state) if num(st.state) is not None else st.state
         row["mpc"] = self.shadow.log_fields()  # what the model-based controller would do
+        if getattr(self, "exp_block", None):
+            b = self.exp_block
+            row["exp"] = {"kind": b["kind"], "unit": b.get("unit"), "fan": b.get("fan")}
         f = self.forecast
         if f is not None and f["at"] != self._forecast_logged:  # each fetched forecast, once (next 6 h)
             self._forecast_logged = f["at"]
@@ -803,6 +861,10 @@ class Manager:
     def snapshot(self) -> dict:
         now = dt_util.now()
         out = dict(self.data)
+        if self.data.get("experiment"):
+            b = experiment.current(self.data["experiment"], now)
+            out["experiment"] = {**self.data["experiment"], "now": experiment.describe(b, self._unit_names()),
+                                 "block_end": b["end"] if b else None}
         settings = core.settings_from(self.data.get("settings"))
         rooms = [_room_from_dict(r) for r in self.data["rooms"]]
         readings = {}
@@ -925,6 +987,23 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             return
         connection.send_result(msg["id"], mgr.snapshot())
 
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/experiment_start",
+                                      vol.Required("hours"): vol.All(vol.Coerce(float), vol.Range(min=experiment.MIN_H, max=experiment.MAX_H))})
+    @websocket_api.async_response
+    async def ws_experiment_start(hass, connection, msg):
+        try:
+            await mgr.async_start_experiment(msg["hours"])
+        except ValueError as e:
+            connection.send_error(msg["id"], "not_ready", str(e))
+            return
+        connection.send_result(msg["id"], mgr.snapshot())
+
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/experiment_stop"})
+    @websocket_api.async_response
+    async def ws_experiment_stop(hass, connection, msg):
+        await mgr.async_stop_experiment()
+        connection.send_result(msg["id"], mgr.snapshot())
+
     @websocket_api.websocket_command({"type": f"{DOMAIN}/set_settings", vol.Required("settings"): dict})
     @websocket_api.async_response
     async def ws_set_settings(hass, connection, msg):
@@ -957,7 +1036,8 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         hass.async_create_task(mgr.async_fit())
         connection.send_result(msg["id"], {"started": True})
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_fit_model):
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_fit_model,
+               ws_experiment_start, ws_experiment_stop):
         websocket_api.async_register_command(hass, fn)
 
     unit_entities = [u["entity"] for u in mgr.data["units"]]

@@ -294,9 +294,15 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
             continue
         ref_fan[u] = ref
         refs = set(FAN_REF) if ref in FAN_REF else {ref}
-        for level in sorted(f for f, k in minutes.items() if f and f not in refs and k >= 60):
-            best = min(FAN_GRID, key=lambda g: trial(lags, {**scales, u: {**scales[u], level: g}})[2])
-            scales[u][level] = best
+        levels = sorted(f for f, k in minutes.items() if f and f not in refs and k >= 60)
+        for _ in range(3):  # coordinate search: a speed's best factor depends on the others', so a few passes
+            moved = False
+            for level in levels:
+                best = min(FAN_GRID, key=lambda g: trial(lags, {**scales, u: {**scales[u], level: g}})[2])
+                moved |= scales[u].get(level) != best
+                scales[u][level] = best
+            if not moved:
+                break
     fitted, rep, _ = trial(lags, scales)
     m.rooms.update(fitted)
     report.update(rep)
