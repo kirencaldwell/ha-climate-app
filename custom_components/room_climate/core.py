@@ -113,6 +113,11 @@ class Settings:
     drive_off: float = 0.5  # stop the unit once the room is predicted this far past target
     drive_restart: float = 0.6  # once stopped, restart only when the room is predicted this far short of target
     drive_slope_s: int = 600  # the room's rate of change from this much history
+    # After a unit stops, its rooms keep moving on its leftover heat (Bedroom 3: +2.4 F in 12 min). For this long (or 3x
+    # the unit's learned lag, if longer) that's the unit's own coast: those rooms don't vote on heat vs cool, and the
+    # loop restarts the unit only on the reading itself, not on a trend. Otherwise the coast feeds back as a disturbance
+    # and the house goes round a heat/cool limit cycle.
+    drive_coast_min: float = 20.0
     drive_min_interval_s: int = 300  # at most one setpoint change per unit this often (starts and stops excepted)
     drive_min_change: float = 0.7  # ignore setpoint moves smaller than this (most of a 0.5 C step)
     # Fan speed, the loop's second output (units listed here only; others keep whatever fan they're set to). A gentle
@@ -422,6 +427,7 @@ class DriveState:
     miss: float = 0.0  # last predicted miss (F; > 0 the room still needs this mode's help)
     fan: Optional[str] = None  # last fan mode chosen
     fan_at: Optional[datetime] = None
+    stopped_at: Optional[datetime] = None  # when the loop last stopped the unit (start of its coast)
 
 
 def slope(history: list[tuple[datetime, float]], now: datetime, window_s: int) -> Optional[float]:
@@ -493,6 +499,10 @@ def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, r
     dt_h = 0.0 if fresh or st.at is None else max(0.0, min(0.25, elapsed(now, st.at) / 3600))
     r = max(-12.0, min(12.0, rate or 0.0))
     lead = settings.drive_lead_min if lead_min is None else lead_min
+    coasting = (not fresh and not st.on and st.stopped_at is not None
+                and elapsed(now, st.stopped_at) < 60 * max(settings.drive_coast_min, 3 * lead))
+    if coasting:
+        r = 0.0  # just stopped: the room is coasting, and a trend through that says nothing about what it needs
     miss = s * (target - (room + r * lead / 60))
     i = 0.0 if fresh else st.i
     if fresh:
@@ -515,8 +525,9 @@ def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, r
     else:
         i = max(0.0, i + kp * min(0.0, miss) * dt_h / ti_h)  # bleeds off while past target
         push = -settings.drive_stop_push
+    stopped = now if (not fresh and st.on and not on) else (None if fresh else st.stopped_at)
     keep = DriveState(mode, on, i, now, None if fresh else st.sp, None if fresh else st.sent_at, miss,
-                      None if st is None else st.fan, None if st is None else st.fan_at)
+                      None if st is None else st.fan, None if st is None else st.fan_at, stopped)
     return push, keep
 
 
@@ -595,7 +606,7 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
                  predicted: dict[str, Optional[float]], unit_temps: dict[str, Optional[float]],
                  states: dict[str, UnitState], house: HouseState, now: datetime,
                  settings: Settings = Settings(), manual: Optional[dict[str, str]] = None,
-                 busy: Optional[set[str]] = None, outdoor: Optional[float] = None):
+                 busy: Optional[set[str]] = None, outdoor: Optional[float] = None, coasting: Optional[set] = None):
     """One control tick for the whole house -> (commands by unit id, new HouseState, info dict).
 
     All units always share one mode. `manual` holds the current mode of each unit under thermostat control (not
@@ -638,6 +649,8 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
             # 55-78 F in an hour as its unit went heat -> cool). It would drive the house into a heat/cool limit cycle,
             # so it follows the house mode and just holds its target until it has a sensor of its own.
             continue
+        if r.unit in (coasting or ()):
+            continue  # its unit just stopped: the room is coasting on that unit's heat (or cold), not asking for more
         zone = zones.setdefault(r.unit, [0.0, 0.0])
         zone[0] += c
         zone[1] += h

@@ -757,3 +757,24 @@ def test_push_limit_per_unit_set_or_learned():
     far4, _, _ = core.drive(cmd, None, 0.0, 1.0, Unit("ah", "climate.ah"), MON, s, None, 4.0)
     far2, _, _ = core.drive(cmd, None, 0.0, 1.0, Unit("ah", "climate.ah"), MON, s, None, 2.0)
     assert far4.raw - 63.0 > far2.raw - 63.0 + 1.5  # a slow room far behind gets the bigger push
+
+
+def test_a_coasting_room_neither_flips_the_house_nor_restarts_its_unit():
+    s = Settings()
+    u1, u2 = Unit("ah", "climate.ah"), Unit("b3", "climate.b3")
+    rooms = [Room("k", "K", "ah", sensor="s.k", priority=2, default_temp=65),
+             Room("b", "B", "b3", sensor="s.b", priority=4, default_temp=67)]
+    readings = {"k": (64.5, MON), "b": (70.0, MON)}  # Bedroom 3 coasting 3 F over after its unit stopped
+    house = core.HouseState("heat", MON - timedelta(hours=2))
+    cmds, h, info = core.control_step([u1, u2], rooms, readings, {}, {}, {}, house, MON, s)
+    assert info["hot"] > 1  # counted, it would start pushing the house toward cool
+    cmds, h, info = core.control_step([u1, u2], rooms, readings, {}, {}, {}, house, MON, s, coasting={"b3"})
+    assert info["hot"] == 0 and h.pending is None
+    # The loop: stopped while rising, then the room falls back fast; no restart on the extrapolated fall
+    _, st, _ = _drv(66.0, 66.5)
+    _, st, _ = _drv(66.4, 66.5, rate=12.0, st=st, t=MON + timedelta(minutes=5))
+    assert not st.on and st.stopped_at is not None
+    c, st2, _ = _drv(67.3, 66.5, rate=-12.0, st=st, t=MON + timedelta(minutes=15))
+    assert not st2.on  # without the coast rule, 67.3 - 2 = 65.3 predicted would restart it
+    c, st3, _ = _drv(65.8, 66.5, rate=-3.0, st=st2, t=MON + timedelta(minutes=18))
+    assert st3.on  # really short of target: restarts, coast or not

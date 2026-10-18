@@ -182,7 +182,7 @@ class HeuristicController:
     def __init__(self, rooms, units, settings=core.Settings()):
         self.rooms, self.units, self.s = rooms, units, settings
         self.house, self.states, self.hist, self.sent, self.prev_busy, self.last_good = core.HouseState(), {}, {}, {}, set(), {}
-        self.drives, self.zone_hist = {}, {}
+        self.drives, self.zone_hist, self.busy_at = {}, {}, {}
         self.kp = {}  # unit id -> outer-loop gain (from a model's learned effects; default gain when empty)
         self.lead = {}  # unit id -> look-ahead minutes (a model's learned lag; default lead when empty)
 
@@ -205,9 +205,14 @@ class HeuristicController:
                         self.hist[r.id] = self.hist[r.id][-1:]
                         predicted[r.id] = None
         self.prev_busy = busy
+        for u in self.units:
+            if u.id in busy:
+                self.busy_at[u.id] = now
+        coasting = {u.id for u in self.units if u.id not in busy and u.id in self.busy_at
+                    and core.elapsed(now, self.busy_at[u.id]) < 60 * self.s.drive_coast_min}
         cmds, self.house, info = core.control_step(self.units, self.rooms, readings, predicted,
                                                    {u.id: sim.unit_temp(u.id) for u in self.units}, self.states, self.house,
-                                                   now, self.s, {}, busy, sim.weather.outdoor(now))
+                                                   now, self.s, {}, busy, sim.weather.outdoor(now), coasting)
         for u in self.units:
             if self.s.drive:  # same outer loop as Manager.async_tick
                 c = cmds[u.id]

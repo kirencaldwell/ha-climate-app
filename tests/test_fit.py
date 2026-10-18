@@ -48,7 +48,9 @@ def test_fit_recovers_the_simulated_house():
         ref = rep["fan_scale"][u]["relative_to"]
         assert got and all(abs(v - true.get(k, 1) / true.get(ref, 1)) <= 0.3 for k, v in got.items()), (u, ref, got)
     b3, pb = m.rooms["bedroom_3"].sun_dir, m.rooms["primary_bedroom"].sun_dir
-    assert b3["s"] > 1.5 and b3["s"] > 2 * max(b3["e"], b3["w"]), b3  # it learns which way each room faces
+    # It learns which way each room faces. (How strong: midday south sun and overhead sun rise and fall together, so
+    # their split varies with the data; the direction doesn't.)
+    assert b3["s"] > 0.8 and b3["s"] > 2 * max(b3["e"], b3["w"]), b3
     assert pb["w"] > 0.6 and pb["w"] > 2 * max(pb["e"], pb["s"]), pb
     up = m.rooms["primary_bedroom"].coupling.get("living_room", 0)
     assert 0.05 < up < 0.2, up  # the stairs (true 0.12)

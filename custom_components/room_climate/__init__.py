@@ -85,6 +85,7 @@ class Manager:
         self._fan_set: set = set()  # units whose fan we've changed (put back to auto when handed to the thermostat)
         self._house_restored = False  # the house mode is taken from the units on the first tick (_restore_house)
         self.exp_block = None  # the experiment block in force (experiment.py), if one is running
+        self._busy_at: dict = {}  # unit id -> last time it was heating/cooling
         self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
         self.zone_hist: dict[str, deque] = {}  # unit id -> [(time, its rooms' weighted reading)] for the loop's rate
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
@@ -548,12 +549,22 @@ class Manager:
                         self.hist[r.id] = self.hist[r.id][-1:]
                         predicted[r.id] = None
         self.prev_busy = busy
+        for u in units:
+            if u.id in busy:
+                self._busy_at[u.id] = now
+        coasting = set()  # units that stopped recently: their rooms are still moving on the unit's own output
+        for u in units:
+            last = self._busy_at.get(u.id)
+            lag = (self.drive_lead(u.id) or 0.0)
+            if u.id not in busy and last is not None and \
+                    core.elapsed(now, last) < 60 * max(settings.drive_coast_min, 3 * lag):
+                coasting.add(u.id)
         if not self._house_restored:
             self._restore_house(units, now)
         house = self.house
         cmds, new_house, info = core.control_step(
             units, rooms, readings, predicted, {u.id: self._unit_temp(u.entity) for u in units},
-            states, house, now, settings, manual, busy, self._outdoor(settings))
+            states, house, now, settings, manual, busy, self._outdoor(settings), coasting)
         if new_house.mode != house.mode:
             _LOGGER.info("house mode %s -> %s (%s)", house.mode, new_house.mode, info["reason"])
         self.house = new_house
