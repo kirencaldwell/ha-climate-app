@@ -10,6 +10,9 @@ Each room's temperature changes (F per hour) by
   + bias                                       people, appliances, anything unmodelled
   + sum heat[u] * y_u   (y_u > 0, heating)     each unit's effect at its current output
   - sum cool[u] * |y_u| (y_u < 0, cooling)
+  + sum leak[u] * L_u                          a unit idling in heat (cool) on the shared outdoor unit still gets
+                                               some hot (cold) refrigerant while the compressor runs for the others;
+                                               L_u is that drive (see leak_inputs), signed by the mode
 
 Units are inverters with their own controller: we only choose mode and setpoint, and the unit sets its output from
 the gap between setpoint and its own reading (the mean of `sensor_rooms` plus `sensor_offset`). That inner loop is
@@ -33,6 +36,7 @@ class RoomModel:
     heat: dict = field(default_factory=dict)  # unit id -> F/h at full heating output
     cool: dict = field(default_factory=dict)  # unit id -> F/h of cooling at full cooling output (positive)
     coupling: dict = field(default_factory=dict)  # other room id -> 1/h toward its temperature
+    leak: dict = field(default_factory=dict)  # unit id -> F/h at full compressor drive while that unit idles in its mode
 
 
 @dataclass
@@ -190,7 +194,25 @@ def unit_output(u: UnitModel, mode: str, setpoint, reading, running: bool, hold:
     return (y if mode == "heat" else -y), True
 
 
-def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict) -> dict:
+def leak_inputs(modes, running: dict, outputs: dict, units, compressor=None) -> dict:
+    """Unit id -> leak drive: for a unit set to heat (cool) but not running, the shared compressor's drive in that
+    mode (+ heating, - cooling), else 0. The drive is `compressor` (0..1, e.g. its frequency over 100 Hz) when known,
+    else the other units' output in that mode."""
+    out = {}
+    for uid in units:
+        md = modes.get(uid, "off") if isinstance(modes, dict) else modes
+        if md not in ("heat", "cool") or running.get(uid):
+            out[uid] = 0.0
+            continue
+        if compressor is not None:
+            drive = max(0.0, compressor)
+        else:
+            drive = sum(max(0.0, y) if md == "heat" else max(0.0, -y) for v, y in outputs.items() if v != uid)
+        out[uid] = drive if md == "heat" else -drive
+    return out
+
+
+def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict, leaks: dict = None) -> dict:
     """dT/dt (F/h) for every modelled room with a temperature. `sun`: a sun vector (sun_vector) or overhead 0..1."""
     out = {}
     sv = as_sun(sun)
@@ -212,6 +234,8 @@ def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict) -
                 d += r.heat.get(uid, 0.0) * y
             elif y < 0:
                 d += r.cool.get(uid, 0.0) * y  # y is negative: cooling
+        for uid, c in r.leak.items():
+            d += c * (leaks or {}).get(uid, 0.0)
         out[rid] = d
     return out
 
@@ -245,7 +269,8 @@ def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict,
             y = (lagged.get(uid, y) + z) / 2
             lagged[uid] = z
         outputs[uid] = y
-    d = derivative(m, temps, outdoor, sun, outputs)
+    modes = {uid: (mode.get(uid, "off") if isinstance(mode, dict) else mode) for uid in m.units}
+    d = derivative(m, temps, outdoor, sun, outputs, leak_inputs(modes, run2, outputs, m.units))
     new = dict(temps)
     for rid, v in d.items():
         new[rid] = temps[rid] + v * dt_h

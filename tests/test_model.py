@@ -72,6 +72,16 @@ def test_sun_from_irradiance_matches_the_cloud_based_scale():
     assert hm.sun_from_irradiance(-5, 200, 0, 0, 0) == {"h": 0.0, "e": 0.0, "s": 0.0, "w": 0.0}
 
 
+def test_leak_from_an_idle_unit_on_the_shared_compressor():
+    lk = hm.leak_inputs({"a": "heat", "b": "heat"}, {"a": True, "b": False}, {"a": 0.8, "b": 0.0}, ["a", "b"])
+    assert lk == {"a": 0.0, "b": 0.8}  # b idles in heat while a heats: b gets a's drive
+    assert hm.leak_inputs({"a": "heat", "b": "off"}, {"a": True}, {"a": 0.8, "b": 0.0}, ["a", "b"])["b"] == 0.0  # off: none
+    assert hm.leak_inputs("cool", {"a": True}, {"a": -0.6, "b": 0.0}, ["a", "b"])["b"] == -0.6
+    assert hm.leak_inputs("heat", {}, {}, ["a"], compressor=0.45)["a"] == 0.45  # measured compressor drive wins
+    m = hm.HouseModel({"r": hm.RoomModel(loss=0, leak={"b": 2.0})}, {"a": hm.UnitModel(), "b": hm.UnitModel()})
+    assert hm.derivative(m, {"r": 67.0}, None, 0.0, {"a": 0.8, "b": 0.0}, {"b": 0.8})["r"] == 1.6
+
+
 def test_solar_index():
     assert hm.solar_index(-5, 0) == 0 and hm.solar_index(None) == 0
     assert abs(hm.solar_index(90, 0) - 1) < 1e-9 and abs(hm.solar_index(90, 100) - 0.25) < 1e-9

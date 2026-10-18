@@ -49,6 +49,7 @@ def series(rows: list, rooms: list, units: list):
     Y = {u: [] for u in units}
     U = {u: [] for u in units}
     F = {u: [] for u in units}
+    L = {u: [] for u in units}
     for row in rows:
         ts.append(datetime.fromisoformat(row["t"]))
         for r in rooms:
@@ -76,7 +77,15 @@ def series(rows: list, rooms: list, units: list):
                 Y[u].append(y if act == "heating" else -y)
             else:
                 Y[u].append(0.0)
-    return ts, T, out, sun, Y, U, F
+        # Leak drive for idle units (model.leak_inputs): the compressor's frequency when a unit reports it, else the
+        # other units' output in that mode.
+        hz = [v for k, v in (row.get("extra") or {}).items() if "compressor_frequency" in k and isinstance(v, (int, float))]
+        modes = {u: (row.get("units", {}).get(u) or {}).get("state") for u in units}
+        running = {u: (row.get("units", {}).get(u) or {}).get("action") in ("heating", "cooling") for u in units}
+        lk = hm.leak_inputs(modes, running, {u: Y[u][-1] for u in units}, units, max(hz) / 100.0 if hz else None)
+        for u in units:
+            L[u].append(lk[u])
+    return ts, T, out, sun, Y, U, F, L
 
 
 FAN_REF = ("auto", "high")  # fan modes counted as full output: the others' factors are relative to these
@@ -184,7 +193,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     """-> (HouseModel, report). layout: {"rooms": {id: {"units": [...], "neighbors": [...]}},
     "units": {id: {"sensor_rooms": [...] (optional: detected when missing), "zone": [...]}}}"""
     rooms, units = list(layout["rooms"]), list(layout["units"])
-    ts, T, out, sun, Y, U, F = series(rows, rooms, units)
+    ts, T, out, sun, Y, U, F, Lk = series(rows, rooms, units)
     n = len(ts)
     # A room's readings from before its `since` (a sensor that was replaced or moved) aren't the room: leave them out.
     for rid, spec in layout["rooms"].items():
@@ -221,8 +230,9 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
                 continue
             nbrs = [j for j in spec.get("neighbors", []) if j in neighbour_ok and j != rid]
             us = [u for u in spec.get("units", units) if u in Yl]
+            own = [u for u in units if rid in layout["units"].get(u, {}).get("zone", [])]  # units serving this room
             cols = (["loss"] + [f"c:{j}" for j in nbrs] + ["solar"] + [f"sun:{k}" for k in hm.WALLS] + ["bias"]
-                    + [f"h:{u}" for u in us] + [f"k:{u}" for u in us])
+                    + [f"h:{u}" for u in us] + [f"k:{u}" for u in us] + [f"l:{u}" for u in own])
             A, b = [], []
             for a in range(0, max(0, splits[rid] - window), stride):
                 z = a + window
@@ -238,6 +248,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
                 row = [o - Tm] + [v - Tm for v in nb] + [sv.get("h", 0.0)] + [sv.get(k, 0.0) for k in hm.WALLS] + [1.0]
                 row += [sum(max(0.0, y) for y in Yl[u][a:z]) / window for u in us]
                 row += [sum(min(0.0, y) for y in Yl[u][a:z]) / window for u in us]  # negative: cooling
+                row += [sum(Lk[u][a:z]) / window for u in own]
                 A.append(row)
                 b.append((Ti[-1] - Ti[0]) / (window / 60))
             if len(A) < 3 * len(cols):
@@ -255,7 +266,8 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
                                         sun_dir={k: round(p[f"sun:{k}"], 3) for k in hm.WALLS},
                                         heat={u: round(p[f"h:{u}"], 3) for u in us},
                                         cool={u: round(p[f"k:{u}"], 3) for u in us},
-                                        coupling={j: round(p[f"c:{j}"], 4) for j in nbrs})
+                                        coupling={j: round(p[f"c:{j}"], 4) for j in nbrs},
+                                        leak={u: round(p[f"l:{u}"], 3) for u in own})
             rep[rid] = {"windows": len(A), "r2_rate": round(r2, 3)}
         return rooms_m, rep, sse
 
@@ -317,7 +329,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
                                     lag_h=round(lags.get(uid, 0) / 60, 4), fan_scale=scales.get(uid, {}))
     report["lags_min"] = lags
     report["fan_scale"] = {u: {"relative_to": ref_fan.get(u), **v} for u, v in scales.items() if v}
-    report["holdout"] = validate(m, ts, T, out, sun, effective(Y, F, m), {r: splits[r] for r in m.rooms})
+    report["holdout"] = validate(m, ts, T, out, sun, effective(Y, F, m), {r: splits[r] for r in m.rooms}, Lk)
     report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
     # Every room with enough held-out checks must beat "nothing changes"; at least one must have been checked. A room
     # whose sensor only just started may have none yet: the live accuracy gate (mpc.readiness) still covers it.
@@ -331,7 +343,8 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     return m, report
 
 
-def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, horizon_min: int = 120, step_min: int = 5, every_min: int = 30):
+def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, L=None, horizon_min: int = 120, step_min: int = 5,
+             every_min: int = 30):
     """2 h ahead on the held-out part with the units at their logged output: RMSE of the model vs 'nothing changes'."""
     errs = {r: [] for r in m.rooms}
     base = {r: [] for r in m.rooms}
@@ -346,7 +359,8 @@ def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, horizon_min: int = 120
             seg = slice(k, k + step_min)
             o = _mean(out[seg])
             y = {u: sum(Y[u][seg]) / step_min for u in Y}
-            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y)
+            lk = {u: sum(v[seg]) / step_min for u, v in (L or {}).items()}
+            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y, lk)
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
         z = a + horizon_min
         for r in start:
@@ -389,7 +403,7 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
     weather and the sun did and predict each room `horizons` minutes ahead. -> {room: {"60": [[iso, F]], ...}}, each
     point at the time it's a prediction for, so it plots against the actual reading at that moment."""
     rooms, units = list(m.rooms), sorted({u for row in rows for u in row.get("units", {})})
-    ts, T, out, sun, Y, _, F = series(rows, rooms, units)
+    ts, T, out, sun, Y, _, F, Lk = series(rows, rooms, units)
     Y = effective(Y, F, m)
     res = {r: {str(h): [] for h in horizons} for r in rooms}
     hmax = max(horizons)
@@ -399,7 +413,8 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
             continue
         for k in range(a, a + hmax, step_min):
             seg = slice(k, k + step_min)
-            d = hm.derivative(m, cur, _mean(out[seg]), hm.mean_sun(sun[seg]), {u: sum(Y[u][seg]) / step_min for u in Y})
+            d = hm.derivative(m, cur, _mean(out[seg]), hm.mean_sun(sun[seg]), {u: sum(Y[u][seg]) / step_min for u in Y},
+                              {u: sum(v[seg]) / step_min for u, v in Lk.items()})
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
             done = k + step_min - a
             if done in horizons:

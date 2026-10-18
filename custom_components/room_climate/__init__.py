@@ -18,6 +18,7 @@ from homeassistant.components.climate.const import ATTR_FAN_MODE, SERVICE_SET_FA
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import Context, Event, HomeAssistant
 from homeassistant.helpers import discovery
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import (async_call_later, async_track_state_change_event, async_track_time_change,
@@ -775,7 +776,7 @@ class Manager:
             c, h = info.get("rooms", {}).get(r.id, (None, None))
             row["rooms"][r.id] = {"temp": num(val), "target": core.target_temp(r, now), "prio": core.room_priority(r, now),
                                   "pred": num(predicted.get(r.id)), "unit": r.unit, "cold": c, "hot": h}
-        prefixes = []
+        extra_ids = set()
         for u in units:
             cur, cmd = self.hass.states.get(u.entity), self.last.get(u.id)
             a = cur.attributes if cur is not None else {}
@@ -785,11 +786,12 @@ class Manager:
                                   "cmd": cmd.mode if cmd else None, "cmd_sp": cmd.setpoint if cmd else None,
                                   "cmd_fan": cmd.fan if cmd else None,
                                   "why": cmd.reason if cmd else None}
-            prefixes.append("sensor." + u.entity.split(".", 1)[1] + "_")
-        # Anything else the unit controllers report (signal now; fan stage, compressor Hz, outdoor coil temp if added).
-        for st in self.hass.states.async_all("sensor"):
-            if st.entity_id.startswith(tuple(prefixes)) and st.state not in BAD_STATES:
-                row["extra"][st.entity_id] = num(st.state) if num(st.state) is not None else st.state
+            extra_ids |= self._unit_sensors(u.entity)
+        # Everything else the unit controllers report: signal, compressor Hz, fan stage, sub-mode, outdoor unit temp...
+        for eid in sorted(extra_ids):
+            st = self.hass.states.get(eid)
+            if st is not None and st.state not in BAD_STATES:
+                row["extra"][eid] = num(st.state) if num(st.state) is not None else st.state
         row["mpc"] = self.shadow.log_fields()  # what the model-based controller would do
         if getattr(self, "exp_block", None):
             b = self.exp_block
@@ -810,6 +812,23 @@ class Manager:
             await self.hass.async_add_executor_job(datalog.append, path, row, now)
         except OSError as e:
             _LOGGER.warning("long-term log write failed: %s", e)
+
+    def _unit_sensors(self, climate_entity: str) -> set:
+        """Sensor entities on the same device as a unit's climate entity (whatever the device calls them), plus any
+        named after the climate entity."""
+        cache = self.__dict__.setdefault("_sensor_cache", {})
+        hit = cache.get(climate_entity)
+        if hit is not None and time.monotonic() - hit[0] < 600:
+            return hit[1]
+        reg = er.async_get(self.hass)
+        ent = reg.async_get(climate_entity)
+        ids = set()
+        if ent is not None and ent.device_id:
+            ids = {e.entity_id for e in er.async_entries_for_device(reg, ent.device_id) if e.domain == "sensor"}
+        prefix = "sensor." + climate_entity.split(".", 1)[1] + "_"
+        ids |= {e for e in self.hass.states.async_entity_ids("sensor") if e.startswith(prefix)}
+        cache[climate_entity] = (time.monotonic(), ids)
+        return ids
 
     def _audit(self, unit: core.Unit, cmd: core.Command, ours: bool, now):
         """Log what we want the unit to do next to what it is doing. Logged only when the decision (mode, setpoint)

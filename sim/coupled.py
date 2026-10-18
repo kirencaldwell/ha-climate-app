@@ -69,7 +69,8 @@ class Weather:
 def the_house() -> hm.HouseModel:
     """A plausible stand-in for the real house: first floor (air handler) open plan, bedrooms 1-2 off it, two
     minisplit bedrooms upstairs that the first floor warms up the stairs (stack effect: stronger up than down).
-    Bedroom 3 faces south (warms most around midday), the Primary bedroom gets the late-afternoon sun from the west."""
+    Bedroom 3 faces south (warms most around midday), the Primary bedroom gets the late-afternoon sun from the west, and
+    Bedroom 3's unit, idling in heat, leaks heat into it while the shared compressor runs for the others."""
     R = hm.RoomModel
     first = ["kitchen", "living_room", "dining_area"]
     rooms = {
@@ -87,6 +88,7 @@ def the_house() -> hm.HouseModel:
         "primary_bedroom": R(loss=0.055, solar=0.6, sun_dir={"w": 1.5}, bias=0.15, heat={"minisplit_1": 7.0}, cool={"minisplit_1": 6.0},
                              coupling={"living_room": 0.12, "bedroom_3": 0.15}),
         "bedroom_3": R(loss=0.06, solar=0.5, sun_dir={"s": 3.0}, bias=0.1, heat={"minisplit_2": 7.0}, cool={"minisplit_2": 6.0},
+                       leak={"minisplit_2": 2.5},  # its unit idling in heat picks up heat while the others run
                        coupling={"living_room": 0.12, "primary_bedroom": 0.15}),
     }
     fans = {k: v for k, v in FAN_SCALE.items() if v < 1}
@@ -158,7 +160,9 @@ class CoupledSim:
                 self.output[uid] = y
                 self.effect[uid] = hm.lag(u, self.effect[uid], y, 1 / 60)
                 self.energy += abs(y) / 60
-            d = hm.derivative(self.m, self.temps, self.weather.outdoor(self.now), self.weather.sun(self.now), self.effect)
+            leaks = hm.leak_inputs(self.mode, self.running, self.output, self.m.units)
+            d = hm.derivative(self.m, self.temps, self.weather.outdoor(self.now), self.weather.sun(self.now), self.effect,
+                              leaks)
             for rid, v in d.items():
                 self.temps[rid] += v / 60
             self.now += timedelta(minutes=1)
