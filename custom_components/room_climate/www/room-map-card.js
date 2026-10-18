@@ -543,19 +543,25 @@ class RoomMapCard extends HTMLElement {
     if (m) {
       const units = Object.keys(m.units || {});
       const rep = meta.report || {}, hold = rep.holdout || {};
+      // Sun: overhead, then the walls it learned the sun warms (strongest first), e.g. "0.5 · S 2.9 W 0.4".
+      const sunTxt = p => {
+        const d = Object.entries(p.sun_dir || {}).filter(([, v]) => v >= 0.05).sort((a, b) => b[1] - a[1])
+          .map(([k, v]) => `${k.toUpperCase()} ${v.toFixed(1)}`).join(" ");
+        return `${f1(p.solar)}${d ? ` · ${d}` : ""}`;
+      };
       const rows = Object.entries(m.rooms).map(([r, p]) => {
         const top = Object.entries(p.coupling || {}).filter(([, c]) => c > 0.005).sort((a, b) => b[1] - a[1]).slice(0, 2)
           .map(([j, c]) => `${name(j)} ${c.toFixed(2)}`).join(", ") || "—";
         const hc = units.map(u => `<td>${f1((p.heat || {})[u])} / ${f1((p.cool || {})[u])}</td>`).join("");
         const h = hold[r] || {};
         const ok = h.model_rmse_F != null && h.no_change_rmse_F != null && h.model_rmse_F < h.no_change_rmse_F;
-        return `<tr><td>${name(r)}</td>${hc}<td>${(p.loss || 0).toFixed(3)}</td><td>${f1(p.solar)}</td><td style="white-space:normal;min-width:9em">${top}</td>
+        return `<tr><td>${name(r)}</td>${hc}<td>${(p.loss || 0).toFixed(3)}</td><td style="white-space:nowrap">${sunTxt(p)}</td><td style="white-space:normal;min-width:9em">${top}</td>
           <td class="${h.model_rmse_F == null ? "" : ok ? "ok" : "bad"}">${h.model_rmse_F == null ? "—" : `${h.model_rmse_F}° vs ${h.no_change_rmse_F}°`}</td></tr>`;
       }).join("");
       const skipped = Object.entries(rep).filter(([, v]) => v && v.skipped).map(([r, v]) => `${name(r)}: ${v.skipped}`).join("; ");
       const fits = (d.fits || []).slice(-7).reverse().map(f => `<tr><td>${when(f.fitted)}</td><td>${f.rows}</td><td class="${f.usable ? "ok" : "warn"}">${f.usable ? "usable" : "learning"}</td></tr>`).join("");
       learned = `<div class="rc-sect"><h4>What the model learned</h4>
-        <p class="rc-sub" style="margin:4px 0">°F per hour each unit moves each room at full heat / full cool; loss to outdoors per hour; sun °F/h in full sun; strongest links to other rooms (per hour); and its 2-hour check on held-out data vs "nothing changes".</p>
+        <p class="rc-sub" style="margin:4px 0">°F per hour each unit moves each room at full heat / full cool; loss to outdoors per hour; sun °F/h in full sun (overhead, then by wall: E/S/W); strongest links to other rooms (per hour); and its 2-hour check on held-out data vs "nothing changes".</p>
         <div style="overflow-x:auto"><table class="rc-tbl"><tr><th>Room</th>${units.map(u => `<th>${name(u).replace(/ (air handler|minisplit)$/i, "")}</th>`).join("")}<th>Loss</th><th>Sun</th><th>Links</th><th>2 h check</th></tr>${rows}</table></div>
         ${skipped ? `<p class="rc-sub" style="margin:6px 0 0">Not fitted yet: ${skipped}</p>` : ""}
         ${fits ? `<h4 style="margin-top:12px">Recent fits</h4><table class="rc-tbl"><tr><th>When</th><th>Minutes</th><th></th></tr>${fits}</table>` : ""}</div>`;

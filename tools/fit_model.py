@@ -50,7 +50,7 @@ def main():
     json.dump(m.to_dict(), open(a.out, "w"), indent=2)
     print(f"{len(rows)} rows -> {a.out}  usable: {m.meta['usable']}")
     for rid, r in m.rooms.items():
-        print(f"  {rid:16s} loss {r.loss:.3f}/h  solar {r.solar:5.2f}  bias {r.bias:+.2f}  heat {r.heat}  cool {r.cool}"
+        print(f"  {rid:16s} loss {r.loss:.3f}/h  solar {r.solar:5.2f} {r.sun_dir}  bias {r.bias:+.2f}  heat {r.heat}  cool {r.cool}"
               f"  coupling {r.coupling}  | {rep.get(rid)}")
     for rid, v in rep.items():
         if rid not in m.rooms and rid != "holdout":

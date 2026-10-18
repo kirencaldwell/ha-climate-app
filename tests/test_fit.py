@@ -37,6 +37,9 @@ def test_fit_recovers_the_simulated_house():
         assert abs(fr.cool[own] - tr.cool[own]) < 0.25 * tr.cool[own], (rid, fr.cool, tr.cool)
         others = [v for u, v in fr.heat.items() if u != own]
         assert max(others) < 0.1 * tr.heat[own], (rid, fr.heat)  # no effect where there is none
+    b3, pb = m.rooms["bedroom_3"].sun_dir, m.rooms["primary_bedroom"].sun_dir
+    assert b3["s"] > 1.5 and b3["s"] > 2 * max(b3["e"], b3["w"]), b3  # it learns which way each room faces
+    assert pb["w"] > 0.6 and pb["w"] > 2 * max(pb["e"], pb["s"]), pb
     up = m.rooms["primary_bedroom"].coupling.get("living_room", 0)
     assert 0.05 < up < 0.2, up  # the stairs (true 0.12)
     assert {u: v.sensor_rooms for u, v in m.units.items()} == {u: v.sensor_rooms for u, v in truth.units.items()}

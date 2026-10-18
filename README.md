@@ -33,7 +33,9 @@ of the minute log; the optimizer plans every 5 minutes next to today's controlle
 shown on the card's **Model** page, with live prediction accuracy (30/60/120 min ahead, replaying what the units
 actually did, vs "nothing changes"), predicted-vs-actual charts and the learned room x unit sensitivities.
 - `custom_components/room_climate/model.py` – grey-box model: each room's loss to outdoors, sun gain, directed coupling
-  to other rooms (heat rising up the stairs), each unit's heating/cooling effect and lag (a warm coil keeps heating
+  to other rooms (heat rising up the stairs), sun overhead and on east/south/west walls (from the sun's height and
+  bearing, so a south room warms at midday and a west one late; each room learns its own mix), each unit's
+  heating/cooling effect and lag (a warm coil keeps heating
   after the compressor stops), and the units' own inverter loop.
 - `custom_components/room_climate/optimizer.py` – every few minutes, tries heat/cool and setpoints (two blocks: now and
   later), simulates ~2 h ahead and minimizes Σ priority × (miss outside the comfort band)², plus charges for mode

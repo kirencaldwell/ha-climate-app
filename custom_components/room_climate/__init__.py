@@ -556,7 +556,7 @@ class Manager:
         outdoor_ahead, cloud_ahead = self._weather_ahead(now, outdoor, cloud)
 
         def sun_at(t):
-            return hm.solar_index(hm.sun_elevation(t, lat, lon), cloud_ahead(t))
+            return hm.sun_at(t, lat, lon, cloud_ahead(t))
 
         self.shadow.observe(now, temps, actual, outdoor, sun_at(now))
         if self.shadow.due(now) and not self._shadow_busy:

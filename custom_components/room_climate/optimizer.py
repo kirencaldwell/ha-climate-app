@@ -86,7 +86,7 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
     n = max(1, int(round(ps.horizon_h * 60 / ps.step_min)))
     dt_h = ps.step_min / 60
     times = [now + timedelta(minutes=ps.step_min * (k + 1)) for k in range(n)]
-    outdoor, sun = _pad(outdoor_seq, n), [s or 0.0 for s in _pad(sun_seq, n)]
+    outdoor, sun = _pad(outdoor_seq, n), [hm.as_sun(s) for s in _pad(sun_seq, n)]
     scored = [r for r in rooms if r.unit is not None and r.id in m.rooms and temps.get(r.id) is not None
               and r.id not in ignore]
     # Targets and weights over the horizon don't depend on the plan: work them out once.

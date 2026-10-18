@@ -4,7 +4,9 @@ Each room's temperature changes (F per hour) by
     loss * (outdoor - T)                      heat leaking to or from outdoors
   + sum coupling[j] * (T_j - T)                heat exchanged with other rooms; directed, so heat rising from the
                                                first floor to a bedroom can be stronger than the other way
-  + solar * sun                                sun gain, sun in 0..1 (see solar_index)
+  + solar * sun_h + sum sun_dir[k] * sun_k      sun gain: overall (sun height) plus sun on east/south/west walls,
+                                               each 0..1 (see sun_vector), so a south room can warm at midday and a
+                                               west one late in the day
   + bias                                       people, appliances, anything unmodelled
   + sum heat[u] * y_u   (y_u > 0, heating)     each unit's effect at its current output
   - sum cool[u] * |y_u| (y_u < 0, cooling)
@@ -25,7 +27,8 @@ from datetime import datetime, timezone
 @dataclass
 class RoomModel:
     loss: float = 0.04  # 1/h toward outdoors
-    solar: float = 0.0  # F/h in full sun
+    solar: float = 0.0  # F/h in full sun (overhead: roof, skylights, anything not facing one way)
+    sun_dir: dict = field(default_factory=dict)  # "e"/"s"/"w" -> F/h with full sun straight onto a wall facing that way
     bias: float = 0.0  # F/h
     heat: dict = field(default_factory=dict)  # unit id -> F/h at full heating output
     cool: dict = field(default_factory=dict)  # unit id -> F/h of cooling at full cooling output (positive)
@@ -76,6 +79,62 @@ def solar_index(elevation_deg, cloud_pct=None) -> float:
     return clear * (1.0 - 0.75 * cloud)
 
 
+WALLS = {"e": 90.0, "s": 180.0, "w": 270.0}  # wall facing -> compass bearing
+
+
+def sun_vector(elevation_deg, azimuth_deg, cloud_pct=None) -> dict:
+    """Sun strengths 0..1: "h" overhead (solar_index) and, per wall facing (WALLS), how squarely the sun hits a
+    vertical wall that way (cos of the angle between the beam and the wall's normal), faded in over the first 10
+    degrees above the horizon (trees, neighbours) and dimmed by cloud like "h". No azimuth: overhead only."""
+    h = solar_index(elevation_deg, cloud_pct)
+    out = {"h": h, "e": 0.0, "s": 0.0, "w": 0.0}
+    if azimuth_deg is None or elevation_deg is None or elevation_deg <= 0:
+        return out
+    cloud = 0.0 if cloud_pct is None else max(0.0, min(100.0, cloud_pct)) / 100.0
+    beam = math.cos(math.radians(elevation_deg)) * min(1.0, elevation_deg / 10.0) * (1.0 - 0.75 * cloud)
+    for k, bearing in WALLS.items():
+        out[k] = round(max(0.0, beam * math.cos(math.radians(azimuth_deg - bearing))), 4)
+    return out
+
+
+def as_sun(sun) -> dict:
+    """A sun input as a vector: a plain number (older callers) is the overhead strength only."""
+    if isinstance(sun, dict):
+        return sun
+    return {"h": sun or 0.0}
+
+
+def mean_sun(xs) -> dict:
+    """Average of sun inputs (numbers or vectors)."""
+    vs = [as_sun(x) for x in xs]
+    if not vs:
+        return {"h": 0.0}
+    keys = set().union(*vs)
+    return {k: sum(v.get(k, 0.0) for v in vs) / len(vs) for k in keys}
+
+
+def _solar_hour_angle(t: datetime, lat: float, lon: float):
+    u = t.astimezone(timezone.utc) if t.tzinfo else t
+    doy = u.timetuple().tm_yday
+    decl = math.radians(23.44) * math.sin(2 * math.pi * (284 + doy) / 365)
+    b = 2 * math.pi * (doy - 81) / 364
+    eot_min = 9.87 * math.sin(2 * b) - 7.53 * math.cos(b) - 1.5 * math.sin(b)  # equation of time
+    solar_hour = u.hour + u.minute / 60 + lon / 15 + eot_min / 60
+    return math.radians(15 * (solar_hour - 12)), decl, math.radians(lat)
+
+
+def sun_azimuth(t: datetime, lat: float, lon: float) -> float:
+    """Sun compass bearing in degrees (0 north, 90 east, 180 south) at time `t`, within a degree or two."""
+    ha, decl, la = _solar_hour_angle(t, lat, lon)
+    az = math.degrees(math.atan2(-math.sin(ha), math.tan(decl) * math.cos(la) - math.sin(la) * math.cos(ha)))
+    return az % 360.0
+
+
+def sun_at(t: datetime, lat: float, lon: float, cloud_pct=None) -> dict:
+    """The sun vector at time `t` for a place (sun_vector of its elevation and azimuth)."""
+    return sun_vector(sun_elevation(t, lat, lon), sun_azimuth(t, lat, lon), cloud_pct)
+
+
 def sun_elevation(t: datetime, lat: float, lon: float) -> float:
     """Sun elevation in degrees at time `t` (timezone-aware; naive = UTC) for latitude/longitude, within ~1 degree."""
     u = t.astimezone(timezone.utc) if t.tzinfo else t
@@ -115,13 +174,16 @@ def unit_output(u: UnitModel, mode: str, setpoint, reading, running: bool, hold:
 
 
 def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict) -> dict:
-    """dT/dt (F/h) for every modelled room with a temperature."""
+    """dT/dt (F/h) for every modelled room with a temperature. `sun`: a sun vector (sun_vector) or overhead 0..1."""
     out = {}
+    sv = as_sun(sun)
     for rid, r in m.rooms.items():
         t = temps.get(rid)
         if t is None:
             continue
-        d = r.bias + r.solar * sun
+        d = r.bias + r.solar * sv.get("h", 0.0)
+        for k, c in r.sun_dir.items():
+            d += c * sv.get(k, 0.0)
         if outdoor is not None:
             d += r.loss * (outdoor - t)
         for j, c in r.coupling.items():

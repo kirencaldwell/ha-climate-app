@@ -47,6 +47,21 @@ def test_inverter_starts_modulates_and_stops():
     assert hm.unit_output(u, "off", 66, 70, True) == (0.0, False)
 
 
+def test_sun_direction():
+    from datetime import timezone
+    tz = timezone(timedelta(hours=-7))
+    noon, late = datetime(2026, 10, 17, 13, 0, tzinfo=tz), datetime(2026, 10, 17, 17, 0, tzinfo=tz)
+    assert abs(hm.sun_azimuth(noon, 47.68, -122.38) - 181.2) < 2  # HA's sun.sun said 181.2 then
+    assert abs(hm.sun_azimuth(datetime(2026, 10, 17, 15, 0, tzinfo=tz), 47.68, -122.38) - 214.7) < 2
+    n, l = hm.sun_at(noon, 47.68, -122.38, 0), hm.sun_at(late, 47.68, -122.38, 0)
+    assert n["s"] > 0.8 and n["e"] == 0 and l["w"] > l["s"] > 0  # south wall at midday, west wall late
+    assert hm.sun_vector(-3, 200)["s"] == 0 and hm.sun_vector(30, None)["s"] == 0  # night; no azimuth known
+    assert hm.sun_at(noon, 47.68, -122.38, 100)["s"] < 0.3 * n["s"]  # clouds
+    m = hm.HouseModel({"r": hm.RoomModel(loss=0, solar=1.0, sun_dir={"s": 2.0})}, {})
+    assert hm.derivative(m, {"r": 67.0}, None, {"h": 0.5, "s": 0.5}, {})["r"] == 1.5
+    assert hm.derivative(m, {"r": 67.0}, None, 0.5, {})["r"] == 0.5  # a plain number is overhead only
+
+
 def test_solar_index():
     assert hm.solar_index(-5, 0) == 0 and hm.solar_index(None) == 0
     assert abs(hm.solar_index(90, 0) - 1) < 1e-9 and abs(hm.solar_index(90, 100) - 0.25) < 1e-9

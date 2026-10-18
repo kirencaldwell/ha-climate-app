@@ -26,6 +26,10 @@ import optimizer  # noqa: E402
 LAT, LON = 47.68, -122.38  # the house (from its NWS weather entity)
 
 
+def sun_azimuth(t: datetime, lat=LAT, lon=LON, utc_offset_h=-7.0) -> float:
+    return hm.sun_azimuth(t - timedelta(hours=utc_offset_h), lat, lon)  # sim times are naive local; model wants UTC
+
+
 def sun_elevation(t: datetime, lat=LAT, lon=LON, utc_offset_h=-7.0) -> float:
     doy = t.timetuple().tm_yday
     decl = math.radians(23.44) * math.sin(2 * math.pi * (284 + doy) / 365)
@@ -57,12 +61,13 @@ class Weather:
         return float(self._day(t)[2])
 
     def sun(self, t: datetime) -> float:
-        return hm.solar_index(sun_elevation(t), self.cloud(t))
+        return hm.sun_vector(sun_elevation(t), sun_azimuth(t), self.cloud(t))
 
 
 def the_house() -> hm.HouseModel:
     """A plausible stand-in for the real house: first floor (air handler) open plan, bedrooms 1-2 off it, two
-    minisplit bedrooms upstairs that the first floor warms up the stairs (stack effect: stronger up than down)."""
+    minisplit bedrooms upstairs that the first floor warms up the stairs (stack effect: stronger up than down).
+    Bedroom 3 faces south (warms most around midday), the Primary bedroom gets the late-afternoon sun from the west."""
     R = hm.RoomModel
     first = ["kitchen", "living_room", "dining_area"]
     rooms = {
@@ -77,9 +82,9 @@ def the_house() -> hm.HouseModel:
                        coupling={"living_room": 0.15, "bedroom_2": 0.1}),
         "bedroom_2": R(loss=0.045, solar=0.8, bias=0.1, heat={"air_handler": 4.0}, cool={"air_handler": 3.4},
                        coupling={"living_room": 0.15, "bedroom_1": 0.1}),
-        "primary_bedroom": R(loss=0.055, solar=1.6, bias=0.15, heat={"minisplit_1": 7.0}, cool={"minisplit_1": 6.0},
+        "primary_bedroom": R(loss=0.055, solar=0.6, sun_dir={"w": 1.5}, bias=0.15, heat={"minisplit_1": 7.0}, cool={"minisplit_1": 6.0},
                              coupling={"living_room": 0.12, "bedroom_3": 0.15}),
-        "bedroom_3": R(loss=0.06, solar=2.5, bias=0.1, heat={"minisplit_2": 7.0}, cool={"minisplit_2": 6.0},
+        "bedroom_3": R(loss=0.06, solar=0.5, sun_dir={"s": 3.0}, bias=0.1, heat={"minisplit_2": 7.0}, cool={"minisplit_2": 6.0},
                        coupling={"living_room": 0.12, "primary_bedroom": 0.15}),
     }
     units = {"air_handler": hm.UnitModel(sensor_rooms=["kitchen"]),
@@ -151,7 +156,7 @@ class CoupledSim:
         """One minute in the shape of the HA long-term log."""
         t = self.now
         return {"t": t.isoformat(), "outdoor": round(self.weather.outdoor(t), 2),
-                "weather": {"cloud": self.weather.cloud(t)}, "sun": {"elev": round(sun_elevation(t), 2)},
+                "weather": {"cloud": self.weather.cloud(t)}, "sun": {"elev": round(sun_elevation(t), 2), "az": round(sun_azimuth(t), 2)},
                 "rooms": {r.id: {"temp": self.reading(r.id), "target": core.target_temp(r, t), "prio": core.room_priority(r, t),
                                  "unit": r.unit} for r in rooms if r.id in self.temps},
                 "units": {u: {"state": self.mode[u], "sp": None if self.sp[u] is None else round(self.sp[u], 1),

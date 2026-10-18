@@ -1,7 +1,8 @@
 """Fit the thermal model (model.py) to minute-log rows. Pure Python, so Home Assistant can refit it every night.
 
 For each room, over windows of `window` minutes (overlapping, every `stride`):
-    (T_end - T_start) / hours  =  loss*(out - T) + sum c_j*(T_j - T) + solar*sun + bias + sum heat_u*y_u+ - sum cool_u*y_u-
+    (T_end - T_start) / hours  =  loss*(out - T) + sum c_j*(T_j - T) + solar*sun_h + sum_k sun_k*sun_k (east/south/west
+                                  walls) + bias + sum heat_u*y_u+ - sum cool_u*y_u-
 with every quantity averaged over the window and y_u+ / y_u- a unit's estimated heating / cooling output (0..1: on
 when the log says heating / cooling, scaled by the inverter's response to its setpoint gap). Ridge least squares with
 every coefficient except bias held >= 0, so the result stays physical; windows long enough to rise above sensor
@@ -55,7 +56,8 @@ def series(rows: list, rooms: list, units: list):
         if o is None:
             o = (row.get("weather") or {}).get("temp")
         out.append(None if o is None else float(o))
-        sun.append(hm.solar_index((row.get("sun") or {}).get("elev"), (row.get("weather") or {}).get("cloud")))
+        sn = row.get("sun") or {}
+        sun.append(hm.sun_vector(sn.get("elev"), sn.get("az"), (row.get("weather") or {}).get("cloud")))
         for u in units:
             x = row.get("units", {}).get(u) or {}
             act, sp, rd = x.get("action"), x.get("sp"), x.get("temp")
@@ -183,6 +185,12 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
             report[r] = {"skipped": f"not enough data yet ({have[r] / 60:.0f} of {min_hours} h of readings)"}
     T = {r: v for r, v in T.items() if have[r] >= min_hours * 60}
     neighbour_ok = {r for r in T if cover[r] >= min_cover}
+    # Each room trains on the first part of its own readings and is tested on the rest: a room whose sensor started
+    # recently has all its readings near the end of the log, inside a split made by time alone.
+    splits = {}
+    for r, v in T.items():
+        idx = [k for k, x in enumerate(v) if x is not None]
+        splits[r] = idx[min(len(idx) - 1, int(len(idx) * (1 - holdout)))] if idx else n
 
     def rooms_fit(Yl):
         """Fit every room with the units' outputs `Yl` -> (room models, per-room report, training SSE)."""
@@ -192,9 +200,10 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
                 continue
             nbrs = [j for j in spec.get("neighbors", []) if j in neighbour_ok and j != rid]
             us = [u for u in spec.get("units", units) if u in Yl]
-            cols = ["loss"] + [f"c:{j}" for j in nbrs] + ["solar", "bias"] + [f"h:{u}" for u in us] + [f"k:{u}" for u in us]
+            cols = (["loss"] + [f"c:{j}" for j in nbrs] + ["solar"] + [f"sun:{k}" for k in hm.WALLS] + ["bias"]
+                    + [f"h:{u}" for u in us] + [f"k:{u}" for u in us])
             A, b = [], []
-            for a in range(0, max(0, split - window), stride):
+            for a in range(0, max(0, splits[rid] - window), stride):
                 z = a + window
                 Ti = T[rid][a:z]
                 if Ti[0] is None or Ti[-1] is None or sum(v is None for v in Ti) > 0.2 * window:
@@ -204,7 +213,8 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
                 if o is None or any(v is None for v in nb):
                     continue
                 Tm = _mean(Ti)
-                row = [o - Tm] + [v - Tm for v in nb] + [sum(sun[a:z]) / window, 1.0]
+                sv = hm.mean_sun(sun[a:z])
+                row = [o - Tm] + [v - Tm for v in nb] + [sv.get("h", 0.0)] + [sv.get(k, 0.0) for k in hm.WALLS] + [1.0]
                 row += [sum(max(0.0, y) for y in Yl[u][a:z]) / window for u in us]
                 row += [sum(min(0.0, y) for y in Yl[u][a:z]) / window for u in us]  # negative: cooling
                 A.append(row)
@@ -221,6 +231,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
             r2 = 1 - res / ss if ss > 0 else 0.0
             p = dict(zip(cols, x))
             rooms_m[rid] = hm.RoomModel(loss=round(p["loss"], 4), solar=round(p["solar"], 3), bias=round(p["bias"], 3),
+                                        sun_dir={k: round(p[f"sun:{k}"], 3) for k in hm.WALLS},
                                         heat={u: round(p[f"h:{u}"], 3) for u in us},
                                         cool={u: round(p[f"k:{u}"], 3) for u in us},
                                         coupling={j: round(p[f"c:{j}"], 4) for j in nbrs})
@@ -255,7 +266,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
         m.units[uid] = hm.UnitModel(sensor_rooms=[r for r in sr if r in m.rooms], sensor_offset=off,
                                     lag_h=round(lags.get(uid, 0) / 60, 4))
     report["lags_min"] = lags
-    report["holdout"] = validate(m, ts, T, out, sun, with_lags(Y, m), split)
+    report["holdout"] = validate(m, ts, T, out, sun, with_lags(Y, m), {r: splits[r] for r in m.rooms})
     report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
     # Every room with enough held-out checks must beat "nothing changes"; at least one must have been checked. A room
     # whose sensor only just started may have none yet: the live accuracy gate (mpc.readiness) still covers it.
@@ -269,12 +280,13 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     return m, report
 
 
-def validate(m: hm.HouseModel, ts, T, out, sun, Y, split: int, horizon_min: int = 120, step_min: int = 5, every_min: int = 30):
+def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, horizon_min: int = 120, step_min: int = 5, every_min: int = 30):
     """2 h ahead on the held-out part with the units at their logged output: RMSE of the model vs 'nothing changes'."""
     errs = {r: [] for r in m.rooms}
     base = {r: [] for r in m.rooms}
     n = len(ts)
-    for a in range(split, n - horizon_min, every_min):
+    splits = split if isinstance(split, dict) else {r: split for r in m.rooms}  # room -> first held-out minute
+    for a in range(min(splits.values(), default=n), n - horizon_min, every_min):
         start = {r: T[r][a] for r in m.rooms if T[r][a] is not None}  # rooms without a reading sit this one out
         if not start:
             continue
@@ -283,11 +295,11 @@ def validate(m: hm.HouseModel, ts, T, out, sun, Y, split: int, horizon_min: int 
             seg = slice(k, k + step_min)
             o = _mean(out[seg])
             y = {u: sum(Y[u][seg]) / step_min for u in Y}
-            d = hm.derivative(m, cur, o, sum(sun[seg]) / step_min, y)
+            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y)
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
         z = a + horizon_min
         for r in start:
-            if T[r][z] is not None:
+            if a >= splits.get(r, n) and T[r][z] is not None:
                 errs[r].append(cur[r] - T[r][z])
                 base[r].append(start[r] - T[r][z])
 
@@ -336,7 +348,7 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
             continue
         for k in range(a, a + hmax, step_min):
             seg = slice(k, k + step_min)
-            d = hm.derivative(m, cur, _mean(out[seg]), sum(sun[seg]) / step_min, {u: sum(Y[u][seg]) / step_min for u in Y})
+            d = hm.derivative(m, cur, _mean(out[seg]), hm.mean_sun(sun[seg]), {u: sum(Y[u][seg]) / step_min for u in Y})
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
             done = k + step_min - a
             if done in horizons:

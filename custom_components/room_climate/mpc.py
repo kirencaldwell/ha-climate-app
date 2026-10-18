@@ -171,7 +171,7 @@ class ShadowPlanner:
     def run(self, now: datetime, rooms: list, units: list, temps: dict, actual: dict, outdoor, sun_at,
             settings: core.Settings, ignore=(), fixed=None, drives=None):
         """Plan, if due. actual: unit id -> {"mode", "setpoint" (F), "running"}; outdoor: F now, or outdoor(datetime) ->
-        F from a forecast; sun_at(datetime) -> 0..1; fixed: unit id -> (mode, setpoint) for units on their own
+        F from a forecast; sun_at(datetime) -> sun vector (model.sun_vector) or 0..1; fixed: unit id -> (mode, setpoint) for units on their own
         thermostats (planned around, not for); drives: unit id -> core.DriveState, the outer loops as they are now."""
         if self.model is None or not (self.next_plan is None or now >= self.next_plan):
             return
