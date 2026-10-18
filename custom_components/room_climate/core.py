@@ -104,6 +104,11 @@ class Settings:
     drive_lead_min: float = 10.0  # act on where the room will be this far ahead (anticipates the coast after a stop);
     #                               a unit's learned lag replaces it
     drive_max_push: float = 2.0  # setpoint at most this far past the room reading: limits the blast of hot/cold air
+    # Per unit, for rooms that respond very differently: "unit:F,unit:F". A unit not listed gets a push limit from its
+    # learned effect (so it moves its rooms at most drive_max_rate F/h), else drive_max_push.
+    drive_max_push_units: str = "air_handler:4,minisplit_2:1"
+    drive_max_rate: float = 4.0
+    drive_push_cap: float = 4.0  # never more than this, set or learned
     drive_stop_push: float = 2.0  # setpoint this far behind the reading to make the unit stop (it idles ~1 C past it)
     drive_off: float = 0.5  # stop the unit once the room is predicted this far past target
     drive_restart: float = 0.6  # once stopped, restart only when the room is predicted this far short of target
@@ -448,8 +453,26 @@ def to_grid(setpoint_f: float) -> float:
     return round(stored_setpoint_c(setpoint_f) * 1.8 + 32, 1)
 
 
+def max_push_for(unit_id: str, effect: Optional[float], settings: Settings = Settings(), k0: float = 0.3,
+                 k1: float = 0.5) -> float:
+    """How far past the room a unit's setpoint may go: set per unit (drive_max_push_units), else from its learned
+    effect on its rooms (F/h at full output; the inverter's output is about k0 + k1 x push), so that it moves them at
+    most drive_max_rate F/h, else drive_max_push. At least one 0.5 C step, at most drive_push_cap."""
+    for part in settings.drive_max_push_units.split(","):
+        k, _, v = part.partition(":")
+        if k.strip() == unit_id and v.strip():
+            try:
+                return max(0.9, min(settings.drive_push_cap, float(v)))
+            except ValueError:
+                break
+    if effect and effect > 0:
+        return max(0.9, min(settings.drive_push_cap, (settings.drive_max_rate / effect - k0) / k1))
+    return settings.drive_max_push
+
+
 def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, rate: Optional[float], kp: float,
-              now: datetime, settings: Settings = Settings(), lead_min: Optional[float] = None) -> tuple[float, DriveState]:
+              now: datetime, settings: Settings = Settings(), lead_min: Optional[float] = None,
+              max_push: Optional[float] = None) -> tuple[float, DriveState]:
     """The outer loop: how far past the room reading to put the setpoint (the push, F, positive = in the mode's
     direction), from the room's predicted miss `lead_min` ahead (target minus prediction, signed so that > 0 means
     the room still needs this mode's help). The lead is the unit's learned lag when there is one: with a first-order
@@ -482,12 +505,13 @@ def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, r
     step = 0.9
     if on:
         p = kp * miss
-        if p + i < settings.drive_max_push:  # anti-windup: don't build while saturated
+        cap = settings.drive_max_push if max_push is None else max_push
+        if p + i < cap:  # anti-windup: don't build while saturated
             i = max(0.0, min(settings.drive_i_max, i + kp * miss * dt_h / ti_h))
         # Clearly short: at least one step, or a push that rounds to the room's own reading never starts the unit
         # (Bedroom 3 sat idle at 65.3 with its setpoint 65.3 for an hour). Near target the unit may settle lower.
         low = step if miss > settings.drive_restart else -step
-        push = max(low, min(settings.drive_max_push, p + i))
+        push = max(low, min(cap, p + i))
     else:
         i = max(0.0, i + kp * min(0.0, miss) * dt_h / ti_h)  # bleeds off while past target
         push = -settings.drive_stop_push
@@ -496,7 +520,7 @@ def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, r
     return push, keep
 
 
-def fan_for(push: float, miss: float, on: bool, settings: Settings = Settings()) -> Optional[str]:
+def fan_for(push: float, miss: float, on: bool, settings: Settings = Settings(), max_push: Optional[float] = None) -> Optional[str]:
     """Fan mode for a push (None: no opinion, i.e. stopped: leave it)."""
     if not on:
         return None
@@ -505,14 +529,15 @@ def fan_for(push: float, miss: float, on: bool, settings: Settings = Settings())
     levels = [x.strip() for x in settings.fan_levels.split(",") if x.strip()]
     if not levels:
         return None
-    frac = max(0.0, push) / max(1e-6, settings.drive_max_push)
+    frac = max(0.0, push) / max(1e-6, settings.drive_max_push if max_push is None else max_push)
     return levels[min(len(levels) - 1, int(frac * len(levels)))]
 
 
-def choose_fan(st: DriveState, push: float, now: datetime, settings: Settings = Settings()) -> Optional[str]:
+def choose_fan(st: DriveState, push: float, now: datetime, settings: Settings = Settings(),
+               max_push: Optional[float] = None) -> Optional[str]:
     """The fan mode to have now, holding a change for fan_min_interval_s (except to auto, which goes at once).
     Updates st.fan/st.fan_at. None: leave the fan alone."""
-    want = fan_for(push, st.miss, st.on, settings)
+    want = fan_for(push, st.miss, st.on, settings, max_push)
     if want is None or want == st.fan:
         return st.fan if want is not None else None
     if st.fan is not None and want != "auto" and st.fan_at is not None \
@@ -523,7 +548,8 @@ def choose_fan(st: DriveState, push: float, now: datetime, settings: Settings = 
 
 
 def drive(cmd: Command, st: Optional[DriveState], rate: Optional[float], kp: float, unit: Unit, now: datetime,
-          settings: Settings = Settings(), lead_min: Optional[float] = None) -> tuple[Command, DriveState, bool]:
+          settings: Settings = Settings(), lead_min: Optional[float] = None,
+          max_push: Optional[float] = None) -> tuple[Command, DriveState, bool]:
     """Turn a command's target into the setpoint to send this tick -> (command, new state, changed).
 
     Setpoints sit on the unit's 0.5 C grid. A new setpoint goes out on a start or stop, on a mode change, or when it
@@ -533,7 +559,7 @@ def drive(cmd: Command, st: Optional[DriveState], rate: Optional[float], kp: flo
         new = DriveState(cmd.mode, False, 0.0, now, keep, st.sent_at if st and keep is not None else None)
         return Command(cmd.mode, keep, cmd.reason, False, keep, cmd.target, cmd.room, cmd.offset), new, \
             st is None or st.mode != cmd.mode
-    push, new = drive_law(st, cmd.mode, cmd.room, cmd.target, rate, kp, now, settings, lead_min)
+    push, new = drive_law(st, cmd.mode, cmd.room, cmd.target, rate, kp, now, settings, lead_min, max_push)
     s = 1.0 if cmd.mode == "heat" else -1.0
     raw = max(unit.min_setpoint, min(unit.max_setpoint, cmd.room + cmd.offset + s * push))
     sp = to_grid(raw)
@@ -558,7 +584,7 @@ def drive(cmd: Command, st: Optional[DriveState], rate: Optional[float], kp: flo
         why = "at target; idling"
     fan = None
     if unit.id in {x.strip() for x in settings.fan_units.split(",")}:
-        fan = choose_fan(new, push, now, settings)
+        fan = choose_fan(new, push, now, settings, max_push)
     return Command(cmd.mode, sp, why, new.on, raw, cmd.target, cmd.room, cmd.offset, fan), new, changed
 
 

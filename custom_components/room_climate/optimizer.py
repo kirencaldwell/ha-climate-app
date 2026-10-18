@@ -115,10 +115,12 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
         return core.round_cool(zone_target(mine, a) + m.units[u.id].sensor_offset)
 
     zone_rooms = {u.id: [r for r in scored if r.unit == u.id] for u in known_units}
-    kp = {}
+    kp, cap = {}, {}
     for u in known_units:
         eff = [m.rooms[r.id].heat.get(u.id, 0.0) for r in zone_rooms[u.id]]
-        kp[u.id] = core.drive_gain(sum(eff) / len(eff) if eff else None, settings, m.units[u.id].k1)
+        e = sum(eff) / len(eff) if eff else None
+        kp[u.id] = core.drive_gain(e, settings, m.units[u.id].k1)
+        cap[u.id] = core.max_push_for(u.id, e, settings, m.units[u.id].k0, m.units[u.id].k1)
 
     fan_units = {x.strip() for x in settings.fan_units.split(",")}
 
@@ -140,11 +142,11 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
                 off = 0.0 if rd is None else rd - room
                 lag = m.units[u.id].lag_h * 60
                 push, states[u.id] = core.drive_law(states.get(u.id), mode, room, targets[u.id], rate, kp[u.id],
-                                                    clock[0], settings, lag if lag > 0 else None)
+                                                    clock[0], settings, lag if lag > 0 else None, cap[u.id])
                 sgn = 1.0 if mode == "heat" else -1.0
                 out[u.id] = max(u.min_setpoint, min(u.max_setpoint, room + off + sgn * push))
                 if u.id in fan_units:
-                    f = core.fan_for(push, states[u.id].miss, states[u.id].on, settings)
+                    f = core.fan_for(push, states[u.id].miss, states[u.id].on, settings, cap[u.id])
                     if f is not None:
                         fan_now[u.id] = f
                 if u.id not in first:

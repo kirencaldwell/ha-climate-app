@@ -367,6 +367,19 @@ class Manager:
         u = m.units.get(unit_id) if m is not None else None
         return u.lag_h * 60 if u is not None and u.lag_h > 0 else None
 
+    def _own_effect(self, unit_id: str, mode: str, rooms: list):
+        m = self.shadow.model
+        if m is None or unit_id not in m.units:
+            return None, None
+        eff = [(m.rooms[r.id].heat if mode == "heat" else m.rooms[r.id].cool).get(unit_id, 0.0)
+               for r in rooms if r.unit == unit_id and r.id in m.rooms]
+        return (sum(eff) / len(eff) if eff else None), m.units[unit_id]
+
+    def drive_max_push(self, unit_id: str, mode: str, rooms: list, settings: core.Settings) -> float:
+        """How far past the room a unit may be pushed: set per unit, else from its learned effect (core.max_push_for)."""
+        eff, um = self._own_effect(unit_id, mode, rooms)
+        return core.max_push_for(unit_id, eff, settings, *((um.k0, um.k1) if um else ()))
+
     def drive_kp(self, unit_id: str, mode: str, rooms: list, settings: core.Settings) -> float:
         """Outer-loop gain for a unit, from the model's learned effect of the unit on its own rooms (core.drive_gain)."""
         m = self.shadow.model
@@ -574,7 +587,8 @@ class Manager:
                     h.popleft()
                 cmd, self.drives[u.id], changed = core.drive(
                     c, self.drives.get(u.id), core.slope(list(h), now, settings.drive_slope_s),
-                    self.drive_kp(u.id, c.mode, rooms, settings), u, now, settings, self.drive_lead(u.id))
+                    self.drive_kp(u.id, c.mode, rooms, settings), u, now, settings, self.drive_lead(u.id),
+                    self.drive_max_push(u.id, c.mode, rooms, settings))
                 if ctl == MODEL:
                     cmd.reason = f"{c.reason} -> {cmd.reason}"
             elif ctl == MODEL:

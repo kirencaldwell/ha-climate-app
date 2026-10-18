@@ -745,3 +745,15 @@ def test_fan_follows_the_push_and_holds_changes():
     assert other.fan is None
     stopped, _, _ = _drv(66.9, 67.0, rate=12.0, st=st, t=MON + timedelta(minutes=1), s=s)
     assert not stopped.active and stopped.fan is None  # stopping leaves the fan as it was
+
+
+def test_push_limit_per_unit_set_or_learned():
+    s = Settings(drive_max_push_units="ah:4,b3:1")
+    assert core.max_push_for("ah", None, s) == 4 and core.max_push_for("b3", 30.0, s) == 1
+    assert core.max_push_for("x", None, s) == s.drive_max_push  # nothing set or learned
+    assert core.max_push_for("x", 30.0, s) == 0.9  # a very strong unit: one 0.5 C step
+    assert core.max_push_for("x", 1.0, s) == s.drive_push_cap  # a weak one: up to the cap
+    cmd = core.Command("heat", None, "", True, None, 68.0, 63.0, 0.0)
+    far4, _, _ = core.drive(cmd, None, 0.0, 1.0, Unit("ah", "climate.ah"), MON, s, None, 4.0)
+    far2, _, _ = core.drive(cmd, None, 0.0, 1.0, Unit("ah", "climate.ah"), MON, s, None, 2.0)
+    assert far4.raw - 63.0 > far2.raw - 63.0 + 1.5  # a slow room far behind gets the bigger push

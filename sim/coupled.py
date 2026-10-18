@@ -217,7 +217,7 @@ class HeuristicController:
                     del h[:max(0, len(h) - 60)]
                 cmd, self.drives[u.id], changed = core.drive(c, self.drives.get(u.id), core.slope(h, now, self.s.drive_slope_s),
                                                              self.kp.get(u.id, self.s.drive_kp), u, now, self.s,
-                                                             self.lead.get(u.id))
+                                                             self.lead.get(u.id), core.max_push_for(u.id, None, self.s))
             else:
                 cmd, changed = core.stabilize(cmds[u.id], self.sent.get(u.id), now, self.s)
             if changed and cmd.setpoint is not None:
@@ -268,7 +268,8 @@ class MPCController:
             cmd = core.Command(self.house.mode, None, "", True, None, self.targets[u.id], room, off)
             lag = self.m.units[u.id].lag_h * 60 if u.id in self.m.units else 0.0
             cmd, self.drives[u.id], _ = core.drive(cmd, self.drives.get(u.id), core.slope(h, now, self.s.drive_slope_s),
-                                                   kp, u, now, self.s, lag if lag > 0 else None)
+                                                   kp, u, now, self.s, lag if lag > 0 else None,
+                                                   core.max_push_for(u.id, sum(eff) / len(eff) if eff else None, self.s))
             sim.command(u.id, cmd.mode, cmd.setpoint)
             sim.set_fan(u.id, cmd.fan)
 
