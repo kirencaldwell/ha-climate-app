@@ -47,6 +47,8 @@ def test_fit_recovers_the_simulated_house():
         got, true = m.units[u].fan_scale, truth.units[u].fan_scale
         ref = rep["fan_scale"][u]["relative_to"]
         assert got and all(abs(v - true.get(k, 1) / true.get(ref, 1)) <= 0.3 for k, v in got.items()), (u, ref, got)
+    b3m = m.rooms["bedroom_3"]
+    assert b3m.mass_tau_h in (4.0, 8.0) and 0.3 < b3m.mass_k < 1.6, (b3m.mass_tau_h, b3m.mass_k)  # true 6 h, 0.8/h
     leak = m.rooms["bedroom_3"].leak.get("minisplit_2", 0.0)
     assert 1.0 < leak < 4.5, m.rooms["bedroom_3"]  # the idle-in-heat leak (true 2.5)...
     assert m.rooms["bedroom_3"].heat.get("air_handler", 0) < 1.0, m.rooms["bedroom_3"].heat  # ...not an air handler effect

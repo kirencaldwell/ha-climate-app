@@ -104,6 +104,7 @@ def effective(Y: dict, F: dict, m: hm.HouseModel) -> dict:
 
 
 LAGS_MIN = (0, 5, 10, 20, 30)  # candidate unit lags
+MASS_TAUS_H = (0.0, 2.0, 4.0, 8.0, 16.0)  # candidate thermal-mass time constants (0: no mass state)
 
 
 def lagged(y: list, lag_min: float) -> list:
@@ -189,7 +190,8 @@ def solve(A: list, b: list, free: set, lam: float = 1e-3, iters: int = 3000) -> 
     return [x[j] / scale[j] for j in range(p)]
 
 
-def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: float = 0.25, lam: float = 1e-3):
+def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: float = 0.25, lam: float = 1e-3,
+        min_hours: float = 24):
     """-> (HouseModel, report). layout: {"rooms": {id: {"units": [...], "neighbors": [...]}},
     "units": {id: {"sensor_rooms": [...] (optional: detected when missing), "zone": [...]}}}"""
     rooms, units = list(layout["rooms"]), list(layout["units"])
@@ -207,7 +209,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     # A room is fitted once it has `min_hours` of readings (a new or moved sensor joins after a day, not after half the
     # fit window); it's anyone's neighbour only once it covers half the log, since a neighbour missing from a window
     # voids that window for every room it neighbours.
-    min_cover, min_hours = 0.5, 24
+    min_cover = 0.5
     have = {r: sum(v is not None for v in T[r]) for r in rooms}
     cover = {r: (have[r] / n if n else 0.0) for r in rooms}
     for r in rooms:
@@ -222,65 +224,102 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
         idx = [k for k, x in enumerate(v) if x is not None]
         splits[r] = idx[min(len(idx) - 1, int(len(idx) * (1 - holdout)))] if idx else n
 
-    def rooms_fit(Yl):
-        """Fit every room with the units' outputs `Yl` -> (room models, per-room report, training SSE)."""
-        rooms_m, rep, sse = {}, {}, 0.0
+    # The rooms' thermal mass for each candidate time constant: the air reading averaged that long (model.mass_step),
+    # starting from the first reading. Windows in a room's first hour are left out, so every candidate sees the same.
+    mass_cache = {}
+
+    def mass_of(rid, tau):
+        key = (rid, tau)
+        if key not in mass_cache:
+            r, ms, cur = hm.RoomModel(mass_tau_h=tau), [], None
+            for v in T[rid]:
+                cur = hm.mass_step(r, cur, v, 1 / 60) if v is not None else cur
+                ms.append(cur)
+            mass_cache[key] = ms
+        return mass_cache[key]
+
+    first = {r: next((k for k, v in enumerate(T[r]) if v is not None), n) for r in T}
+
+    def fit_room(rid, spec, Yl, tau):
+        nbrs = [j for j in spec.get("neighbors", []) if j in neighbour_ok and j != rid]
+        us = [u for u in spec.get("units", units) if u in Yl]
+        own = [u for u in units if rid in layout["units"].get(u, {}).get("zone", [])]  # units serving this room
+        cols = (["loss"] + [f"c:{j}" for j in nbrs] + ["solar"] + [f"sun:{k}" for k in hm.WALLS] + ["bias"]
+                + [f"h:{u}" for u in us] + [f"k:{u}" for u in us] + [f"l:{u}" for u in own] + (["mass"] if tau else []))
+        M = mass_of(rid, tau) if tau else None
+        A, b = [], []
+        for a in range(first[rid] + 60, max(0, splits[rid] - window), stride):
+            z = a + window
+            Ti = T[rid][a:z]
+            if Ti[0] is None or Ti[-1] is None or sum(v is None for v in Ti) > 0.2 * window:
+                continue
+            o = _mean(out[a:z])
+            nb = [_mean(T[j][a:z]) for j in nbrs]
+            if o is None or any(v is None for v in nb):
+                continue
+            Tm = _mean(Ti)
+            sv = hm.mean_sun(sun[a:z])
+            row = [o - Tm] + [v - Tm for v in nb] + [sv.get("h", 0.0)] + [sv.get(k, 0.0) for k in hm.WALLS] + [1.0]
+            row += [sum(max(0.0, y) for y in Yl[u][a:z]) / window for u in us]
+            row += [sum(min(0.0, y) for y in Yl[u][a:z]) / window for u in us]  # negative: cooling
+            row += [sum(Lk[u][a:z]) / window for u in own]
+            if tau:
+                row.append(_mean(M[a:z]) - Tm)
+            A.append(row)
+            b.append((Ti[-1] - Ti[0]) / (window / 60))
+        if len(A) < 3 * len(cols):
+            return None, {"skipped": f"only {len(A)} usable windows (need {3 * len(cols)})"}, 0.0
+        x = solve(A, b, free={cols.index("bias")}, lam=lam)
+        pred = [sum(r[j] * x[j] for j in range(len(x))) for r in A]
+        mb = sum(b) / len(b)
+        ss = sum((y - mb) ** 2 for y in b)
+        res = sum((y - q) ** 2 for y, q in zip(b, pred))
+        r2 = 1 - res / ss if ss > 0 else 0.0
+        p = dict(zip(cols, x))
+        rm = hm.RoomModel(loss=round(p["loss"], 4), solar=round(p["solar"], 3), bias=round(p["bias"], 3),
+                          sun_dir={k: round(p[f"sun:{k}"], 3) for k in hm.WALLS},
+                          heat={u: round(p[f"h:{u}"], 3) for u in us},
+                          cool={u: round(p[f"k:{u}"], 3) for u in us},
+                          coupling={j: round(p[f"c:{j}"], 4) for j in nbrs},
+                          leak={u: round(p[f"l:{u}"], 3) for u in own},
+                          mass_k=round(p.get("mass", 0.0), 4), mass_tau_h=tau if p.get("mass", 0.0) > 0 else 0.0)
+        return rm, {"windows": len(A), "r2_rate": round(r2, 3), "mass_tau_h": rm.mass_tau_h}, res
+
+    def rooms_fit(Yl, taus=None):
+        """Fit every room with the units' outputs `Yl` -> (room models, per-room report, training SSE, mass time
+        constants). Without `taus`, each room's is chosen from MASS_TAUS_H by how well its windows are explained."""
+        rooms_m, rep, sse, chosen = {}, {}, 0.0, {}
         for rid, spec in layout["rooms"].items():
             if rid not in T:
                 continue
-            nbrs = [j for j in spec.get("neighbors", []) if j in neighbour_ok and j != rid]
-            us = [u for u in spec.get("units", units) if u in Yl]
-            own = [u for u in units if rid in layout["units"].get(u, {}).get("zone", [])]  # units serving this room
-            cols = (["loss"] + [f"c:{j}" for j in nbrs] + ["solar"] + [f"sun:{k}" for k in hm.WALLS] + ["bias"]
-                    + [f"h:{u}" for u in us] + [f"k:{u}" for u in us] + [f"l:{u}" for u in own])
-            A, b = [], []
-            for a in range(0, max(0, splits[rid] - window), stride):
-                z = a + window
-                Ti = T[rid][a:z]
-                if Ti[0] is None or Ti[-1] is None or sum(v is None for v in Ti) > 0.2 * window:
+            best = None
+            for tau in ([taus.get(rid, 0.0)] if taus is not None else MASS_TAUS_H):
+                rm, rr, res = fit_room(rid, spec, Yl, tau)
+                if rm is None:
+                    best = best or (None, rr, 0.0, tau)
                     continue
-                o = _mean(out[a:z])
-                nb = [_mean(T[j][a:z]) for j in nbrs]
-                if o is None or any(v is None for v in nb):
-                    continue
-                Tm = _mean(Ti)
-                sv = hm.mean_sun(sun[a:z])
-                row = [o - Tm] + [v - Tm for v in nb] + [sv.get("h", 0.0)] + [sv.get(k, 0.0) for k in hm.WALLS] + [1.0]
-                row += [sum(max(0.0, y) for y in Yl[u][a:z]) / window for u in us]
-                row += [sum(min(0.0, y) for y in Yl[u][a:z]) / window for u in us]  # negative: cooling
-                row += [sum(Lk[u][a:z]) / window for u in own]
-                A.append(row)
-                b.append((Ti[-1] - Ti[0]) / (window / 60))
-            if len(A) < 3 * len(cols):
-                rep[rid] = {"skipped": f"only {len(A)} usable windows (need {3 * len(cols)})"}
-                continue
-            x = solve(A, b, free={cols.index("bias")}, lam=lam)
-            pred = [sum(r[j] * x[j] for j in range(len(x))) for r in A]
-            mb = sum(b) / len(b)
-            ss = sum((y - mb) ** 2 for y in b)
-            res = sum((y - q) ** 2 for y, q in zip(b, pred))
-            sse += res
-            r2 = 1 - res / ss if ss > 0 else 0.0
-            p = dict(zip(cols, x))
-            rooms_m[rid] = hm.RoomModel(loss=round(p["loss"], 4), solar=round(p["solar"], 3), bias=round(p["bias"], 3),
-                                        sun_dir={k: round(p[f"sun:{k}"], 3) for k in hm.WALLS},
-                                        heat={u: round(p[f"h:{u}"], 3) for u in us},
-                                        cool={u: round(p[f"k:{u}"], 3) for u in us},
-                                        coupling={j: round(p[f"c:{j}"], 4) for j in nbrs},
-                                        leak={u: round(p[f"l:{u}"], 3) for u in own})
-            rep[rid] = {"windows": len(A), "r2_rate": round(r2, 3)}
-        return rooms_m, rep, sse
+                if best is None or best[0] is None or res < best[2] - 1e-9:
+                    best = (rm, rr, res, tau)
+            rm, rr, res, tau = best
+            rep[rid] = rr
+            if rm is not None:
+                rooms_m[rid], chosen[rid] = rm, rm.mass_tau_h
+                sse += res
+        return rooms_m, rep, sse, chosen
 
     # Each unit's lag: coordinate search over the candidates, by how well the training windows are explained.
     lags = {u: 0 for u in units}
     cache = {}
+
+    # The rooms' mass time constants are chosen once (no lags, no fan factors), then held through the searches below.
+    taus = rooms_fit(Y)[3]
 
     def trial(lg, sc=None):
         sc = sc or {}
         key = (tuple(sorted(lg.items())), tuple(sorted((u, tuple(sorted(v.items()))) for u, v in sc.items())))
         if key not in cache:
             Ys = scaled(Y, F, sc)
-            cache[key] = rooms_fit({u: lagged(Ys[u], lg.get(u, 0)) for u in Ys})
+            cache[key] = rooms_fit({u: lagged(Ys[u], lg.get(u, 0)) for u in Ys}, taus)
         return cache[key]
 
     # Only a unit with one of its own rooms in the fit: otherwise the "best" lag would come from how it happens to
@@ -318,7 +357,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
                 scales[u][level] = best
             if not moved:
                 break
-    fitted, rep, _ = trial(lags, scales)
+    fitted, rep, _, _ = trial(lags, scales)
     m.rooms.update(fitted)
     report.update(rep)
     zones = {u: spec.get("zone", []) for u, spec in layout["units"].items()}
@@ -343,6 +382,19 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     return m, report
 
 
+def mass_series(m: hm.HouseModel, T: dict) -> dict:
+    """Room id -> its mass temperature each minute, from the air readings (rooms with a mass state)."""
+    out = {}
+    for rid, r in m.rooms.items():
+        if r.mass_tau_h > 0 and rid in T:
+            ms, cur = [], None
+            for v in T[rid]:
+                cur = hm.mass_step(r, cur, v, 1 / 60) if v is not None else cur
+                ms.append(cur)
+            out[rid] = ms
+    return out
+
+
 def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, L=None, horizon_min: int = 120, step_min: int = 5,
              every_min: int = 30):
     """2 h ahead on the held-out part with the units at their logged output: RMSE of the model vs 'nothing changes'."""
@@ -350,18 +402,22 @@ def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, L=None, horizon_min: i
     base = {r: [] for r in m.rooms}
     n = len(ts)
     splits = split if isinstance(split, dict) else {r: split for r in m.rooms}  # room -> first held-out minute
+    M = mass_series(m, T)
     for a in range(min(splits.values(), default=n), n - horizon_min, every_min):
         start = {r: T[r][a] for r in m.rooms if T[r][a] is not None}  # rooms without a reading sit this one out
         if not start:
             continue
         cur = dict(start)
+        mass = {r: M[r][a] for r in M if M[r][a] is not None}
         for k in range(a, a + horizon_min, step_min):
             seg = slice(k, k + step_min)
             o = _mean(out[seg])
             y = {u: sum(Y[u][seg]) / step_min for u in Y}
             lk = {u: sum(v[seg]) / step_min for u, v in (L or {}).items()}
-            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y, lk)
-            cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
+            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y, lk, mass)
+            new = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
+            hm.follow_mass(m, mass, {r: (cur[r] + new[r]) / 2 for r in cur}, step_min / 60)
+            cur = new
         z = a + horizon_min
         for r in start:
             if a >= splits.get(r, n) and T[r][z] is not None:
@@ -407,15 +463,19 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
     Y = effective(Y, F, m)
     res = {r: {str(h): [] for h in horizons} for r in rooms}
     hmax = max(horizons)
+    M = mass_series(m, T)
     for a in range(0, len(ts) - hmax, every_min):
         cur = {r: T[r][a] for r in rooms if T[r][a] is not None}
         if not cur:
             continue
+        mass = {r: M[r][a] for r in M if M[r][a] is not None}
         for k in range(a, a + hmax, step_min):
             seg = slice(k, k + step_min)
             d = hm.derivative(m, cur, _mean(out[seg]), hm.mean_sun(sun[seg]), {u: sum(Y[u][seg]) / step_min for u in Y},
-                              {u: sum(v[seg]) / step_min for u, v in Lk.items()})
-            cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
+                              {u: sum(v[seg]) / step_min for u, v in Lk.items()}, mass)
+            new = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
+            hm.follow_mass(m, mass, {r: (cur[r] + new[r]) / 2 for r in cur}, step_min / 60)
+            cur = new
             done = k + step_min - a
             if done in horizons:
                 for r in cur:

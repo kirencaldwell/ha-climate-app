@@ -69,7 +69,8 @@ def _pad(seq, n):
 
 def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime, house: core.HouseState,
          setpoints_now: dict, running: dict, outdoor_seq, sun_seq, settings: core.Settings = core.Settings(),
-         ps: PlanSettings = PlanSettings(), ignore=(), fixed=None, drives=None, lagged=None, fans=None) -> Plan:
+         ps: PlanSettings = PlanSettings(), ignore=(), fixed=None, drives=None, lagged=None, fans=None,
+         mass=None) -> Plan:
     """Best house mode and setpoints for the next `horizon_h`. `temps` are current room temperatures (rooms the model
     knows), `running` which units are actually running now, `outdoor_seq`/`sun_seq` the expected weather per step.
     Rooms in `ignore` are simulated (their unit may regulate on them) but don't count in the cost: e.g. a room that
@@ -81,7 +82,7 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
     runs core.drive_law every substep to turn it into setpoints, as the integration will: `setpoints_now` are then
     the targets planned last time, `drives` the units' outer-loop states now (unit id -> core.DriveState). `lagged`:
     the units' effective outputs now (model.step). `fans`: unit id -> fan mode now; with the outer loop, the
-    simulation picks fan speeds as it does (core.fan_for)."""
+    simulation picks fan speeds as it does (core.fan_for). `mass`: the rooms' thermal mass temperatures now."""
     fixed = fixed or {}
     drive = settings.drive
     n = max(1, int(round(ps.horizon_h * 60 / ps.step_min)))
@@ -168,6 +169,7 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
         modes_by_unit = {uid: (fixed[uid][0] if uid in fixed else mode) for uid in m.units}
         traj, outs, cur = [], [], dict(temps)
         lag = dict(lagged) if lagged is not None else None
+        ms = dict(mass) if mass is not None else None
         states = {uid: st for uid, st in (drives or {}).items() if mode == house.mode} if drive else {}
         clock, first = [now], {}
         fan_now = dict(fans or {})
@@ -180,7 +182,7 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
                 ctl = lambda tt, rr, hh, inner=inner, fixed_sp=fixed_sp: {**inner(tt, rr, hh), **fixed_sp}
             sp_b.update({uid: f[1] for uid, f in fixed.items()})
             tr, ou, run = hm.rollout(m, cur, modes_by_unit, sp_b, run, outdoor[a:b], sun[a:b], dt_h, ps.substeps,
-                                     lag, ctl, fans=fan_now)
+                                     lag, ctl, fans=fan_now, mass=ms)
             traj += tr
             outs += ou
             cur = tr[-1]

@@ -82,6 +82,18 @@ def test_leak_from_an_idle_unit_on_the_shared_compressor():
     assert hm.derivative(m, {"r": 67.0}, None, 0.0, {"a": 0.8, "b": 0.0}, {"b": 0.8})["r"] == 1.6
 
 
+def test_thermal_mass_state():
+    r = hm.RoomModel(loss=0, mass_k=1.0, mass_tau_h=4.0)
+    assert hm.mass_step(r, None, 70.0, 0.1) == 70.0  # starts at the air's temperature
+    m70 = hm.mass_step(r, 66.0, 70.0, 4.0)
+    assert 68.4 < m70 < 68.6  # one time constant: 63% of the way
+    m = hm.HouseModel({"r": r}, {})
+    assert hm.derivative(m, {"r": 68.0}, None, 0.0, {}, mass={"r": 66.0})["r"] == -2.0  # a cool mass pulls the air down
+    mass = {"r": 66.0}
+    hm.step(m, {"r": 68.0}, None, 0.0, "off", {}, {}, 0.5, mass=mass)
+    assert 66.0 < mass["r"] < 66.5  # the mass warms slowly toward the air
+
+
 def test_solar_index():
     assert hm.solar_index(-5, 0) == 0 and hm.solar_index(None) == 0
     assert abs(hm.solar_index(90, 0) - 1) < 1e-9 and abs(hm.solar_index(90, 100) - 0.25) < 1e-9

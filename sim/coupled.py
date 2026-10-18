@@ -89,6 +89,7 @@ def the_house() -> hm.HouseModel:
                              coupling={"living_room": 0.12, "bedroom_3": 0.15}),
         "bedroom_3": R(loss=0.06, solar=0.5, sun_dir={"s": 3.0}, bias=0.1, heat={"minisplit_2": 7.0}, cool={"minisplit_2": 6.0},
                        leak={"minisplit_2": 2.5},  # its unit idling in heat picks up heat while the others run
+                       mass_k=0.8, mass_tau_h=6.0,  # walls and floor: a slow store the air trades heat with
                        coupling={"living_room": 0.12, "primary_bedroom": 0.15}),
     }
     fans = {k: v for k, v in FAN_SCALE.items() if v < 1}
@@ -113,6 +114,7 @@ class CoupledSim:
         self.output = {u: 0.0 for u in truth.units}
         self.effect = {u: 0.0 for u in truth.units}  # output seen through each unit's lag (coil and ducts)
         self.fan = {u: "auto" for u in truth.units}
+        self.mass = {r: self.temps[r] for r, rm in truth.rooms.items() if rm.mass_tau_h > 0}  # thermal mass, F
         self.fan_changes = 0
         self.room_step, self.unit_step, self.noise = room_step, unit_step, noise
         self.rng = random.Random(seed)
@@ -162,9 +164,11 @@ class CoupledSim:
                 self.energy += abs(y) / 60
             leaks = hm.leak_inputs(self.mode, self.running, self.output, self.m.units)
             d = hm.derivative(self.m, self.temps, self.weather.outdoor(self.now), self.weather.sun(self.now), self.effect,
-                              leaks)
+                              leaks, self.mass)
+            before = dict(self.temps)
             for rid, v in d.items():
                 self.temps[rid] += v / 60
+            hm.follow_mass(self.m, self.mass, {r: (before[r] + self.temps[r]) / 2 for r in d}, 1 / 60)
             self.now += timedelta(minutes=1)
 
     def row(self, rooms) -> dict:

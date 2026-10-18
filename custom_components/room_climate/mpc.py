@@ -80,12 +80,32 @@ class ShadowPlanner:
         self.readings: dict = {}  # room -> deque[(t, F)]
         self.lagged: dict = {}  # unit id -> effective output now (model.step), followed from what the units really do
         self.targets: dict = {}  # unit id -> target last planned (with the outer loop)
+        self.mass: dict = {}  # room id -> its thermal mass temperature now (model.follow_mass), from the readings
+        self._mass_at = None
 
     def set_model(self, m: hm.HouseModel):
         """Use a (re)fitted model. Accuracy history is kept: a nightly refit changes the model a little, has passed its
         own held-out check, and wiping the scores would knock any unit under model control back out every night."""
         self.model = m
         self.next_plan = None
+        self._rebuild_mass()
+
+    def _rebuild_mass(self):
+        """Each room's mass temperature from the readings kept (up to a day): a new model may have new time constants."""
+        self.mass, self._mass_at = {}, None
+        if self.model is None:
+            return
+        for rid, d in self.readings.items():
+            r = self.model.rooms.get(rid)
+            if r is None or r.mass_tau_h <= 0:
+                continue
+            cur, last = None, None
+            for t, v in d:
+                dt = 1 / 60 if last is None else max(0.0, (t - last).total_seconds() / 3600)
+                cur, last = hm.mass_step(r, cur, v, dt), t
+            if cur is not None:
+                self.mass[rid] = cur
+                self._mass_at = last if self._mass_at is None else max(self._mass_at, last)
 
     # --- every tick (cheap) ---
     def observe(self, now: datetime, temps: dict, actual: dict = None, outdoor=None, sun: float = 0.0):
@@ -100,6 +120,9 @@ class ShadowPlanner:
         if self.model is None or actual is None:
             return
         try:
+            dt_m = 0.0 if self._mass_at is None else max(0.0, min(1.0, (now - self._mass_at).total_seconds() / 3600))
+            hm.follow_mass(self.model, self.mass, temps, dt_m if dt_m else 1 / 60)
+            self._mass_at = now
             self._follow_lag(now, temps, actual)
             self._advance(now, temps, actual, outdoor, sun)
             if self.next_track is None or now >= self.next_track:
@@ -108,7 +131,7 @@ class ShadowPlanner:
                 if start:
                     self.records.append({"t0": now, "t": now, "start": start, "temps": dict(start), "done": set(),
                                          "running": {u: bool(a.get("running")) for u, a in actual.items()},
-                                         "lagged": dict(self.lagged)})
+                                         "lagged": dict(self.lagged), "mass": dict(self.mass)})
         except Exception as e:  # never let the model take the integration down; show it instead
             self.error = f"{type(e).__name__}: {e}"
         while self.records and now - self.records[0]["t0"] > timedelta(minutes=max(HORIZONS_MIN) + 10):
@@ -150,7 +173,7 @@ class ShadowPlanner:
             for _ in range(n if dt > 0 else 0):
                 rec["temps"], rec["running"], _ = hm.step(self.model, rec["temps"], outdoor, sun, modes, sps,
                                                           ran, dt / n, rec.setdefault("lagged", {}), hold=True,
-                                                          fans=fans)
+                                                          fans=fans, mass=rec.setdefault("mass", {}))
             rec["t"] = now
             age = (now - rec["t0"]).total_seconds() / 60
             for h in HORIZONS_MIN:
@@ -194,7 +217,7 @@ class ShadowPlanner:
         traj, _, _ = hm.rollout(self.model, dict(start), modes, {u: a.get("setpoint") for u, a in actual.items()},
                                 {u: bool(a.get("running")) for u, a in actual.items()}, _seq(outdoor, times),
                                 [sun_at(t) for t in times], step_min / 60, substeps=2, lagged=dict(self.lagged),
-                                fans={u: a.get("fan") for u, a in actual.items()})
+                                fans={u: a.get("fan") for u, a in actual.items()}, mass=dict(self.mass))
         self.projection = {"at": now.isoformat(), "temps": {
             r: [[t.isoformat(), round(step[r], 2)] for t, step in zip(times, traj)] for r in start}}
 
@@ -212,7 +235,7 @@ class ShadowPlanner:
         p = optimizer.plan(self.model, rooms, units, temps, now, self.house, now_sp, running, _seq(outdoor, times),
                            [sun_at(t) for t in times], settings, ps, ignore=set(ignore), fixed=fixed,
                            drives=drives if settings.drive else None, lagged=dict(self.lagged),
-                           fans={u: a.get("fan") for u, a in actual.items()})
+                           fans={u: a.get("fan") for u, a in actual.items()}, mass=dict(self.mass))
         setpoints, first = p.setpoints, p.first
         forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)
         if forced and self.house.mode != forced:
@@ -296,6 +319,7 @@ class ShadowPlanner:
         self.errors = deque((p(t), r, h, e, b) for t, r, h, e, b in d.get("errors", []) if p(t) >= keep_since)
         self.points = deque((p(t), r, h, v) for t, r, h, v in d.get("points", []) if p(t) >= chart_since)
         self.readings = {r: deque((p(t), v) for t, v in pts if p(t) >= keep_since) for r, pts in d.get("readings", {}).items()}
+        self._rebuild_mass()
 
     # --- reporting ---
     def log_fields(self) -> dict:
