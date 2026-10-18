@@ -7,6 +7,8 @@
  *               floor_views: {2: {x: 440, y: 60, w: 400, h: 710}, 3: {...}}   # crop shown per floor
  *               theme: tech                       # stylized dark schematic drawn from room shapes (no image needed)
  *               north: left                       # up | down | left | right: draws a north arrow
+ *               admin: true                       # the admin view: unit control buttons, experiments, Diagnostics and
+ *                                                 # the Model page (left out of the everyday view)
  * Rooms without a `unit` are monitor-only (shown in blue on the tech theme).
  */
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -108,6 +110,7 @@ const CSS = `
 const FLOOR_NAMES = { 1: "Basement", 2: "First Floor", 3: "Second Floor" };
 
 class RoomMapCard extends HTMLElement {
+  get _admin() { return !!(this._config && this._config.admin); }
   setConfig(config) {
     // Opens on the First Floor (floor 2); card config `default_floor` overrides.
     this._config = config; this._sel = null; this._floor = config.default_floor || 2; this._data = null;
@@ -183,6 +186,7 @@ class RoomMapCard extends HTMLElement {
   _click(e) {
     const t = e.target.closest("[data-act],[data-room],[data-floor]");
     if (!t || !this._data) return;
+    if (["diag", "model", "ctl", "exp-start", "exp-stop"].includes(t.dataset.act) && !this._admin) return;  // admin view only
     if (t.dataset.act === "diag") { this._openDiag(); return; }
     if (t.dataset.act === "model") { this._openModel(); return; }
     if (t.dataset.act === "ctl") { this._setControl(t.dataset.u, t.dataset.c); return; }
@@ -360,7 +364,7 @@ class RoomMapCard extends HTMLElement {
         ${st.badge}<div class="big">${st.big}</div>
         <div class="why"><b>Actual</b> · ${st.actual}</div>
         <div class="why" style="${warn ? "color:#ffd166" : ""}"><b>${st.wantLbl}</b> · ${st.wantTxt}${x.reason ? ` · ${x.reason}` : ""}${warn ? " ⚠" : st.ours && st.a ? " ✓" : ""}</div>
-        ${st.hand(u.id)}</div>`;
+        ${this._admin ? st.hand(u.id) : ""}</div>`;
     }).join("");
     const house = d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 6px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}</p>` : "";
     const db = (d.settings_effective || {}).deadband ?? 1;
@@ -380,12 +384,14 @@ class RoomMapCard extends HTMLElement {
       : `<div class="rc-sect"><h4>Experiment while nobody's home</h4>
           <p class="rc-sub" style="margin:4px 0">The units take turns so the model learns faster. Rooms may drift a few degrees.</p>
           <div class="rc-chips" style="display:flex;gap:6px">${[4, 6, 8, 10].map(h => `<button data-act="exp-start" data-h="${h}" style="flex:1">${h} h</button>`).join("")}</div></div>`;
+    // An experiment shows on the everyday view too (rooms may be off target), just without the controls.
+    const expUser = ex ? `<div class="rc-sect"><p class="rc-sub" style="margin:4px 0"><b>Learning run</b> until ${hm(ex.end)}: rooms may be a few degrees off.</p></div>` : "";
     return `<h3>Heat pumps</h3>${house}<div class="rc-units">${tiles}</div>
-      ${expSect}
+      ${this._admin ? expSect : expUser}
       ${pr ? `<div class="rc-sect"><h4>Highest priority</h4>${pr}</div>` : ""}
       <p class="rc-sub" style="margin:12px 0">Tap a room to adjust it.</p>
-      <div class="rc-chips" style="display:flex;gap:8px"><button data-act="diag" style="flex:1">Diagnostics</button>
-        <button data-act="model" style="flex:1">Model</button></div>`;
+      ${this._admin ? `<div class="rc-chips" style="display:flex;gap:8px"><button data-act="diag" style="flex:1">Diagnostics</button>
+        <button data-act="model" style="flex:1">Model</button></div>` : ""}`;
   }
 
   _openDiag() {
