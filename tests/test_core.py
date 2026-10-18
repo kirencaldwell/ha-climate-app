@@ -778,3 +778,14 @@ def test_a_coasting_room_neither_flips_the_house_nor_restarts_its_unit():
     assert not st2.on  # without the coast rule, 67.3 - 2 = 65.3 predicted would restart it
     c, st3, _ = _drv(65.8, 66.5, rate=-3.0, st=st2, t=MON + timedelta(minutes=18))
     assert st3.on  # really short of target: restarts, coast or not
+
+
+def test_coast_is_as_long_as_the_run_and_ends_when_the_room_moves_too_far():
+    s = Settings()
+    stop = MON
+    assert core.coast_until(stop, 60, 0, s) == stop + timedelta(minutes=2)  # a 1-min run: a 2-min coast
+    assert core.coast_until(stop, 3600, 0, s) == stop + timedelta(minutes=s.drive_coast_min)
+    c = {"until": core.coast_until(stop, 900, 0, s), "room": 67.8}
+    assert core.still_coasting(c, stop + timedelta(minutes=5), 68.8, s)
+    assert not core.still_coasting(c, stop + timedelta(minutes=5), 69.5, s)  # 1.7 F up: the sun, not the coast
+    assert not core.still_coasting(c, stop + timedelta(minutes=25), 68.0, s)

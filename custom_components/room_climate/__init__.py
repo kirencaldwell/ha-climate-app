@@ -85,7 +85,8 @@ class Manager:
         self._fan_set: set = set()  # units whose fan we've changed (put back to auto when handed to the thermostat)
         self._house_restored = False  # the house mode is taken from the units on the first tick (_restore_house)
         self.exp_block = None  # the experiment block in force (experiment.py), if one is running
-        self._busy_at: dict = {}  # unit id -> last time it was heating/cooling
+        self._run_start: dict = {}  # unit id -> when its current run started
+        self._coast: dict = {}  # unit id -> {"until", "room"}: its rooms coasting on the run that just ended
         self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
         self.zone_hist: dict[str, deque] = {}  # unit id -> [(time, its rooms' weighted reading)] for the loop's rate
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
@@ -549,16 +550,22 @@ class Manager:
                         self.hist[r.id] = self.hist[r.id][-1:]
                         predicted[r.id] = None
         self.prev_busy = busy
-        for u in units:
-            if u.id in busy:
-                self._busy_at[u.id] = now
         coasting = set()  # units that stopped recently: their rooms are still moving on the unit's own output
         for u in units:
-            last = self._busy_at.get(u.id)
-            lag = (self.drive_lead(u.id) or 0.0)
-            if u.id not in busy and last is not None and \
-                    core.elapsed(now, last) < 60 * max(settings.drive_coast_min, 3 * lag):
+            mine = [r for r in rooms if r.unit == u.id]
+            res = core.weighted_error(mine, readings, now, settings)
+            room_now = None if res is None else res[1]
+            if u.id in busy:
+                self._run_start.setdefault(u.id, now)
+                self._coast.pop(u.id, None)
+            elif u.id in self._run_start:  # just stopped: its coast starts, as long as the run that caused it
+                run_s = core.elapsed(now, self._run_start.pop(u.id))
+                self._coast[u.id] = {"until": core.coast_until(now, run_s, self.drive_lead(u.id) or 0.0, settings),
+                                     "room": room_now}
+            if core.still_coasting(self._coast.get(u.id), now, room_now, settings):
                 coasting.add(u.id)
+            else:
+                self._coast.pop(u.id, None)
         if not self._house_restored:
             self._restore_house(units, now)
         house = self.house

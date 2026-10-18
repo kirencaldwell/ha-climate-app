@@ -182,7 +182,7 @@ class HeuristicController:
     def __init__(self, rooms, units, settings=core.Settings()):
         self.rooms, self.units, self.s = rooms, units, settings
         self.house, self.states, self.hist, self.sent, self.prev_busy, self.last_good = core.HouseState(), {}, {}, {}, set(), {}
-        self.drives, self.zone_hist, self.busy_at = {}, {}, {}
+        self.drives, self.zone_hist, self.run_start, self.coast = {}, {}, {}, {}
         self.kp = {}  # unit id -> outer-loop gain (from a model's learned effects; default gain when empty)
         self.lead = {}  # unit id -> look-ahead minutes (a model's learned lag; default lead when empty)
 
@@ -205,11 +205,18 @@ class HeuristicController:
                         self.hist[r.id] = self.hist[r.id][-1:]
                         predicted[r.id] = None
         self.prev_busy = busy
+        coasting = set()  # as Manager.async_tick
         for u in self.units:
+            res = core.weighted_error([r for r in self.rooms if r.unit == u.id], readings, now, self.s)
+            room_now = None if res is None else res[1]
             if u.id in busy:
-                self.busy_at[u.id] = now
-        coasting = {u.id for u in self.units if u.id not in busy and u.id in self.busy_at
-                    and core.elapsed(now, self.busy_at[u.id]) < 60 * self.s.drive_coast_min}
+                self.run_start.setdefault(u.id, now)
+                self.coast.pop(u.id, None)
+            elif u.id in self.run_start:
+                run_s = core.elapsed(now, self.run_start.pop(u.id))
+                self.coast[u.id] = {"until": core.coast_until(now, run_s, self.lead.get(u.id) or 0.0, self.s), "room": room_now}
+            if core.still_coasting(self.coast.get(u.id), now, room_now, self.s):
+                coasting.add(u.id)
         cmds, self.house, info = core.control_step(self.units, self.rooms, readings, predicted,
                                                    {u.id: sim.unit_temp(u.id) for u in self.units}, self.states, self.house,
                                                    now, self.s, {}, busy, sim.weather.outdoor(now), coasting)

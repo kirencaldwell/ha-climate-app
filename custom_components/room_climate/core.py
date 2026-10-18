@@ -118,6 +118,8 @@ class Settings:
     # loop restarts the unit only on the reading itself, not on a trend. Otherwise the coast feeds back as a disturbance
     # and the house goes round a heat/cool limit cycle.
     drive_coast_min: float = 20.0
+    drive_coast_run_x: float = 2.0  # ...but no longer than this many times the run that caused it (a 1-min run: 2 min)
+    drive_coast_rise: float = 1.5  # ...and over once the room has moved this far since the stop: that's not the coast
     drive_min_interval_s: int = 300  # at most one setpoint change per unit this often (starts and stops excepted)
     drive_min_change: float = 0.7  # ignore setpoint moves smaller than this (most of a 0.5 C step)
     # Fan speed, the loop's second output (units listed here only; others keep whatever fan they're set to). A gentle
@@ -428,6 +430,20 @@ class DriveState:
     fan: Optional[str] = None  # last fan mode chosen
     fan_at: Optional[datetime] = None
     stopped_at: Optional[datetime] = None  # when the loop last stopped the unit (start of its coast)
+
+
+def coast_until(stopped: datetime, run_s: float, lag_min: float, settings: Settings = Settings()) -> datetime:
+    """When a unit's coast is over, for a run of run_s seconds that stopped at `stopped`."""
+    mins = min(max(settings.drive_coast_min, 3 * lag_min), settings.drive_coast_run_x * run_s / 60)
+    return stopped + timedelta(minutes=mins)
+
+
+def still_coasting(coast: Optional[dict], now: datetime, room: Optional[float], settings: Settings = Settings()) -> bool:
+    """coast: {"until", "room"} (the rooms' reading when the unit stopped). Over at `until`, or as soon as the room
+    has moved drive_coast_rise from that reading (more than the coast can explain: sun, or a real need)."""
+    if not coast or now >= coast["until"]:
+        return False
+    return room is None or coast.get("room") is None or abs(room - coast["room"]) < settings.drive_coast_rise
 
 
 def slope(history: list[tuple[datetime, float]], now: datetime, window_s: int) -> Optional[float]:
