@@ -100,6 +100,20 @@ def sun_vector(elevation_deg, azimuth_deg, cloud_pct=None) -> dict:
     return out
 
 
+def sun_from_irradiance(elevation_deg, azimuth_deg, ghi, dni, dhi) -> dict:
+    """Sun strengths 0..1 from irradiance (W/m2: global horizontal, direct normal, diffuse), e.g. NOAA's HRRR model:
+    "h" is global horizontal over 1000 W/m2; each wall gets the direct beam that reaches it plus half the diffuse sky,
+    same scale. Clear midday sun gives about the same numbers as sun_vector, so models fitted on either still fit."""
+    out = {"h": max(0.0, (ghi or 0.0) / 1000.0), "e": 0.0, "s": 0.0, "w": 0.0}
+    if elevation_deg is None or azimuth_deg is None or elevation_deg <= 0:
+        return out
+    beam = (dni or 0.0) * math.cos(math.radians(elevation_deg)) / 1000.0
+    sky = 0.5 * (dhi or 0.0) / 1000.0
+    for k, bearing in WALLS.items():
+        out[k] = round(max(0.0, beam * math.cos(math.radians(azimuth_deg - bearing))) + sky, 4)
+    return out
+
+
 def as_sun(sun) -> dict:
     """A sun input as a vector: a plain number (older callers) is the overhead strength only."""
     if isinstance(sun, dict):

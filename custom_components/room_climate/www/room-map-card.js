@@ -657,7 +657,8 @@ class RoomMapCard extends HTMLElement {
       return `Weather ahead: no fresh forecast, so plans hold today's ${now == null ? "current" : Math.round(now) + "°"} weather for the next 2 hours.`;
     const two = f.next.filter(p => Date.parse(p[0]) <= Date.parse(d.now) + 2 * 3600e3).slice(-1)[0] || f.next[0];
     const cl = c => c == null ? "" : `, ${Math.round(c)}% cloud`;
-    return `Weather ahead (hourly forecast, ${t(f.at)}): ${now == null ? "—" : Math.round(now) + "°"} now → ${Math.round(two[1])}°${cl(two[2])} by ${t(two[0])}. Plans and projections use it; learning and scoring use the weather that actually happened.`;
+    const sun = d.sunshine ? ` Sunshine now (NOAA HRRR estimate, every 15 min): ${d.sunshine.ghi} W/m², ${d.sunshine.dni} direct.` : " Sunshine: from the forecast's cloud cover (no HRRR estimate).";
+    return `Weather ahead (hourly forecast, ${t(f.at)}): ${now == null ? "—" : Math.round(now) + "°"} now → ${Math.round(two[1])}°${cl(two[2])} by ${t(two[0])}.${sun} Plans and projections use these; learning and scoring use the weather that actually happened.`;
   }
 
   _histHtml(h, name) {

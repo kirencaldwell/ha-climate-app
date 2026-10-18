@@ -19,6 +19,7 @@ from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import Context, Event, HomeAssistant
 from homeassistant.helpers import discovery
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import (async_call_later, async_track_state_change_event, async_track_time_change,
                                          async_track_time_interval)
 from homeassistant.helpers.storage import Store
@@ -102,6 +103,7 @@ class Manager:
         self.hist5: deque = deque()  # compact 5-minute samples for the Model page's charts (mpc.compact)
         self.backtest: dict = None  # {"fitted", "split", "points": {room: {"60"/"120": [[iso, F]]}}}
         self.forecast: dict = None  # {"at", "entity", "points": [(datetime, F, cloud %)]}: hourly, for planning
+        self.irr: dict = None  # {"at", "points": [(datetime, ghi, dni, dhi)]}: HRRR sunshine, 15-min (async_update_sun)
         self._forecast_logged = None
         self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
         self.fit_history: list = []
@@ -220,6 +222,39 @@ class Manager:
             pts.append((t, temp, it.get("cloud_coverage")))
         if pts:
             self.forecast = {"at": now, "entity": ent, "points": pts}
+
+    async def async_update_sun(self, _now=None):
+        """Estimated sunshine at the house every 15 min: NOAA's HRRR model through Open-Meteo (free, no key). Direct and
+        diffuse sunlight rather than an hourly cloud cover: what heats a south window. Kept from 2 h back to 3 h ahead."""
+        lat, lon = self.hass.config.latitude, self.hass.config.longitude
+        url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&models=gfs_hrrr&timeformat=unixtime"
+               "&minutely_15=shortwave_radiation,direct_normal_irradiance,diffuse_radiation"
+               "&past_minutely_15=8&forecast_minutely_15=12" % (lat, lon))
+        try:
+            async with async_get_clientsession(self.hass).get(url, timeout=20) as resp:
+                resp.raise_for_status()
+                m = (await resp.json())["minutely_15"]
+            # Each value is the mean of the 15 minutes before its time stamp: centre it in that quarter hour.
+            pts = [(dt_util.utc_from_timestamp(t) - timedelta(minutes=7.5), g, n, f)
+                   for t, g, n, f in zip(m["time"], m["shortwave_radiation"], m["direct_normal_irradiance"],
+                                         m["diffuse_radiation"]) if None not in (g, n, f)]
+        except Exception as e:  # offline or changed: fall back on the forecast's cloud cover
+            _LOGGER.debug("sunshine estimate unavailable: %s", e)
+            return
+        if pts:
+            self.irr = {"at": dt_util.now(), "points": pts}
+
+    def irradiance_at(self, t):
+        """(ghi, dni, dhi) at time t from the HRRR estimate, interpolated; None if there isn't a fresh one covering t."""
+        f = self.irr
+        if f is None or dt_util.now() - f["at"] > timedelta(hours=1):
+            return None
+        pts = f["points"]
+        for (ta, *a), (tb, *b) in zip(pts, pts[1:]):
+            if ta <= t <= tb:
+                w = (t - ta).total_seconds() / max(1.0, (tb - ta).total_seconds())
+                return tuple(x + (y - x) * w for x, y in zip(a, b))
+        return None
 
     def _weather_ahead(self, now, outdoor, cloud):
         """(outdoor(t) or the current value, cloud(t)) for the planner: the hourly forecast when fresh, else now."""
@@ -653,6 +688,9 @@ class Manager:
         outdoor_ahead, cloud_ahead = self._weather_ahead(now, outdoor, cloud)
 
         def sun_at(t):
+            irr = self.irradiance_at(t)
+            if irr is not None:  # estimated sunshine (HRRR); else the forecast's cloud cover
+                return hm.sun_from_irradiance(hm.sun_elevation(t, lat, lon), hm.sun_azimuth(t, lat, lon), *irr)
             return hm.sun_at(t, lat, lon, cloud_ahead(t))
 
         self.shadow.observe(now, temps, actual, outdoor, sun_at(now))
@@ -695,6 +733,8 @@ class Manager:
                                      "next": [[t.isoformat(), v, c] for t, v, c in f["points"] if now < t <= now + timedelta(hours=3)]}
         return {"now": now.isoformat(), "model": None if m is None else m.to_dict(), "age_h": self.model_age_h(),
                 "forecast": fc, "outdoor_now": self._outdoor(s),
+                "sunshine": None if self.irradiance_at(now) is None else
+                dict(zip(("ghi", "dni", "dhi"), (round(x) for x in self.irradiance_at(now)))),
                 "ready": {"ok": ok, "why": reasons},
                 "fit": self.fit_state, "fits": self.fit_history[-30:], "shadow": self.shadow.debug(now),
                 "targets": targets, "today": today, "house_today": self.house.mode,
@@ -725,6 +765,9 @@ class Manager:
         sun = self.hass.states.get("sun.sun")
         if sun is not None:
             row["sun"] = {"elev": num(sun.attributes.get("elevation")), "az": num(sun.attributes.get("azimuth"))}
+            irr = self.irradiance_at(now)
+            if irr is not None:  # W/m2: global horizontal, direct normal, diffuse (HRRR estimate)
+                row["sun"].update(ghi=round(irr[0]), dni=round(irr[1]), dhi=round(irr[2]))
         for r in rooms:
             if not r.sensor:
                 continue
@@ -1089,6 +1132,8 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     hass.async_create_task(mgr.async_load_history())
     # The hourly forecast for planning: soon after startup, then every hour.
     async_call_later(hass, 30, mgr.async_update_forecast)
+    async_call_later(hass, 20, mgr.async_update_sun)
+    async_track_time_interval(hass, mgr.async_update_sun, timedelta(minutes=15))
     async_track_time_interval(hass, mgr.async_update_forecast, timedelta(hours=1))
     # Refit the thermal model nightly, and soon after startup if there is none or it's more than a day old.
     async_track_time_change(hass, mgr.async_fit, hour=3, minute=40, second=0)

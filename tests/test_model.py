@@ -62,6 +62,16 @@ def test_sun_direction():
     assert hm.derivative(m, {"r": 67.0}, None, 0.5, {})["r"] == 0.5  # a plain number is overhead only
 
 
+def test_sun_from_irradiance_matches_the_cloud_based_scale():
+    clear = hm.sun_vector(32, 181, 0)  # midday, clear
+    irr = hm.sun_from_irradiance(32, 181, 520, 750, 120)  # what HRRR gave for a clear-ish Seattle midday
+    assert abs(irr["h"] - clear["h"]) < 0.1 and abs(irr["s"] - clear["s"]) < 0.2  # (real beams are dimmer than the ideal)
+    assert irr["e"] < 0.1 and irr["s"] > 0.5  # the beam is on the south wall
+    dull = hm.sun_from_irradiance(32, 181, 150, 0, 150)  # overcast: only diffuse light
+    assert dull["s"] == dull["e"] == dull["w"] == 0.075 and dull["h"] == 0.15
+    assert hm.sun_from_irradiance(-5, 200, 0, 0, 0) == {"h": 0.0, "e": 0.0, "s": 0.0, "w": 0.0}
+
+
 def test_solar_index():
     assert hm.solar_index(-5, 0) == 0 and hm.solar_index(None) == 0
     assert abs(hm.solar_index(90, 0) - 1) < 1e-9 and abs(hm.solar_index(90, 100) - 0.25) < 1e-9

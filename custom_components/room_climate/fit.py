@@ -59,7 +59,10 @@ def series(rows: list, rooms: list, units: list):
             o = (row.get("weather") or {}).get("temp")
         out.append(None if o is None else float(o))
         sn = row.get("sun") or {}
-        sun.append(hm.sun_vector(sn.get("elev"), sn.get("az"), (row.get("weather") or {}).get("cloud")))
+        if sn.get("ghi") is not None:  # estimated sunshine (HRRR) when logged; else from the forecast's cloud cover
+            sun.append(hm.sun_from_irradiance(sn.get("elev"), sn.get("az"), sn.get("ghi"), sn.get("dni"), sn.get("dhi")))
+        else:
+            sun.append(hm.sun_vector(sn.get("elev"), sn.get("az"), (row.get("weather") or {}).get("cloud")))
         for u in units:
             x = row.get("units", {}).get(u) or {}
             act, sp, rd = x.get("action"), x.get("sp"), x.get("temp")
