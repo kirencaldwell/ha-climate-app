@@ -132,7 +132,7 @@ class ShadowPlanner:
                 if rd is not None and sp is not None:
                     err = (sp - rd) if mode == "heat" else (rd - sp)
                     y = max(u.ymin, min(1.0, u.k0 + u.k1 * err))
-                y = y if mode == "heat" else -y
+                y = (y if mode == "heat" else -y) * hm.fan_factor(u, a.get("fan"))
             self.lagged[uid] = hm.lag(u, self.lagged.get(uid, y), y, dt_h)
 
     def _advance(self, now, temps, actual, outdoor, sun):
@@ -141,6 +141,7 @@ class ShadowPlanner:
         # Whether each compressor ran is replayed too, not re-simulated: with units that cycle, a hair of temperature
         # error would otherwise shift every simulated start and stop and swamp the score.
         ran = {u: bool(a.get("running")) for u, a in actual.items()}
+        fans = {u: a.get("fan") for u, a in actual.items()}
         for rec in self.records:
             if len(rec["done"]) == len(HORIZONS_MIN):
                 continue
@@ -148,7 +149,8 @@ class ShadowPlanner:
             n = max(1, int(dt * 60 / 2 + 0.999))  # steps of at most 2 min (ticks can be sparse)
             for _ in range(n if dt > 0 else 0):
                 rec["temps"], rec["running"], _ = hm.step(self.model, rec["temps"], outdoor, sun, modes, sps,
-                                                          ran, dt / n, rec.setdefault("lagged", {}), hold=True)
+                                                          ran, dt / n, rec.setdefault("lagged", {}), hold=True,
+                                                          fans=fans)
             rec["t"] = now
             age = (now - rec["t0"]).total_seconds() / 60
             for h in HORIZONS_MIN:
@@ -191,7 +193,8 @@ class ShadowPlanner:
         modes = {u: (a.get("mode") if a.get("mode") in ("heat", "cool") else "off") for u, a in actual.items()}
         traj, _, _ = hm.rollout(self.model, dict(start), modes, {u: a.get("setpoint") for u, a in actual.items()},
                                 {u: bool(a.get("running")) for u, a in actual.items()}, _seq(outdoor, times),
-                                [sun_at(t) for t in times], step_min / 60, substeps=2, lagged=dict(self.lagged))
+                                [sun_at(t) for t in times], step_min / 60, substeps=2, lagged=dict(self.lagged),
+                                fans={u: a.get("fan") for u, a in actual.items()})
         self.projection = {"at": now.isoformat(), "temps": {
             r: [[t.isoformat(), round(step[r], 2)] for t, step in zip(times, traj)] for r in start}}
 
@@ -208,7 +211,8 @@ class ShadowPlanner:
         t0 = time.perf_counter()
         p = optimizer.plan(self.model, rooms, units, temps, now, self.house, now_sp, running, _seq(outdoor, times),
                            [sun_at(t) for t in times], settings, ps, ignore=set(ignore), fixed=fixed,
-                           drives=drives if settings.drive else None, lagged=dict(self.lagged))
+                           drives=drives if settings.drive else None, lagged=dict(self.lagged),
+                           fans={u: a.get("fan") for u, a in actual.items()})
         setpoints, first = p.setpoints, p.first
         forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)
         if forced and self.house.mode != forced:

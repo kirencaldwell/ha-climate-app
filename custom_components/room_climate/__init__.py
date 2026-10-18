@@ -14,6 +14,7 @@ import voluptuous as vol
 from homeassistant.components import persistent_notification, websocket_api
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.climate import ATTR_HVAC_MODE, DOMAIN as CLIMATE, SERVICE_SET_HVAC_MODE, SERVICE_SET_TEMPERATURE
+from homeassistant.components.climate.const import ATTR_FAN_MODE, SERVICE_SET_FAN_MODE
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import Context, Event, HomeAssistant
 from homeassistant.helpers import discovery
@@ -81,6 +82,7 @@ class Manager:
         self.last_good: dict[str, tuple] = {}  # room id -> (temp F, reading time, last seen) to bridge sensor dropouts
         self.prev_busy: set = set()
         self.sent: dict = {}  # unit id -> (last setpoint command, when); for thermostat units, what we would have sent
+        self._fan_set: set = set()  # units whose fan we've changed (put back to auto when handed to the thermostat)
         self._house_restored = False  # the house mode is taken from the units on the first tick (_restore_house)
         self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
         self.zone_hist: dict[str, deque] = {}  # unit id -> [(time, its rooms' weighted reading)] for the loop's rate
@@ -348,6 +350,12 @@ class Manager:
             if not ok:
                 raise ValueError("the model isn't ready to control units: " + "; ".join(reasons))
         ud["control"] = control
+        if control == THERMOSTAT and unit_id in self._fan_set and not why.startswith("changed at the thermostat"):
+            # handed back from the card: give the unit its own (auto) fan again; a change made at the unit is left be
+            self._fan_set.discard(unit_id)
+            cur = self.hass.states.get(ud["entity"])
+            if cur is not None and cur.state not in BAD_STATES and cur.attributes.get("fan_mode") != "auto":
+                await self._call(core.Unit(ud["id"], ud["entity"]), SERVICE_SET_FAN_MODE, {ATTR_FAN_MODE: "auto"})
         self.sent.pop(unit_id, None)  # taking over: send our setpoint now, not after the change interval
         self.drives.pop(unit_id, None)
         _LOGGER.info("%s control -> %s (%s)", unit_id, control, why)
@@ -365,13 +373,14 @@ class Manager:
         if old.state in BAD_STATES or new.state in BAD_STATES:
             return  # dropping off and reconnecting is not a change of mind
         sp_old, sp_new = old.attributes.get("temperature"), new.attributes.get("temperature")
-        if old.state == new.state and sp_old == sp_new:
+        fan_old, fan_new = old.attributes.get("fan_mode"), new.attributes.get("fan_mode")
+        if old.state == new.state and sp_old == sp_new and fan_old == fan_new:
             return
         at = self._sent_at.get(ud["id"])
         if event.context.id in self._ours or (at and core.elapsed(dt_util.utcnow(), at) < OURS_GRACE_S):
             return
         await self.async_set_control(ud["id"], THERMOSTAT,
-                                     f"changed at the thermostat: {old.state}/{sp_old} -> {new.state}/{sp_new}")
+                                     f"changed at the thermostat: {old.state}/{sp_old}/{fan_old} -> {new.state}/{sp_new}/{fan_new}")
 
     async def async_save(self):
         await self.store.async_save(self.data)
@@ -546,6 +555,7 @@ class Manager:
                 continue
             sp = cur.attributes.get("temperature")
             actual[u.id] = {"mode": cur.state, "running": cur.attributes.get("hvac_action") in ("heating", "cooling"),
+                            "fan": cur.attributes.get("fan_mode"),
                             "setpoint": None if sp is None else TemperatureConverter.convert(float(sp), disp, F)}
         outdoor = self._outdoor(settings)
         ent = self._outdoor_entity(settings)
@@ -643,6 +653,7 @@ class Manager:
                                   "state": cur.state if cur is not None else None, "sp": num(a.get("temperature")),
                                   "action": a.get("hvac_action"), "fan": a.get("fan_mode"), "temp": num(self._unit_temp(u.entity)),
                                   "cmd": cmd.mode if cmd else None, "cmd_sp": cmd.setpoint if cmd else None,
+                                  "cmd_fan": cmd.fan if cmd else None,
                                   "why": cmd.reason if cmd else None}
             prefixes.append("sensor." + u.entity.split(".", 1)[1] + "_")
         # Anything else the unit controllers report (signal now; fan stage, compressor Hz, outdoor coil temp if added).
@@ -710,6 +721,11 @@ class Manager:
             if have is None or abs(float(have) - sp) > 0.15:
                 _LOGGER.info("SEND %s temperature %s -> %s (%s)", unit.entity, have, sp, cmd.reason)
                 await self._call(unit, SERVICE_SET_TEMPERATURE, {ATTR_TEMPERATURE: sp})
+        fan_now = cur.attributes.get("fan_mode")
+        if cmd.fan is not None and cmd.fan != fan_now and cmd.fan in (cur.attributes.get("fan_modes") or []):
+            _LOGGER.info("SEND %s fan_mode %s -> %s (%s)", unit.entity, fan_now, cmd.fan, cmd.reason)
+            await self._call(unit, SERVICE_SET_FAN_MODE, {ATTR_FAN_MODE: cmd.fan})
+            self._fan_set.add(unit.id)
 
     def _stored(self, setpoint_f: float) -> float:
         """`setpoint_f` as the unit will store and report it, in HA's temperature unit."""

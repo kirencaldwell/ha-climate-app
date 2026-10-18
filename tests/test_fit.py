@@ -8,6 +8,7 @@ sys.path.append(os.path.join(HERE, "..", "custom_components", "room_climate"))  
 sys.path.insert(0, os.path.join(HERE, "..", "sim"))
 import coupled  # noqa: E402
 import fit  # noqa: E402
+import model as hm  # noqa: E402
 
 
 def test_fit_recovers_the_simulated_house():
@@ -29,14 +30,23 @@ def test_fit_recovers_the_simulated_house():
               "units": {u: {"zone": [r.id for r in rooms if r.unit == u]} for u in truth.units}}  # sensor rooms: detected
     m, rep = fit.fit(log, layout)
     assert m.meta["usable"]
+    refs = {u: (rep.get("fan_scale", {}).get(u) or {}).get("relative_to") or "auto" for u in truth.units}
     for rid, tr in truth.rooms.items():
         fr = m.rooms[rid]
         assert abs(fr.loss - tr.loss) < 0.25 * tr.loss, (rid, fr.loss, tr.loss)
         own = next(iter(tr.heat))
-        assert abs(fr.heat[own] - tr.heat[own]) < 0.25 * tr.heat[own], (rid, fr.heat, tr.heat)
-        assert abs(fr.cool[own] - tr.cool[own]) < 0.25 * tr.cool[own], (rid, fr.cool, tr.cool)
+        at_ref = hm.fan_factor(truth.units[own], refs[own])  # effects are learned at the unit's reference fan speed
+        assert abs(fr.heat[own] - tr.heat[own] * at_ref) < 0.25 * tr.heat[own] * at_ref, (rid, fr.heat, tr.heat, refs[own])
+        # Looser for cooling: with the fan under control the minisplits mostly heat on quiet and cool on low, so a
+        # faster fan and a stronger cooling effect are hard to tell apart; predictions (checked below) don't suffer.
+        tol = 0.25 if refs[own] == "auto" else 0.5
+        assert abs(fr.cool[own] - tr.cool[own] * at_ref) < tol * tr.cool[own] * at_ref, (rid, fr.cool, tr.cool, refs[own])
         others = [v for u, v in fr.heat.items() if u != own]
         assert max(others) < 0.1 * tr.heat[own], (rid, fr.heat)  # no effect where there is none
+    for u in ("minisplit_1", "minisplit_2"):  # the fan speeds the outer loop used, relative to its reference speed
+        got, true = m.units[u].fan_scale, truth.units[u].fan_scale
+        ref = rep["fan_scale"][u]["relative_to"]
+        assert got and all(abs(v - true.get(k, 1) / true.get(ref, 1)) <= 0.3 for k, v in got.items()), (u, ref, got)
     b3, pb = m.rooms["bedroom_3"].sun_dir, m.rooms["primary_bedroom"].sun_dir
     assert b3["s"] > 1.5 and b3["s"] > 2 * max(b3["e"], b3["w"]), b3  # it learns which way each room faces
     assert pb["w"] > 0.6 and pb["w"] > 2 * max(pb["e"], pb["s"]), pb

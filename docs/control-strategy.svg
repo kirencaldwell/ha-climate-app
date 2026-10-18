@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 680" width="1240" height="680" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>Room Climate control strategy</title>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475467"/>
+    </marker>
+    <marker id="p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7a5af8"/>
+    </marker>
+    <style>
+      .b { fill: #fff; stroke: #98a2b3; stroke-width: 1.5; }
+      .bl { fill: #f9f5ff; stroke: #b692f6; stroke-width: 1.5; }
+      .h { font-size: 18px; font-weight: 700; fill: #101828; text-anchor: middle; }
+      .s { font-size: 13px; fill: #344054; text-anchor: middle; }
+      .d { font-size: 12px; fill: #667085; text-anchor: middle; }
+      .l { font-size: 13px; fill: #344054; font-style: italic; }
+      .lp { font-size: 13px; fill: #6941c6; font-style: italic; }
+      .w { stroke: #475467; stroke-width: 2; fill: none; marker-end: url(#a); }
+      .wl { stroke: #7a5af8; stroke-width: 2; fill: none; stroke-dasharray: 7 5; marker-end: url(#p); }
+    </style>
+  </defs>
+  <rect width="1240" height="680" fill="#f8f9fb"/>
+  <text x="30" y="40" font-size="22" font-weight="700" fill="#101828">Room Climate — control strategy</text>
+  <text x="30" y="62" font-size="13" fill="#667085">Every minute, it works out what each room needs and tells the heat pumps. The model learns from what happens.</text>
+
+  <!-- weather -->
+  <rect x="970" y="78" width="240" height="62" rx="10" fill="#fffaeb" stroke="#fdb022" stroke-width="1.5"/>
+  <text x="1090" y="102" class="h">Weather and sun</text>
+  <text x="1090" y="124" class="d">outdoor temperature, sun, forecast</text>
+
+  <!-- main path -->
+  <rect x="30" y="170" width="170" height="124" rx="10" class="b"/>
+  <text x="115" y="204" class="h">Schedules</text>
+  <text x="115" y="228" class="s">each room's target</text>
+  <text x="115" y="246" class="s">temperature and</text>
+  <text x="115" y="264" class="s">how much it matters</text>
+
+  <rect x="250" y="170" width="200" height="124" rx="10" class="b"/>
+  <text x="350" y="200" class="h">Decide</text>
+  <text x="350" y="222" class="s">heat or cool the house,</text>
+  <text x="350" y="240" class="s">and a target for each unit</text>
+  <text x="350" y="262" class="d">rooms that matter more</text>
+  <text x="350" y="278" class="d">count more; leans cool</text>
+
+  <rect x="500" y="170" width="200" height="124" rx="10" class="b"/>
+  <text x="600" y="200" class="h">Outer loop</text>
+  <text x="600" y="222" class="s">sets each unit's setpoint</text>
+  <text x="600" y="240" class="s">a little past the room</text>
+  <text x="600" y="262" class="d">pushes gently and stops</text>
+  <text x="600" y="278" class="d">before overshooting</text>
+
+  <rect x="750" y="170" width="190" height="124" rx="10" class="b"/>
+  <text x="845" y="200" class="h">Heat pump</text>
+  <text x="845" y="222" class="s">runs harder or softer</text>
+  <text x="845" y="240" class="s">to reach its setpoint</text>
+  <text x="845" y="262" class="d">three units share one</text>
+  <text x="845" y="278" class="d">outdoor compressor</text>
+
+  <rect x="990" y="170" width="220" height="124" rx="10" fill="#fff" stroke="#fdb022" stroke-width="1.5"/>
+  <text x="1100" y="204" class="h">House</text>
+  <text x="1100" y="228" class="s">rooms warm and cool</text>
+  <text x="1100" y="246" class="s">each other</text>
+  <text x="1100" y="268" class="d">heat rises; the sun warms</text>
+  <text x="1100" y="284" class="d">south and west rooms</text>
+
+  <path d="M200 232 H250" class="w"/>
+  <path d="M450 232 H500" class="w"/>
+  <text x="456" y="222" class="l">target</text>
+  <path d="M700 232 H750" class="w"/>
+  <text x="702" y="222" class="l">setpoint</text>
+  <path d="M940 232 H990" class="w"/>
+  <text x="946" y="222" class="l">heat</text>
+  <path d="M1090 140 V170" class="w"/>
+
+  <!-- feedback -->
+  <rect x="750" y="350" width="190" height="80" rx="10" class="b"/>
+  <text x="845" y="378" class="h">Room sensors</text>
+  <text x="845" y="400" class="s">one in each room</text>
+  <text x="845" y="418" class="d">nine in all</text>
+  <path d="M1100 294 V390 H940" class="w"/>
+  <path d="M845 350 V294" class="w"/>
+  <path d="M750 390 H350 V294" class="w"/>
+  <path d="M600 390 V294" class="w"/>
+  <text x="440" y="382" class="l">room temperatures</text>
+  <text x="857" y="326" class="d" style="text-anchor:start">each unit also uses its room's</text>
+  <text x="857" y="341" class="d" style="text-anchor:start">sensor as its thermostat</text>
+
+  <!-- learning -->
+  <rect x="30" y="520" width="170" height="86" rx="10" class="bl"/>
+  <text x="115" y="550" class="h">Log</text>
+  <text x="115" y="572" class="s">records everything</text>
+  <text x="115" y="590" class="s">once a minute</text>
+  <rect x="250" y="520" width="200" height="86" rx="10" class="bl"/>
+  <text x="350" y="550" class="h">Fit</text>
+  <text x="350" y="572" class="s">each night, learns from</text>
+  <text x="350" y="590" class="s">the last two weeks</text>
+  <rect x="500" y="520" width="200" height="86" rx="10" class="bl"/>
+  <text x="600" y="550" class="h">Model</text>
+  <text x="600" y="572" class="s">predicts how the house</text>
+  <text x="600" y="590" class="s">will respond</text>
+
+  <path d="M200 563 H250" class="wl"/>
+  <path d="M450 563 H500" class="wl"/>
+  <path d="M545 520 V480 H410 V294" class="wl"/>
+  <text x="420" y="452" class="lp">plans, once the model</text>
+  <text x="420" y="468" class="lp">predicts well enough</text>
+  <path d="M660 520 V294" class="wl"/>
+  <text x="670" y="470" class="lp">tuning for each unit</text>
+
+  <text x="30" y="650" class="lp">Dashed lines are the learning loop: the model is learned from the log, then used to plan and to tune the controllers.</text>
+</svg>

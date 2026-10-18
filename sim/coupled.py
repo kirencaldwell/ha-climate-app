@@ -24,6 +24,8 @@ import model as hm  # noqa: E402
 import optimizer  # noqa: E402
 
 LAT, LON = 47.68, -122.38  # the house (from its NWS weather entity)
+# Assumed share of a unit's output at each fan speed (a slower fan moves less air over the coil). Unmeasured.
+FAN_SCALE = {"quiet": 0.55, "low": 0.7, "medium": 0.85, "middle": 0.93, "high": 1.0, "auto": 1.0}
 
 
 def sun_azimuth(t: datetime, lat=LAT, lon=LON, utc_offset_h=-7.0) -> float:
@@ -87,9 +89,10 @@ def the_house() -> hm.HouseModel:
         "bedroom_3": R(loss=0.06, solar=0.5, sun_dir={"s": 3.0}, bias=0.1, heat={"minisplit_2": 7.0}, cool={"minisplit_2": 6.0},
                        coupling={"living_room": 0.12, "primary_bedroom": 0.15}),
     }
-    units = {"air_handler": hm.UnitModel(sensor_rooms=["kitchen"]),
-             "minisplit_1": hm.UnitModel(sensor_rooms=["primary_bedroom"]),
-             "minisplit_2": hm.UnitModel(sensor_rooms=["bedroom_3"])}
+    fans = {k: v for k, v in FAN_SCALE.items() if v < 1}
+    units = {"air_handler": hm.UnitModel(sensor_rooms=["kitchen"], fan_scale=dict(fans)),
+             "minisplit_1": hm.UnitModel(sensor_rooms=["primary_bedroom"], fan_scale=dict(fans)),
+             "minisplit_2": hm.UnitModel(sensor_rooms=["bedroom_3"], fan_scale=dict(fans))}
     return hm.HouseModel(rooms, units, {"source": "sim truth", "first_floor": first})
 
 
@@ -107,6 +110,8 @@ class CoupledSim:
         self.running = {u: False for u in truth.units}
         self.output = {u: 0.0 for u in truth.units}
         self.effect = {u: 0.0 for u in truth.units}  # output seen through each unit's lag (coil and ducts)
+        self.fan = {u: "auto" for u in truth.units}
+        self.fan_changes = 0
         self.room_step, self.unit_step, self.noise = room_step, unit_step, noise
         self.rng = random.Random(seed)
         self.starts = 0
@@ -123,6 +128,11 @@ class CoupledSim:
             if self.sp[uid] is None or abs(stored - self.sp[uid]) > 0.01:
                 self.sp[uid] = stored
                 self.commands += 1
+
+    def set_fan(self, uid: str, fan):
+        if fan is not None and fan != self.fan[uid]:
+            self.fan[uid] = fan
+            self.fan_changes += 1
 
     def reading(self, rid: str) -> float:
         return _q(self.temps[rid] + self.rng.gauss(0, self.noise), self.room_step)
@@ -143,6 +153,7 @@ class CoupledSim:
             for uid, u in self.m.units.items():
                 was = self.running[uid]
                 y, self.running[uid] = hm.unit_output(u, self.mode[uid], self.sp[uid], hm.unit_reading(self.m, uid, self.temps), was)
+                y *= hm.fan_factor(u, self.fan[uid])
                 self.starts += (not was) and self.running[uid]
                 self.output[uid] = y
                 self.effect[uid] = hm.lag(u, self.effect[uid], y, 1 / 60)
@@ -160,7 +171,7 @@ class CoupledSim:
                 "rooms": {r.id: {"temp": self.reading(r.id), "target": core.target_temp(r, t), "prio": core.room_priority(r, t),
                                  "unit": r.unit} for r in rooms if r.id in self.temps},
                 "units": {u: {"state": self.mode[u], "sp": None if self.sp[u] is None else round(self.sp[u], 1),
-                              "action": self.action(u), "temp": self.unit_temp(u)} for u in self.m.units}}
+                              "action": self.action(u), "temp": self.unit_temp(u), "fan": self.fan[u]} for u in self.m.units}}
 
 
 class HeuristicController:
@@ -214,6 +225,7 @@ class HeuristicController:
             state = self.states.setdefault(u.id, core.UnitState())
             if not (cmd.setpoint is None and cmd.mode == state.mode):  # same rule as Manager._send
                 sim.command(u.id, cmd.mode, cmd.setpoint)
+                sim.set_fan(u.id, cmd.fan)
             self.states[u.id] = core.apply(state, cmd, now)
             if core.regime_changed(state, self.states[u.id]):
                 for r in self.rooms:
@@ -258,6 +270,7 @@ class MPCController:
             cmd, self.drives[u.id], _ = core.drive(cmd, self.drives.get(u.id), core.slope(h, now, self.s.drive_slope_s),
                                                    kp, u, now, self.s, lag if lag > 0 else None)
             sim.command(u.id, cmd.mode, cmd.setpoint)
+            sim.set_fan(u.id, cmd.fan)
 
     def tick(self, sim: CoupledSim, now: datetime):
         if self.next_at is not None and now < self.next_at:
@@ -275,7 +288,8 @@ class MPCController:
             now_sp = {u.id: (self.sent[u.id][0].setpoint if u.id in self.sent else None) for u in self.units}
         p = optimizer.plan(self.m, self.rooms, self.units, temps, now, self.house, now_sp, running,
                            [sim.weather.outdoor(t) for t in ts], [sim.weather.sun(t) for t in ts], self.s, self.ps,
-                           drives=dict(self.drives) if self.s.drive else None, lagged=dict(sim.effect))
+                           drives=dict(self.drives) if self.s.drive else None, lagged=dict(sim.effect),
+                           fans=dict(sim.fan))
         self.last_plan = p
         setpoints = p.setpoints
         if self.house.mode not in ("heat", "cool"):

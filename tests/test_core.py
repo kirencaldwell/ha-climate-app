@@ -729,3 +729,19 @@ def test_drive_looks_ahead_by_the_units_lag():
     cmd = core.Command("heat", None, "", True, None, 66.5, 65.3, 0.0)
     keep5, st5, _ = core.drive(cmd, st, 15.0, 1.0, Unit("u", "climate.u"), MON + timedelta(minutes=5), Settings(), 5.0)
     assert not stop10.active and st5.on  # a 5-minute lag: 66.55, on target, keep going
+
+
+def test_fan_follows_the_push_and_holds_changes():
+    s = Settings(fan_units="u")
+    cmd, st, _ = _drv(66.5, 67.0, kp=0.3, s=s)  # gentle push
+    assert cmd.fan == "quiet"
+    hard, st2, _ = _drv(65.5, 67.0, st=st, t=MON + timedelta(minutes=2), s=s)  # a bigger push, but too soon
+    assert hard.fan == "quiet"
+    later, _, _ = _drv(65.5, 67.0, st=st2, t=MON + timedelta(minutes=12), s=s)
+    assert later.fan in ("low", "medium")  # steps up once the hold is over
+    far, _, _ = _drv(63.0, 67.0, st=st2, t=MON + timedelta(minutes=3), s=s)
+    assert far.fan == "auto"  # far from target: the unit's own fan, at once
+    other, _, _ = _drv(66.5, 67.0, kp=0.3)  # a unit not listed in fan_units keeps its fan
+    assert other.fan is None
+    stopped, _, _ = _drv(66.9, 67.0, rate=12.0, st=st, t=MON + timedelta(minutes=1), s=s)
+    assert not stopped.active and stopped.fan is None  # stopping leaves the fan as it was

@@ -33,7 +33,8 @@ def _shadow_run(model, hours, ignore=()):
         now = sim.now
         ctl.tick(sim, now)
         temps = {r.id: sim.reading(r.id) for r in rooms}
-        actual = {u.id: {"mode": sim.mode[u.id], "setpoint": sim.sp[u.id], "running": sim.running[u.id]} for u in units}
+        actual = {u.id: {"mode": sim.mode[u.id], "setpoint": sim.sp[u.id], "running": sim.running[u.id],
+                         "fan": sim.fan[u.id]} for u in units}
         shadow.observe(now, temps, actual, w.outdoor(now), w.sun(now))
         if shadow.due(now):
             shadow.run(now, rooms, units, temps, actual, w.outdoor(now), w.sun, s, ignore)

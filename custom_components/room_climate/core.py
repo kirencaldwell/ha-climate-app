@@ -110,6 +110,14 @@ class Settings:
     drive_slope_s: int = 600  # the room's rate of change from this much history
     drive_min_interval_s: int = 300  # at most one setpoint change per unit this often (starts and stops excepted)
     drive_min_change: float = 0.7  # ignore setpoint moves smaller than this (most of a 0.5 C step)
+    # Fan speed, the loop's second output (units listed here only; others keep whatever fan they're set to). A gentle
+    # push runs the fan low: less capacity at the compressor's lowest speed, so a strong unit in a small room runs
+    # longer and softer instead of in short blasts, and less draft near it. A hard push steps the fan up; a room far
+    # from target gets the unit's own auto fan.
+    fan_units: str = "minisplit_1,minisplit_2"  # comma-separated unit ids
+    fan_levels: str = "quiet,low,medium"  # slowest first, for pushes up to 1/3, 2/3 and the rest of drive_max_push
+    fan_far: float = 2.0  # room predicted this far short of target: auto fan
+    fan_min_interval_s: int = 600  # at most one fan change per unit this often (going to auto excepted)
     # Reading older than this is ignored. Long, because Bluetooth sensors (e.g. Govee) only update when the value
     # changes; a sensor that really drops out goes unavailable instead.
     stale_s: int = 7200
@@ -160,6 +168,7 @@ class Command:
     target: Optional[float] = None  # what the unit's rooms should reach (room scale, aim included), for drive
     room: Optional[float] = None  # the rooms' priority-weighted reading now
     offset: float = 0.0  # the unit's own reading minus `room`
+    fan: Optional[str] = None  # fan mode to set (None: leave the unit's fan as it is)
 
 
 @dataclass
@@ -405,6 +414,9 @@ class DriveState:
     at: Optional[datetime] = None  # last update
     sp: Optional[float] = None  # last setpoint sent (F, on the unit's 0.5 C grid)
     sent_at: Optional[datetime] = None
+    miss: float = 0.0  # last predicted miss (F; > 0 the room still needs this mode's help)
+    fan: Optional[str] = None  # last fan mode chosen
+    fan_at: Optional[datetime] = None
 
 
 def slope(history: list[tuple[datetime, float]], now: datetime, window_s: int) -> Optional[float]:
@@ -479,8 +491,35 @@ def drive_law(st: Optional[DriveState], mode: str, room: float, target: float, r
     else:
         i = max(0.0, i + kp * min(0.0, miss) * dt_h / ti_h)  # bleeds off while past target
         push = -settings.drive_stop_push
-    keep = DriveState(mode, on, i, now, None if fresh else st.sp, None if fresh else st.sent_at)
+    keep = DriveState(mode, on, i, now, None if fresh else st.sp, None if fresh else st.sent_at, miss,
+                      None if st is None else st.fan, None if st is None else st.fan_at)
     return push, keep
+
+
+def fan_for(push: float, miss: float, on: bool, settings: Settings = Settings()) -> Optional[str]:
+    """Fan mode for a push (None: no opinion, i.e. stopped: leave it)."""
+    if not on:
+        return None
+    if miss >= settings.fan_far:
+        return "auto"
+    levels = [x.strip() for x in settings.fan_levels.split(",") if x.strip()]
+    if not levels:
+        return None
+    frac = max(0.0, push) / max(1e-6, settings.drive_max_push)
+    return levels[min(len(levels) - 1, int(frac * len(levels)))]
+
+
+def choose_fan(st: DriveState, push: float, now: datetime, settings: Settings = Settings()) -> Optional[str]:
+    """The fan mode to have now, holding a change for fan_min_interval_s (except to auto, which goes at once).
+    Updates st.fan/st.fan_at. None: leave the fan alone."""
+    want = fan_for(push, st.miss, st.on, settings)
+    if want is None or want == st.fan:
+        return st.fan if want is not None else None
+    if st.fan is not None and want != "auto" and st.fan_at is not None \
+            and elapsed(now, st.fan_at) < settings.fan_min_interval_s:
+        return st.fan
+    st.fan, st.fan_at = want, now
+    return want
 
 
 def drive(cmd: Command, st: Optional[DriveState], rate: Optional[float], kp: float, unit: Unit, now: datetime,
@@ -517,7 +556,10 @@ def drive(cmd: Command, st: Optional[DriveState], rate: Optional[float], kp: flo
         why = f"easing off: on track for {cmd.target:.0f}°"
     else:
         why = "at target; idling"
-    return Command(cmd.mode, sp, why, new.on, raw, cmd.target, cmd.room, cmd.offset), new, changed
+    fan = None
+    if unit.id in {x.strip() for x in settings.fan_units.split(",")}:
+        fan = choose_fan(new, push, now, settings)
+    return Command(cmd.mode, sp, why, new.on, raw, cmd.target, cmd.room, cmd.offset, fan), new, changed
 
 
 MANUAL_MODES = ("dry", "fan_only")

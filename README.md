@@ -26,6 +26,10 @@ behind the reading so the unit stops; it restarts 0.6 °F short. The gain comes 
 unit on its own rooms (a powerful unit in a small room gets a small gain; never above 1), the integral covers a cold
 night's steady load, and setpoints move at most every 5 minutes on the unit's 0.5 °C grid. The model-based controller
 plans *targets* and runs the same loop in its simulation, so its predictions match what is sent.
+The loop also sets the **fan speed** on the units in `fan_units` (the two minisplits by default; the ducted air handler
+keeps its fan): quiet for a gentle push, then low and medium as it pushes harder, auto when a room is far from target.
+A slower fan means less output at the compressor's lowest speed, so a strong unit in a small room runs longer and
+softer instead of in short bursts. The model learns each fan speed's share of a unit's output from the log.
 
 ## Model-based control ("would do" mode: shown, not sent)
 A learned thermal model plus a model-predictive optimizer. HA refits the model every night at 3:40 on the last 14 days

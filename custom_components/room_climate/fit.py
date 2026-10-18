@@ -41,12 +41,14 @@ def _median(xs):
 
 
 def series(rows: list, rooms: list, units: list):
-    """Per-minute lists: times, temps[room], outdoor, sun, y[unit] (signed estimated output), unit readings."""
+    """Per-minute lists: times, temps[room], outdoor, sun, y[unit] (signed estimated output, before any fan scaling),
+    unit readings, fan mode[unit]."""
     d = hm.UnitModel()
     ts, out, sun = [], [], []
     T = {r: [] for r in rooms}
     Y = {u: [] for u in units}
     U = {u: [] for u in units}
+    F = {u: [] for u in units}
     for row in rows:
         ts.append(datetime.fromisoformat(row["t"]))
         for r in rooms:
@@ -62,6 +64,7 @@ def series(rows: list, rooms: list, units: list):
             x = row.get("units", {}).get(u) or {}
             act, sp, rd = x.get("action"), x.get("sp"), x.get("temp")
             U[u].append(None if rd is None else float(rd))
+            F[u].append(x.get("fan"))
             if act in ("heating", "cooling"):
                 y = 1.0
                 if sp is not None and rd is not None:
@@ -70,7 +73,22 @@ def series(rows: list, rooms: list, units: list):
                 Y[u].append(y if act == "heating" else -y)
             else:
                 Y[u].append(0.0)
-    return ts, T, out, sun, Y, U
+    return ts, T, out, sun, Y, U, F
+
+
+FAN_REF = ("auto", "high")  # fan modes counted as full output: the others' factors are relative to these
+FAN_GRID = (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75, 2.0)  # relative to the reference speed
+
+
+def scaled(Y: dict, F: dict, scales: dict) -> dict:
+    """Unit outputs with each minute's fan factor applied (scales: unit -> {fan mode: factor})."""
+    return {u: [y * scales.get(u, {}).get(f, 1.0) if y else y for y, f in zip(v, F.get(u, [None] * len(v)))]
+            for u, v in Y.items()}
+
+
+def effective(Y: dict, F: dict, m: hm.HouseModel) -> dict:
+    """The units' outputs as the model sees them: fan factors, then lags."""
+    return with_lags(scaled(Y, F, {u: x.fan_scale for u, x in m.units.items()}), m)
 
 
 LAGS_MIN = (0, 5, 10, 20, 30)  # candidate unit lags
@@ -163,7 +181,7 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     """-> (HouseModel, report). layout: {"rooms": {id: {"units": [...], "neighbors": [...]}},
     "units": {id: {"sensor_rooms": [...] (optional: detected when missing), "zone": [...]}}}"""
     rooms, units = list(layout["rooms"]), list(layout["units"])
-    ts, T, out, sun, Y, U = series(rows, rooms, units)
+    ts, T, out, sun, Y, U, F = series(rows, rooms, units)
     n = len(ts)
     # A room's readings from before its `since` (a sensor that was replaced or moved) aren't the room: leave them out.
     for rid, spec in layout["rooms"].items():
@@ -242,10 +260,12 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     lags = {u: 0 for u in units}
     cache = {}
 
-    def trial(lg):
-        key = tuple(sorted(lg.items()))
+    def trial(lg, sc=None):
+        sc = sc or {}
+        key = (tuple(sorted(lg.items())), tuple(sorted((u, tuple(sorted(v.items()))) for u, v in sc.items())))
         if key not in cache:
-            cache[key] = rooms_fit({u: lagged(Y[u], lg.get(u, 0)) for u in Y})
+            Ys = scaled(Y, F, sc)
+            cache[key] = rooms_fit({u: lagged(Ys[u], lg.get(u, 0)) for u in Ys})
         return cache[key]
 
     # Only a unit with one of its own rooms in the fit: otherwise the "best" lag would come from how it happens to
@@ -256,7 +276,28 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
         for u in units:
             if u in own_fitted:
                 lags[u] = min(LAGS_MIN, key=lambda L: trial({**lags, u: L})[2])
-    fitted, rep, _ = trial(lags)
+    # Each fan speed's output relative to a reference speed: full fan (auto/high) if the unit has run an hour at it,
+    # else the speed it ran at most (whose factor the unit's effect then includes). Only speeds with an hour of running;
+    # others count as the reference. By the same training fit.
+    scales = {u: {} for u in units}
+    ref_fan = {}
+    for u in units:
+        if u not in own_fitted:
+            continue
+        minutes = {}
+        for y, f in zip(Y[u], F[u]):
+            if y:
+                minutes[f] = minutes.get(f, 0) + 1
+        full = sum(minutes.get(f, 0) for f in FAN_REF)
+        ref = "auto" if full >= 60 else max(minutes, key=minutes.get, default=None)
+        if ref is None:
+            continue
+        ref_fan[u] = ref
+        refs = set(FAN_REF) if ref in FAN_REF else {ref}
+        for level in sorted(f for f, k in minutes.items() if f and f not in refs and k >= 60):
+            best = min(FAN_GRID, key=lambda g: trial(lags, {**scales, u: {**scales[u], level: g}})[2])
+            scales[u][level] = best
+    fitted, rep, _ = trial(lags, scales)
     m.rooms.update(fitted)
     report.update(rep)
     zones = {u: spec.get("zone", []) for u, spec in layout["units"].items()}
@@ -264,9 +305,10 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     for uid, spec in layout["units"].items():
         sr, off = (spec["sensor_rooms"], 0.0) if spec.get("sensor_rooms") is not None else detected.get(uid, ([], 0.0))
         m.units[uid] = hm.UnitModel(sensor_rooms=[r for r in sr if r in m.rooms], sensor_offset=off,
-                                    lag_h=round(lags.get(uid, 0) / 60, 4))
+                                    lag_h=round(lags.get(uid, 0) / 60, 4), fan_scale=scales.get(uid, {}))
     report["lags_min"] = lags
-    report["holdout"] = validate(m, ts, T, out, sun, with_lags(Y, m), {r: splits[r] for r in m.rooms})
+    report["fan_scale"] = {u: {"relative_to": ref_fan.get(u), **v} for u, v in scales.items() if v}
+    report["holdout"] = validate(m, ts, T, out, sun, effective(Y, F, m), {r: splits[r] for r in m.rooms})
     report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
     # Every room with enough held-out checks must beat "nothing changes"; at least one must have been checked. A room
     # whose sensor only just started may have none yet: the live accuracy gate (mpc.readiness) still covers it.
@@ -338,8 +380,8 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
     weather and the sun did and predict each room `horizons` minutes ahead. -> {room: {"60": [[iso, F]], ...}}, each
     point at the time it's a prediction for, so it plots against the actual reading at that moment."""
     rooms, units = list(m.rooms), sorted({u for row in rows for u in row.get("units", {})})
-    ts, T, out, sun, Y, _ = series(rows, rooms, units)
-    Y = with_lags(Y, m)
+    ts, T, out, sun, Y, _, F = series(rows, rooms, units)
+    Y = effective(Y, F, m)
     res = {r: {str(h): [] for h in horizons} for r in rooms}
     hmax = max(horizons)
     for a in range(0, len(ts) - hmax, every_min):

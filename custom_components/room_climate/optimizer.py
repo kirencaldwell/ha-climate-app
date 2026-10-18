@@ -69,7 +69,7 @@ def _pad(seq, n):
 
 def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime, house: core.HouseState,
          setpoints_now: dict, running: dict, outdoor_seq, sun_seq, settings: core.Settings = core.Settings(),
-         ps: PlanSettings = PlanSettings(), ignore=(), fixed=None, drives=None, lagged=None) -> Plan:
+         ps: PlanSettings = PlanSettings(), ignore=(), fixed=None, drives=None, lagged=None, fans=None) -> Plan:
     """Best house mode and setpoints for the next `horizon_h`. `temps` are current room temperatures (rooms the model
     knows), `running` which units are actually running now, `outdoor_seq`/`sun_seq` the expected weather per step.
     Rooms in `ignore` are simulated (their unit may regulate on them) but don't count in the cost: e.g. a room that
@@ -80,7 +80,8 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
     With the outer loop on (settings.drive), what's planned per unit is the *target* for its rooms, and the simulation
     runs core.drive_law every substep to turn it into setpoints, as the integration will: `setpoints_now` are then
     the targets planned last time, `drives` the units' outer-loop states now (unit id -> core.DriveState). `lagged`:
-    the units' effective outputs now (model.step)."""
+    the units' effective outputs now (model.step). `fans`: unit id -> fan mode now; with the outer loop, the
+    simulation picks fan speeds as it does (core.fan_for)."""
     fixed = fixed or {}
     drive = settings.drive
     n = max(1, int(round(ps.horizon_h * 60 / ps.step_min)))
@@ -119,7 +120,9 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
         eff = [m.rooms[r.id].heat.get(u.id, 0.0) for r in zone_rooms[u.id]]
         kp[u.id] = core.drive_gain(sum(eff) / len(eff) if eff else None, settings, m.units[u.id].k1)
 
-    def controller(mode, targets, states, clock, first):
+    fan_units = {x.strip() for x in settings.fan_units.split(",")}
+
+    def controller(mode, targets, states, clock, first, fan_now):
         """model.rollout's control hook: the outer loop on the simulated rooms."""
         def control(temps, rates, dt_h):
             clock[0] += timedelta(hours=dt_h)
@@ -140,6 +143,10 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
                                                     clock[0], settings, lag if lag > 0 else None)
                 sgn = 1.0 if mode == "heat" else -1.0
                 out[u.id] = max(u.min_setpoint, min(u.max_setpoint, room + off + sgn * push))
+                if u.id in fan_units:
+                    f = core.fan_for(push, states[u.id].miss, states[u.id].on, settings)
+                    if f is not None:
+                        fan_now[u.id] = f
                 if u.id not in first:
                     first[u.id] = core.to_grid(out[u.id])
             return out
@@ -161,16 +168,17 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
         lag = dict(lagged) if lagged is not None else None
         states = {uid: st for uid, st in (drives or {}).items() if mode == house.mode} if drive else {}
         clock, first = [now], {}
+        fan_now = dict(fans or {})
         for bi, (a, b) in enumerate(blocks):
             sp_b = {uid: v[bi] for uid, v in sps.items()}
             ctl = None
             if drive and mode in ("heat", "cool"):
-                inner = controller(mode, sp_b, states, clock, first)
+                inner = controller(mode, sp_b, states, clock, first, fan_now)
                 fixed_sp = {uid: f[1] for uid, f in fixed.items()}
                 ctl = lambda tt, rr, hh, inner=inner, fixed_sp=fixed_sp: {**inner(tt, rr, hh), **fixed_sp}
             sp_b.update({uid: f[1] for uid, f in fixed.items()})
             tr, ou, run = hm.rollout(m, cur, modes_by_unit, sp_b, run, outdoor[a:b], sun[a:b], dt_h, ps.substeps,
-                                     lag, ctl)
+                                     lag, ctl, fans=fan_now)
             traj += tr
             outs += ou
             cur = tr[-1]
