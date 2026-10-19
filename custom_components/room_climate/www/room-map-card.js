@@ -26,6 +26,17 @@ const toHHMM = m => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m %
 const fmtTime = m => { const h = Math.floor(m / 60), mm = String(m % 60).padStart(2, "0"); return `${h % 12 || 12}:${mm} ${h < 12 ? "AM" : "PM"}`; };
 const todayIdx = () => (new Date().getDay() + 6) % 7;  // Mon=0
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+// Chart line tiers, so the eye goes to what matters:
+//   main: what really happened (thick, text colour, outlined, drawn on top)
+//   key:  the model's version to compare against it (coloured, medium)
+//   ref:  baselines and context (thin, faded grey)
+const TIERS = { main: { w: 3, op: 1, halo: true }, key: { w: 2.2, op: .95 }, ref: { w: 1.5, op: .6, color: "#8b96a8", dash: "2 4" } };
+const TIER_RANK = { ref: 0, key: 1, main: 2 };
+const HALO = "var(--card-background-color, #121a28)";
+const tier = sr => {
+  const t = TIERS[sr.tier || "key"];
+  return { w: sr.width || t.w, op: t.op, halo: t.halo, color: sr.color || t.color || "currentColor", dash: sr.dash !== undefined ? sr.dash : t.dash };
+};
 
 const CSS = `
 .rc { color: var(--primary-text-color, #e6edf7); font-size: 16px; padding: 0 12px 12px; box-sizing: border-box; }
@@ -626,16 +637,20 @@ class RoomMapCard extends HTMLElement {
     let bandSvg = "";
     if (band && band.length > 1) {
       const top = band.map(p => `${x(p[0]).toFixed(1)},${y(p[2]).toFixed(1)}`), bot = band.slice().reverse().map(p => `${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`);
-      bandSvg = `<polygon points="${top.concat(bot).join(" ")}" fill="#3de0a5" fill-opacity=".09"/>`;
+      bandSvg = `<polygon points="${top.concat(bot).join(" ")}" fill="#3de0a5" fill-opacity=".12"/>` +
+        [top, bot].map(e => `<polyline points="${e.join(" ")}" fill="none" stroke="#3de0a5" stroke-opacity=".3" stroke-width="1"/>`).join("");
     }
     const path = (sr) => {
-      const p = sr.pts.filter(q => q[0] >= t0 && q[0] <= t1 && q[1] != null);
-      if (sr.dots) return p.map(([t, v]) => `<circle cx="${x(t).toFixed(1)}" cy="${y(v).toFixed(1)}" r="${sr.r || 2.4}" fill="${sr.color}"/>`).join("");
+      const p = sr.pts.filter(q => q[0] >= t0 && q[0] <= t1 && q[1] != null), st = tier(sr);
+      if (sr.dots) return p.map(([t, v]) => `<circle cx="${x(t).toFixed(1)}" cy="${y(v).toFixed(1)}" r="${sr.r || 2.6}" fill="${st.color}" fill-opacity="${st.op}" style="stroke:${HALO}" stroke-width="1"/>`).join("");
       if (p.length < 2) return "";
       let d = `M${x(p[0][0]).toFixed(1)} ${y(p[0][1]).toFixed(1)}`;
       for (let i = 1; i < p.length; i++) d += sr.step ? `H${x(p[i][0]).toFixed(1)}V${y(p[i][1]).toFixed(1)}` : `L${x(p[i][0]).toFixed(1)} ${y(p[i][1]).toFixed(1)}`;
-      return `<path d="${d}" fill="none" stroke="${sr.color}" stroke-width="${sr.width || 2}" ${sr.dash ? `stroke-dasharray="${sr.dash}"` : ""} stroke-linejoin="round"/>`;
+      const halo = st.halo ? `<path d="${d}" fill="none" style="stroke:${HALO}" stroke-width="${st.w + 3}" stroke-linejoin="round" stroke-linecap="round"/>` : "";
+      return halo + `<path d="${d}" fill="none" stroke="${st.color}" stroke-opacity="${st.op}" stroke-width="${st.w}" ${st.dash ? `stroke-dasharray="${st.dash}"` : ""} stroke-linejoin="round" stroke-linecap="round"/>`;
     };
+    // the measured line goes on top, references underneath
+    const order = series.slice().sort((a, b) => TIER_RANK[a.tier || "key"] - TIER_RANK[b.tier || "key"]);
     const strip = strips.map((st, i) => {
       const yy = 6 + i * (SH + 3);
       return `<text x="${L - 5}" y="${yy + SH - 2}" text-anchor="end" font-size="9" fill="currentColor" fill-opacity=".6">${st.label}</text>` +
@@ -647,7 +662,21 @@ class RoomMapCard extends HTMLElement {
     const markSvg = marks.filter(mk => mk.t > t0 && mk.t < t1).map(mk => `<line x1="${x(mk.t)}" x2="${x(mk.t)}" y1="${T}" y2="${H - B}" stroke="#ffd166" stroke-opacity=".55" stroke-dasharray="3 3"/>
       <text x="${x(mk.t) - 4}" y="${T + 10}" text-anchor="end" font-size="9.5" fill="#ffd166" fill-opacity=".85">${mk.left || ""}</text>
       <text x="${x(mk.t) + 4}" y="${T + 10}" font-size="9.5" fill="#ffd166" fill-opacity=".85">${mk.right || ""}</text>`).join("");
-    return `<svg class="rc-chart" viewBox="0 0 ${W} ${H}">${strip}${g}${bandSvg}${hline}${markSvg}${nowLine}${series.map(path).join("")}</svg>`;
+    return `<svg class="rc-chart" viewBox="0 0 ${W} ${H}">${strip}${g}${bandSvg}${hline}${markSvg}${nowLine}${order.map(path).join("")}</svg>`;
+  }
+
+  // Legend from the same series specs as the chart, with a drawn swatch of each line.
+  // items: series specs with a label, or {swatch: "band" | "block", color, label}
+  _legend(items) {
+    const sw = it => {
+      if (it.swatch === "band") return `<rect x="1" y="1" width="22" height="10" fill="#3de0a5" fill-opacity=".18" stroke="#3de0a5" stroke-opacity=".4"/>`;
+      if (it.swatch === "block") return `<rect x="4" y="2" width="16" height="8" fill="${it.color}" fill-opacity=".75"/>`;
+      const st = tier(it);
+      if (it.dots) return `<circle cx="7" cy="6" r="3" fill="${st.color}"/><circle cx="17" cy="6" r="3" fill="${st.color}"/>`;
+      return `<line x1="1" x2="23" y1="6" y2="6" stroke="${st.color}" stroke-opacity="${st.op}" stroke-width="${st.w}" ${st.dash ? `stroke-dasharray="${st.dash}"` : ""} stroke-linecap="round"/>`;
+    };
+    return `<div class="rc-legend" style="justify-content:flex-start;gap:6px 14px;flex-wrap:wrap">${items.filter(it => it && it.label).map(it =>
+      `<span style="display:inline-flex;align-items:center;gap:5px;${(it.tier || "key") === "main" ? "color:var(--primary-text-color);font-weight:600" : ""}"><svg width="24" height="12" viewBox="0 0 24 12" style="color:var(--primary-text-color)">${sw(it)}</svg>${it.label}</span>`).join("")}</div>`;
   }
 
   _weatherLine(d) {
@@ -689,7 +718,7 @@ class RoomMapCard extends HTMLElement {
     const chips = items => `<div class="rc-seg rc-chips">${items.map(([k, l]) => chip(k, l)).join("")}</div>`;
     const hzSeg = `<div class="rc-seg rc-chips">${[["60", "1 h ahead"], ["120", "2 h ahead"]].map(([k, l]) =>
       `<button data-mx="hz" data-k="${k}" class="${hz === k ? "on" : ""}">${l}</button>`).join("")}</div>`;
-    const lg = items => `<div class="rc-legend" style="justify-content:flex-start;gap:14px;flex-wrap:wrap">${items.filter(Boolean).map(([c, t, k]) => `<span><b style="color:${c}">${k || "—"}</b> ${t}</span>`).join("")}</div>`;
+    const lg = items => this._legend(items);
     // 1. temperature: actual and its comfort band, plus what's switched on
     const act = S.filter(x => x.r[rid]).map(x => [ms(x.t), x.r[rid][0]]);
     const band = S.filter(x => x.r[rid] && x.r[rid][1] != null).map(x => [ms(x.t), x.r[rid][1] - h.band[0], x.r[rid][1] + h.band[1]]);
@@ -697,56 +726,52 @@ class RoomMapCard extends HTMLElement {
     const startPt = act.length ? [act[act.length - 1]] : [];
     const BT = ((h.backtest || {}).points || {})[rid] || {};
     const split = (h.backtest || {}).split;
-    const tSeries = [{ pts: act, color: "#e6edf7", width: 2.2 }];
-    if (show.has("bt")) tSeries.push({ pts: (BT[hz] || []).map(([t, v]) => [ms(t), v]), color: "#ffb454", width: 1.4 });
-    if (show.has("pred")) tSeries.push({ pts: (P[hz] || []).map(([t, v]) => [ms(t), v]), color: "#3fa9ff", dots: true });
-    if (show.has("stay")) tSeries.push({ pts: startPt.concat(proj.map(([t, v]) => [ms(t), v])), color: "#9aa7b8", dash: "2 4", width: 2 });
-    if (show.has("plan")) tSeries.push({ pts: startPt.concat(plan.map(([t, v]) => [ms(t), v])), color: "#3de0a5", dash: "6 4", width: 2 });
+    const tSeries = [{ pts: act, tier: "main", label: "actual" }];
+    if (show.has("bt")) tSeries.push({ pts: (BT[hz] || []).map(([t, v]) => [ms(t), v]), color: "#ffb454", label: `latest model over the logged past, ${hzTxt} ahead` });
+    if (show.has("pred")) tSeries.push({ pts: (P[hz] || []).map(([t, v]) => [ms(t), v]), color: "#3fa9ff", dots: true, label: `what the model said ${hzTxt} before` });
+    if (show.has("stay")) tSeries.push({ pts: startPt.concat(proj.map(([t, v]) => [ms(t), v])), tier: "ref", label: "next 2 h if settings stay" });
+    if (show.has("plan")) tSeries.push({ pts: startPt.concat(plan.map(([t, v]) => [ms(t), v])), color: "#3de0a5", dash: "7 4", label: "next 2 h if the model were in charge" });
     const tempChart = this._tsChart({ t0, t1, now, band, fmt: v => v.toFixed(1) + "°",
       marks: split && show.has("bt") ? [{ t: ms(split), left: "trained on ←", right: "→ tested on" }] : [], series: tSeries });
     const needHz = show.has("bt") || show.has("pred");
     // 2. prediction error by hour, at one horizon, against "nothing changes" at the same horizon
     const A = ((h.accuracy || {})[rid] || {})[hz] || [];
-    const accChart = this._tsChart({ t0, t1: now, now, zero: true, H: 150, fmt: v => v.toFixed(1) + "°", series: [
-      { pts: A.map(([t, , b]) => [ms(t) + 1800e3, b]), color: "#667085", dash: "4 4" },
-      { pts: A.map(([t, r]) => [ms(t) + 1800e3, r]), color: "#3fa9ff", width: 2 },
-      { pts: A.map(([t, r]) => [ms(t) + 1800e3, r]), color: "#3fa9ff", dots: true, r: 2 }] });
+    const aSeries = [
+      { pts: A.map(([t, , b]) => [ms(t) + 1800e3, b]), tier: "ref", dash: "5 4", label: "assuming nothing changes" },
+      { pts: A.map(([t, r]) => [ms(t) + 1800e3, r]), color: "#3fa9ff", width: 2.6, label: "model's typical miss" }];
+    const accChart = this._tsChart({ t0, t1: now, now, zero: true, H: 150, fmt: v => v.toFixed(1) + "°",
+      series: aSeries.concat([{ pts: aSeries[1].pts, color: "#3fa9ff", dots: true, r: 2.2 }]) });
     // 3. commands per unit: what the unit was set to and its mode; the controllers' commands on request
     const units = Object.keys(h.units || {});
     if (!units.includes(this._mUnit)) this._mUnit = units[0];
     const uid = this._mUnit;
     const unitTabs = `<div class="rc-seg">${units.map(u => `<button data-mx="unit" data-u="${u}" class="${u === uid ? "on" : ""}">${(h.units[u] || u).replace(/ (air handler|minisplit)$/i, "")}</button>`).join("")}</div>`;
     const U = i => S.filter(x => x.u[uid] && x.u[uid][i] != null).map(x => [ms(x.t), x.u[uid][i]]);
-    const cSeries = [{ pts: U(1), color: "#e6edf7", step: true, width: 2 }];
+    const cSeries = [{ pts: U(1), tier: "main", step: true, label: "setpoint the unit was at" }];
     const cStrips = [{ label: "unit", segs: segs(x => (x.u[uid] || [])[0]) }];
-    if (show.has("today")) { cSeries.push({ pts: U(3), color: "#3de0a5", step: true, dash: "5 3" }); cStrips.push({ label: "ours", segs: segs(x => (x.u[uid] || [])[2]) }); }
-    if (show.has("model")) { cSeries.push({ pts: U(5), color: "#b48cff", step: true, width: 2 }); cStrips.push({ label: "model", segs: segs(x => (x.u[uid] || [])[4]) }); }
+    if (show.has("today")) { cSeries.push({ pts: U(3), color: "#3de0a5", step: true, dash: "6 4", label: "Room Climate's command" }); cStrips.push({ label: "ours", segs: segs(x => (x.u[uid] || [])[2]) }); }
+    if (show.has("model")) { cSeries.push({ pts: U(5), color: "#b48cff", step: true, label: "model would set" }); cStrips.push({ label: "model", segs: segs(x => (x.u[uid] || [])[4]) }); }
     const cmdChart = this._tsChart({ t0, t1: now, now, fmt: v => v.toFixed(0) + "°", strips: cStrips, series: cSeries });
     // 4. comfort score
     const C = h.comfort || [];
-    const comfortChart = this._tsChart({ t0, t1: now, now, zero: true, H: 150, fmt: v => v.toFixed(1), series: [
-      { pts: C.filter(c => c[1] != null).map(c => [ms(c[0]), c[1]]), color: "#e6edf7", width: 2 },
-      ...(show.has("mcomfort") ? [{ pts: C.filter(c => c[2] != null).map(c => [ms(c[0]), c[2]]), color: "#b48cff", width: 2 }] : [])] });
+    const kSeries = [{ pts: C.filter(c => c[1] != null).map(c => [ms(c[0]), c[1]]), tier: "main", label: "actual, over the following 2 h" },
+      ...(show.has("mcomfort") ? [{ pts: C.filter(c => c[2] != null).map(c => [ms(c[0]), c[2]]), color: "#b48cff", label: "model's prediction for its own plan" }] : [])];
+    const comfortChart = this._tsChart({ t0, t1: now, now, zero: true, H: 150, fmt: v => v.toFixed(1), series: kSeries });
     return `<div class="rc-sect"><h4>History</h4>${ranges}
       <h4 style="margin-top:10px">Temperature · ${name(rid)}</h4>${roomTabs}${tempChart}
-      ${lg([["#e6edf7", "actual"], ["#3de0a5", "comfort band", "▒"],
-            show.has("plan") && ["#3de0a5", "next 2 h if the model were in charge", "- -"],
-            show.has("stay") && ["#9aa7b8", "next 2 h if settings stay", "··"],
-            show.has("pred") && ["#3fa9ff", `what the model said ${hzTxt} before`, "●"],
-            show.has("bt") && ["#ffb454", `latest model over the logged past, ${hzTxt} ahead`]])}
+      ${lg([tSeries[0], { swatch: "band", label: "comfort band" }, ...tSeries.slice(1)])}
       <p class="rc-sub" style="margin:6px 0 2px">Also show:</p>
       ${chips([["plan", "Model's plan"], ["stay", "If settings stay"], ["pred", "Live predictions"], ["bt", "Backtest"]])}
       ${needHz ? hzSeg : ""}
       <h4 style="margin-top:14px">How far off the model was · ${name(rid)}, ${hzTxt} ahead</h4>${accChart}
-      ${lg([["#3fa9ff", "model's typical miss"], ["#667085", "assuming nothing changes", "- -"]])}
-      <p class="rc-sub" style="margin:2px 0 0">Per hour. Blue under grey = the model is beating the simple guess.</p>
+      ${lg([aSeries[1], aSeries[0]])}
+      <p class="rc-sub" style="margin:2px 0 0">Per hour. Blue under the grey dashes = the model is beating the simple guess.</p>
       ${needHz ? "" : hzSeg}
       <h4 style="margin-top:14px">Unit setpoint and mode</h4>${unitTabs}${cmdChart}
-      ${lg([["#e6edf7", "setpoint the unit was at"], ["#ff7a45", "heat", "■"], ["#3fa9ff", "cool", "■"], ["#667085", "off / idle", "■"],
-            show.has("today") && ["#3de0a5", "Room Climate's command", "- -"], show.has("model") && ["#b48cff", "model would set"]])}
+      ${lg([cSeries[0], ...cSeries.slice(1), { swatch: "block", color: "#ff7a45", label: "heat" }, { swatch: "block", color: "#3fa9ff", label: "cool" }, { swatch: "block", color: "#667085", label: "off / idle" }])}
       ${chips([["today", "Room Climate's command"], ["model", "Model would set"]])}
       <h4 style="margin-top:14px">Comfort score (lower is better)</h4>${comfortChart}
-      ${lg([["#e6edf7", "actual, over the following 2 h"], show.has("mcomfort") && ["#b48cff", "model's prediction for its own plan"]])}
+      ${lg(kSeries)}
       ${chips([["mcomfort", "Model's predicted score"]])}
       <p class="rc-sub" style="margin:2px 0 0">Priority-weighted misses outside the comfort band, per hour. The line stops 2 h before now, since those hours aren't over yet.</p></div>`;
   }
