@@ -653,7 +653,7 @@ class Manager:
                 self.drives.pop(u.id, None)
             elif u.id in defrosting and self.last.get(u.id) is not None and self.last[u.id].mode == c.mode:
                 cmd, changed = self.last[u.id], False  # defrosting: hold what it had; the dip isn't a need
-                cmd.reason = "defrosting; holding
+                cmd.reason = "defrosting; holding"
             elif settings.drive and c.mode in ("heat", "cool") and c.target is not None:
                 # Outer loop: the setpoint follows the room, pushing gently and stopping before an overshoot.
                 h = self.zone_hist.setdefault(u.id, deque())
