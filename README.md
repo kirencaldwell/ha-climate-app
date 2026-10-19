@@ -16,6 +16,13 @@ deadband (±1°F), stops at target, and respects minimum run/off times and a hea
 `target + (unit sensor − room sensor) ± 1`, so the unit's own thermostat chases the *room* temperature. Stale/missing
 sensors are ignored; with none, the unit is left alone.
 
+**Heat vs cool for the house** (`core.choose_mode`, `switch_mode: accumulate`): each room's comfort cost is read from
+its reading smoothed over 5 minutes (no trend projection), and the house switches once the cost of staying in its
+mode, added up over time and fading over an hour, passes `switch_acc` (1.5, priority × °F² × h). Short spikes, like a
+small room coasting after its unit stops, barely add up; a large sustained need switches within minutes. Units that
+report DEFROST sit out the vote (and hold their setpoint) for the defrost and 10 minutes after. `switch_mode:
+thresholds` restores the older rules (ratio, margin, 10-min confirmation, 20-min minimum, trend projection).
+
 **Outer loop** (`core.drive`, on by default; `drive: false` restores fixed setpoints). Sending the target as the
 setpoint makes an inverter run hard until the room is a degree past it, and the coil keeps heating after it stops: in a
 small room that overshoots by several degrees and can flip the whole house between heat and cool. Instead each unit's

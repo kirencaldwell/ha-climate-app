@@ -86,6 +86,18 @@ class Settings:
     switch_confirm_s: int = 600  # the other mode must stay clearly better this long before switching
     switch_ratio: float = 1.5
     switch_margin: float = 0.5
+    # How the house picks heat vs cool. "accumulate": switch once the cost of staying, added up over time (and fading
+    # with switch_leak_min), passes switch_acc; leave "off" once the need adds up to start_acc. One threshold instead of
+    # ratio/margin/confirm/minimum-time, and a short spike barely adds up (with readings smoothed over 10 min: Bedroom
+    # 3's coasts 0.3-0.4, the midday sun on it 6-7, a cold first floor at 6am 23). "thresholds": the older rules (start_cost, ratio, margin,
+    # switch_confirm_s, min_mode_s). Either way the vote reads each room smoothed over vote_smooth_min, not a trend.
+    switch_mode: str = "accumulate"
+    switch_acc: float = 1.5  # tuned on the Oct 16-18 logs (44 real switches -> 7 replayed) and the sim
+    start_acc: float = 0.5
+    switch_leak_min: float = 60.0
+    switch_min_s: int = 600  # compressor protection: at least this long in a mode before reversing
+    vote_smooth_min: float = 5.0
+    vote_exclude_coast: bool = False  # the older patch: rooms coasting after their unit stops sit out the vote
     min_cost: float = 0.05  # demand below this counts as comfortable
     start_cost: float = 1.0  # demand needed to leave "off" (then confirmed for switch_confirm_s like any mode switch)
     max_offset: float = 6.0  # clamp on sensor-vs-unit-sensor compensation
@@ -190,6 +202,8 @@ class HouseState:
     since: Optional[datetime] = None
     pending: Optional[str] = None  # a mode switch that is being confirmed
     pending_since: Optional[datetime] = None
+    acc: float = 0.0  # accumulated cost of staying in this mode when the other would be better (priority x F^2 x h)
+    acc_at: Optional[datetime] = None
 
 
 def elapsed(later: datetime, earlier: datetime) -> float:
@@ -319,6 +333,49 @@ def room_costs(room: Room, current: float, predicted: Optional[float], now: date
 
 def choose_mode(cold: float, hot: float, house: HouseState, now: datetime,
                 settings: Settings = Settings()) -> tuple[HouseState, str]:
+    if settings.switch_mode == "accumulate":
+        return _choose_mode_acc(cold, hot, house, now, settings)
+    return _choose_mode_thresholds(cold, hot, house, now, settings)
+
+
+def _choose_mode_acc(cold: float, hot: float, house: HouseState, now: datetime,
+                     settings: Settings) -> tuple[HouseState, str]:
+    """Switch when the cost of staying, accumulated over time, passes switch_acc (cost rates are priority x F^2 per
+    hour, as room_costs gives them). The total fades with switch_leak_min, so short spikes and alternating needs don't
+    add up, while a large sustained need gets there quickly."""
+    can = {"heat": settings.allow_heat, "cool": settings.allow_cool}
+    dt_h = 0.0 if house.acc_at is None else max(0.0, min(0.25, elapsed(now, house.acc_at) / 3600))
+    fade = math.exp(-dt_h * 60 / max(1e-6, settings.switch_leak_min))
+    if house.mode not in ("heat", "cool"):
+        want = "heat" if cold >= hot else "cool"
+        demand = max(cold, hot) if can[want] else 0.0
+        acc = (house.acc * fade if house.pending == want else 0.0) + demand * dt_h
+        if demand < settings.min_cost and acc < settings.min_cost * 0.1:
+            return HouseState("off", acc_at=now), "house comfortable"
+        if acc >= settings.start_acc:
+            return HouseState(want, now, acc_at=now), f"{want}: need added up to {acc:.2f}"
+        return HouseState("off", None, want, house.pending_since or now, acc, now), \
+            f"{want} wanted ({'cold' if want == 'heat' else 'hot'} {demand:.2f}/h, {acc:.2f} of {settings.start_acc:g})"
+    mine, theirs = (cold, hot) if house.mode == "heat" else (hot, cold)
+    other = "cool" if house.mode == "heat" else "heat"
+    adv = (theirs - mine) if can[other] else 0.0
+    acc = max(0.0, house.acc * fade + adv * dt_h)
+    held = elapsed(now, house.since) if house.since else 1e9
+    if acc >= settings.switch_acc and held >= settings.switch_min_s:
+        return HouseState(other, now, acc_at=now), f"switching: staying in {house.mode} added up to {acc:.1f}"
+    stay = HouseState(house.mode, house.since, other if acc > 0 else None, house.pending_since if acc > 0 else None,
+                      acc, now)
+    if acc >= settings.switch_acc:
+        return stay, f"{other} wanted ({acc:.1f}); holding {house.mode} min time"
+    if acc > 0.05:
+        return stay, f"{house.mode} ({other} building {acc:.1f} of {settings.switch_acc:g}; cold {cold:.2f}, hot {hot:.2f})"
+    if max(cold, hot) < settings.min_cost:
+        return stay, f"{house.mode} mode, idle: nothing needed"
+    return stay, f"{house.mode} (cold {cold:.2f}, hot {hot:.2f})"
+
+
+def _choose_mode_thresholds(cold: float, hot: float, house: HouseState, now: datetime,
+                            settings: Settings) -> tuple[HouseState, str]:
     """Pick the house mode from total cold vs hot demand. Never goes back to off once running.
 
     Leaving "off" (first start, or after a restart) takes demand of `start_cost`, held for `switch_confirm_s`, so a
@@ -565,6 +622,10 @@ def choose_fan(st: DriveState, push: float, now: datetime, settings: Settings = 
     """The fan mode to have now, holding a change for fan_min_interval_s (except to auto, which goes at once).
     Updates st.fan/st.fan_at. None: leave the fan alone."""
     want = fan_for(push, st.miss, st.on, settings, max_push)
+    if want is None and not st.on and st.mode == "heat":
+        # Idle in heat its coil still gets some hot refrigerant while the compressor runs for the other units: a slow
+        # fan blows less of it (and less draft) into a room that's already warm enough.
+        want = "quiet"
     if want is None or want == st.fan:
         return st.fan if want is not None else None
     if st.fan is not None and want != "auto" and st.fan_at is not None \
@@ -622,7 +683,8 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
                  predicted: dict[str, Optional[float]], unit_temps: dict[str, Optional[float]],
                  states: dict[str, UnitState], house: HouseState, now: datetime,
                  settings: Settings = Settings(), manual: Optional[dict[str, str]] = None,
-                 busy: Optional[set[str]] = None, outdoor: Optional[float] = None, coasting: Optional[set] = None):
+                 busy: Optional[set[str]] = None, outdoor: Optional[float] = None, coasting: Optional[set] = None,
+                 vote: Optional[dict] = None, defrosting: Optional[set] = None):
     """One control tick for the whole house -> (commands by unit id, new HouseState, info dict).
 
     All units always share one mode. `manual` holds the current mode of each unit under thermostat control (not
@@ -658,15 +720,20 @@ def control_step(units: list[Unit], rooms: list[Room], readings: dict[str, tuple
         # its setpoint, so the trend says nothing about the opposite need (it would flip cool->heat as cooling
         # works). Use the reading alone.
         driven = states.get(r.unit, UnitState()).active or r.unit in (busy or ())
-        c, h = room_costs(r, got[0], None if driven else predicted.get(r.id), now, settings, outdoor)
+        if vote is not None:  # each room smoothed, no trend: a short transient stays small
+            c, h = room_costs(r, vote.get(r.id, got[0]), None, now, settings, outdoor)
+        else:
+            c, h = room_costs(r, got[0], None if driven else predicted.get(r.id), now, settings, outdoor)
         per_room[r.id] = (round(c, 2), round(h, 2))
         if r.sensor is not None and r.sensor == unit_entity.get(r.unit):
             # The room reads its own unit's sensor, which sits in that unit's airflow and swings with it (Bedroom 3:
             # 55-78 F in an hour as its unit went heat -> cool). It would drive the house into a heat/cool limit cycle,
             # so it follows the house mode and just holds its target until it has a sensor of its own.
             continue
-        if r.unit in (coasting or ()):
+        if settings.vote_exclude_coast and r.unit in (coasting or ()):
             continue  # its unit just stopped: the room is coasting on that unit's heat (or cold), not asking for more
+        if r.unit in (defrosting or ()):
+            continue  # its unit is defrosting (heat briefly off, coil cold): the dip will pass
         zone = zones.setdefault(r.unit, [0.0, 0.0])
         zone[0] += c
         zone[1] += h

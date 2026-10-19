@@ -9,6 +9,10 @@ from house import SimHouse
 MON = datetime(2026, 10, 5, 12, 0)  # a Monday
 # Symmetric comfort, no cool aim: for tests about other mechanics. The cool-leaning defaults have their own tests.
 NEUTRAL = Settings(band_below=1.0, band_above=1.5, warm_weight=1.0, aim_offset=0.0)
+# The older heat/cool rules (ratio, margin, confirmation, minimum time; trend projection in the vote): what the tests
+# written for them check. The accumulated-cost rule has its own tests.
+OLD = dict(switch_mode="thresholds")
+NEUTRAL = dataclasses.replace(NEUTRAL, **OLD)
 
 
 def sched_room(**kw):
@@ -328,7 +332,7 @@ def _night(bed, bed_pred, at, house, down=66.5):
     rooms = [bed_room, Room("down", "Main", "ah", priority=2, default_temp=67)]
     units = [Unit("ah", "c1"), Unit("ms", "c2")]
     return core.control_step(units, rooms, {"bed": (bed, at), "down": (down, at)}, {"bed": bed_pred, "down": None},
-                             {}, {}, house, at)
+                             {}, {}, house, at, Settings(**OLD))
 
 
 def test_evening_setback_switches_heat_to_cool_after_confirming():
@@ -447,7 +451,7 @@ def test_setpoint_interval_is_15_real_minutes_across_fall_back():
 
 
 def test_mode_switch_still_confirms_across_spring_forward():
-    s = Settings()
+    s = Settings(**OLD)
     house = core.HouseState("heat", _local(_SPRING, -120), "cool", _local(_SPRING, 58))  # pending since 01:58 PST
     at = _local(_SPRING, 61)  # 03:01 PDT, 3 real minutes later (wall clock says 63)
     new, why = core.choose_mode(0.0, 50.0, house, at, s)
@@ -539,7 +543,7 @@ def test_a_hair_under_the_floor_does_not_start_the_house():
 
 
 def test_leaving_off_needs_real_demand_held_for_the_confirmation_time():
-    s = Settings()
+    s = Settings(**OLD)
     h = core.HouseState()
     h, why = core.choose_mode(0.5, 0.0, h, MON, s)  # below start_cost
     assert h.mode == "off" and h.pending is None
@@ -552,7 +556,7 @@ def test_leaving_off_needs_real_demand_held_for_the_confirmation_time():
 
 
 def test_demand_that_goes_away_or_flips_restarts_the_confirmation():
-    s = Settings()
+    s = Settings(**OLD)
     h, _ = core.choose_mode(5.0, 0.0, core.HouseState(), MON, s)
     h, _ = core.choose_mode(0.2, 0.0, h, MON + timedelta(minutes=6), s)  # gone
     assert h.mode == "off" and h.pending is None
@@ -744,7 +748,10 @@ def test_fan_follows_the_push_and_holds_changes():
     other, _, _ = _drv(66.5, 67.0, kp=0.3)  # a unit not listed in fan_units keeps its fan
     assert other.fan is None
     stopped, _, _ = _drv(66.9, 67.0, rate=12.0, st=st, t=MON + timedelta(minutes=1), s=s)
-    assert not stopped.active and stopped.fan is None  # stopping leaves the fan as it was
+    assert not stopped.active and stopped.fan == "quiet"  # stopped in heat: a slow fan (the coil still gets heat)
+    _, cst, _ = _drv(70.0, 67.0, "cool", kp=0.3, s=s)
+    cstop, _, _ = _drv(66.0, 67.0, "cool", rate=-12.0, st=cst, t=MON + timedelta(minutes=1), s=s)
+    assert not cstop.active and cstop.fan is None  # stopped in cool: left as it was
 
 
 def test_push_limit_per_unit_set_or_learned():
@@ -760,7 +767,7 @@ def test_push_limit_per_unit_set_or_learned():
 
 
 def test_a_coasting_room_neither_flips_the_house_nor_restarts_its_unit():
-    s = Settings()
+    s = Settings(vote_exclude_coast=True, **OLD)
     u1, u2 = Unit("ah", "climate.ah"), Unit("b3", "climate.b3")
     rooms = [Room("k", "K", "ah", sensor="s.k", priority=2, default_temp=65),
              Room("b", "B", "b3", sensor="s.b", priority=4, default_temp=67)]
@@ -789,3 +796,29 @@ def test_coast_is_as_long_as_the_run_and_ends_when_the_room_moves_too_far():
     assert core.still_coasting(c, stop + timedelta(minutes=5), 68.8, s)
     assert not core.still_coasting(c, stop + timedelta(minutes=5), 69.5, s)  # 1.7 F up: the sun, not the coast
     assert not core.still_coasting(c, stop + timedelta(minutes=25), 68.0, s)
+
+
+def test_accumulated_switching_ignores_spikes_and_acts_on_sustained_needs():
+    s = Settings()
+    h = core.HouseState("heat", MON - timedelta(hours=2))
+    t = MON
+    for _ in range(10):  # a 10-min spike: Bedroom 3 coasting 2 F over at priority 4 (2*4*1^2 = 8/h)
+        h, why = core.choose_mode(0.0, 8.0, h, t, s); t += timedelta(minutes=1)
+    assert h.mode == "heat" and 0 < h.acc < s.switch_acc
+    peak = h.acc
+    for _ in range(30):  # gone again: it fades (half an hour of a 60-min fade)
+        h, why = core.choose_mode(0.0, 0.0, h, t, s); t += timedelta(minutes=1)
+    assert h.acc < 0.65 * peak
+    for _ in range(10):  # the midday sun: 3 F over at priority 5 (2*5*2^2 = 40/h), sustained
+        h, why = core.choose_mode(0.5, 40.0, h, t, s); t += timedelta(minutes=1)
+    assert h.mode == "cool", why  # 40/h passes 2 in about 3 minutes
+    h2 = core.HouseState("off")
+    for _ in range(3):
+        h2, _ = core.choose_mode(6.0, 0.0, h2, t, s); t += timedelta(minutes=1)
+    assert h2.mode == "off" and h2.pending == "heat"
+    for _ in range(4):
+        h2, _ = core.choose_mode(6.0, 0.0, h2, t, s); t += timedelta(minutes=1)
+    assert h2.mode == "heat"  # 6/h adds up to 0.5 in 5 min
+    old = Settings(switch_mode="thresholds")
+    h3, why = core.choose_mode(0.0, 40.0, core.HouseState("heat", MON - timedelta(hours=2)), MON, old)
+    assert "confirming" in why  # the older rules are still there

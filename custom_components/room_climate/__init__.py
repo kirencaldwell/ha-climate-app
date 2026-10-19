@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import logging
 import os
 import pathlib
@@ -87,6 +88,8 @@ class Manager:
         self._fan_set: set = set()  # units whose fan we've changed (put back to auto when handed to the thermostat)
         self._house_restored = False  # the house mode is taken from the units on the first tick (_restore_house)
         self.exp_block = None  # the experiment block in force (experiment.py), if one is running
+        self.vote: dict = {}  # room id -> its reading smoothed for the heat/cool vote
+        self._defrost_at: dict = {}  # unit id -> last time it reported DEFROST
         self._run_start: dict = {}  # unit id -> when its current run started
         self._coast: dict = {}  # unit id -> {"until", "room"}: its rooms coasting on the run that just ended
         self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
@@ -586,6 +589,21 @@ class Manager:
                         self.hist[r.id] = self.hist[r.id][-1:]
                         predicted[r.id] = None
         self.prev_busy = busy
+        # The heat/cool vote reads each room smoothed (core.Settings.vote_smooth_min): fresh readings only.
+        k = 1.0 - math.exp(-1.0 / max(0.1, settings.vote_smooth_min))  # per one-minute tick
+        for rid, (val, _ts) in readings.items():
+            prev = self.vote.get(rid)
+            self.vote[rid] = val if prev is None else prev + (val - prev) * k
+        # Units defrosting (sub-mode DEFROST: heat briefly off, coil cold), and for 10 min after: their rooms dip and
+        # recover on their own, so they sit out the vote and the outer loop holds its setpoint.
+        defrosting = set()
+        for u in units:
+            sub = next((self.hass.states.get(e) for e in self._unit_sensors(u.entity) if e.endswith("_sub_mode")), None)
+            if sub is not None and str(sub.state).upper() == "DEFROST":
+                self._defrost_at[u.id] = now
+            last = self._defrost_at.get(u.id)
+            if last is not None and core.elapsed(now, last) < 600:
+                defrosting.add(u.id)
         coasting = set()  # units that stopped recently: their rooms are still moving on the unit's own output
         for u in units:
             mine = [r for r in rooms if r.unit == u.id]
@@ -607,7 +625,8 @@ class Manager:
         house = self.house
         cmds, new_house, info = core.control_step(
             units, rooms, readings, predicted, {u.id: self._unit_temp(u.entity) for u in units},
-            states, house, now, settings, manual, busy, self._outdoor(settings), coasting)
+            states, house, now, settings, manual, busy, self._outdoor(settings), coasting, dict(self.vote),
+            defrosting)
         if new_house.mode != house.mode:
             _LOGGER.info("house mode %s -> %s (%s)", house.mode, new_house.mode, info["reason"])
         self.house = new_house
@@ -632,6 +651,9 @@ class Manager:
             if exp_cmds and u.id in exp_cmds:
                 cmd, changed = exp_cmds[u.id], True  # an experiment block; the outer loop starts afresh after it
                 self.drives.pop(u.id, None)
+            elif u.id in defrosting and self.last.get(u.id) is not None and self.last[u.id].mode == c.mode:
+                cmd, changed = self.last[u.id], False  # defrosting: hold what it had; the dip isn't a need
+                cmd.reason = "defrosting; holding
             elif settings.drive and c.mode in ("heat", "cool") and c.target is not None:
                 # Outer loop: the setpoint follows the room, pushing gently and stopping before an overshoot.
                 h = self.zone_hist.setdefault(u.id, deque())

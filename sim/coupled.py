@@ -186,7 +186,7 @@ class HeuristicController:
     def __init__(self, rooms, units, settings=core.Settings()):
         self.rooms, self.units, self.s = rooms, units, settings
         self.house, self.states, self.hist, self.sent, self.prev_busy, self.last_good = core.HouseState(), {}, {}, {}, set(), {}
-        self.drives, self.zone_hist, self.run_start, self.coast = {}, {}, {}, {}
+        self.drives, self.zone_hist, self.run_start, self.coast, self.vote = {}, {}, {}, {}, {}
         self.kp = {}  # unit id -> outer-loop gain (from a model's learned effects; default gain when empty)
         self.lead = {}  # unit id -> look-ahead minutes (a model's learned lag; default lead when empty)
 
@@ -221,9 +221,12 @@ class HeuristicController:
                 self.coast[u.id] = {"until": core.coast_until(now, run_s, self.lead.get(u.id) or 0.0, self.s), "room": room_now}
             if core.still_coasting(self.coast.get(u.id), now, room_now, self.s):
                 coasting.add(u.id)
+        k = 1.0 - math.exp(-1.0 / max(0.1, self.s.vote_smooth_min))  # as Manager.async_tick
+        for rid, (val, _t) in readings.items():
+            self.vote[rid] = val if rid not in self.vote else self.vote[rid] + (val - self.vote[rid]) * k
         cmds, self.house, info = core.control_step(self.units, self.rooms, readings, predicted,
                                                    {u.id: sim.unit_temp(u.id) for u in self.units}, self.states, self.house,
-                                                   now, self.s, {}, busy, sim.weather.outdoor(now), coasting)
+                                                   now, self.s, {}, busy, sim.weather.outdoor(now), coasting, dict(self.vote))
         for u in self.units:
             if self.s.drive:  # same outer loop as Manager.async_tick
                 c = cmds[u.id]
