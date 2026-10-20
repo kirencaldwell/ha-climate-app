@@ -37,6 +37,10 @@ class RoomModel:
     cool: dict = field(default_factory=dict)  # unit id -> F/h of cooling at full cooling output (positive)
     coupling: dict = field(default_factory=dict)  # other room id -> 1/h toward its temperature
     leak: dict = field(default_factory=dict)  # unit id -> F/h at full compressor drive while that unit idles in its mode
+    # Second state: the room's slower mass (walls, floor, furniture) M, which the air trades heat with:
+    # dT/dt += mass_k * (M - T), dM/dt = (T - M) / mass_tau_h. 0: no mass state. Fitted (fit.refine_paths).
+    mass_k: float = 0.0  # 1/h
+    mass_tau_h: float = 0.0
 
 
 @dataclass
@@ -225,8 +229,19 @@ def leak_inputs(modes, running: dict, outputs: dict, units, compressor=None) -> 
     return out
 
 
-def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict, leaks: dict = None) -> dict:
-    """dT/dt (F/h) for every modelled room with a temperature. `sun`: a sun vector (sun_vector) or overhead 0..1."""
+def mass_step(r: RoomModel, M, t, dt_h: float):
+    """A room's mass temperature after dt_h with the air at t (M None: starts at the air)."""
+    if r.mass_tau_h <= 0 or t is None:
+        return M
+    if M is None:
+        return t
+    return M + (t - M) * (1.0 - math.exp(-dt_h / r.mass_tau_h))
+
+
+def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict, leaks: dict = None,
+               masses: dict = None) -> dict:
+    """dT/dt (F/h) for every modelled room with a temperature. `sun`: a sun vector (sun_vector) or overhead 0..1.
+    `masses`: room id -> its mass temperature (rooms with a mass state; missing: taken at the air's)."""
     out = {}
     sv = as_sun(sun)
     for rid, r in m.rooms.items():
@@ -249,6 +264,10 @@ def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict, l
                 d += r.cool.get(uid, 0.0) * y  # y is negative: cooling
         for uid, c in r.leak.items():
             d += c * (leaks or {}).get(uid, 0.0)
+        if r.mass_k:
+            mv = (masses or {}).get(rid)
+            if mv is not None:
+                d += r.mass_k * (mv - t)
         out[rid] = d
     return out
 
@@ -265,12 +284,13 @@ def fan_factor(u: UnitModel, fan) -> float:
 
 
 def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict, running: dict, dt_h: float,
-         lagged: dict = None, hold: bool = False, fans: dict = None):
+         lagged: dict = None, hold: bool = False, fans: dict = None, masses: dict = None):
     """Advance one step: (new temps, new running flags, outputs used). Units decide output from their reading at the
     start of the step (as a real inverter does, with a little lag). `mode` is one mode for every unit, or a dict of
     unit id -> mode (what the units are really set to, which may differ). `lagged` (unit id -> effective output) carries
     the units' lag from step to step and is updated in place; without it a unit's effect follows its output at once.
-    `hold`: `running` is what the units really did, not simulated (see unit_output). `fans`: unit id -> fan mode."""
+    `hold`: `running` is what the units really did, not simulated (see unit_output). `fans`: unit id -> fan mode.
+    `masses` (room id -> mass temperature) carries rooms' mass states and is updated in place, like `lagged`."""
     outputs, run2 = {}, {}
     for uid, u in m.units.items():
         md = mode.get(uid, "off") if isinstance(mode, dict) else mode
@@ -283,19 +303,29 @@ def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict,
             lagged[uid] = z
         outputs[uid] = y
     modes = {uid: (mode.get(uid, "off") if isinstance(mode, dict) else mode) for uid in m.units}
-    d = derivative(m, temps, outdoor, sun, outputs, leak_inputs(modes, run2, outputs, m.units))
+    if masses is not None:
+        for rid, r in m.rooms.items():
+            if r.mass_k and masses.get(rid) is None and temps.get(rid) is not None:
+                masses[rid] = temps[rid]
+    d = derivative(m, temps, outdoor, sun, outputs, leak_inputs(modes, run2, outputs, m.units), masses)
     new = dict(temps)
     for rid, v in d.items():
         new[rid] = temps[rid] + v * dt_h
+    if masses is not None:
+        for rid, r in m.rooms.items():
+            if r.mass_k and rid in masses:
+                masses[rid] = mass_step(r, masses[rid], temps.get(rid), dt_h)
     return new, run2, outputs
 
 
 def rollout(m: HouseModel, temps: dict, mode, setpoints: dict, running: dict, outdoor_seq, sun_seq,
-            dt_h: float, substeps: int = 1, lagged: dict = None, control=None, fans: dict = None):
+            dt_h: float, substeps: int = 1, lagged: dict = None, control=None, fans: dict = None,
+            masses: dict = None):
     """Simulate len(outdoor_seq) steps of dt_h with setpoints held. Returns ([temps after each step], [outputs per step],
     final running flags). `lagged`: see step (updated in place). `control(temps, rates, dt_h)` -> setpoints, when given,
     sets them before every substep instead (an outer loop on the room temperatures; rates are F/h from the last
-    substep, None at first). `fans` (unit id -> fan mode) is read every substep, so `control` may change it."""
+    substep, None at first). `fans` (unit id -> fan mode) is read every substep, so `control` may change it.
+    `masses`: see step (updated in place)."""
     traj, outs = [], []
     run = dict(running)
     h = dt_h / substeps
@@ -305,7 +335,8 @@ def rollout(m: HouseModel, temps: dict, mode, setpoints: dict, running: dict, ou
         for _ in range(substeps):
             sps = control(temps, rates, h) if control is not None else setpoints
             before = temps
-            temps, run, y = step(m, temps, outdoor_seq[k], sun_seq[k], mode, sps, run, h, lagged, fans=fans)
+            temps, run, y = step(m, temps, outdoor_seq[k], sun_seq[k], mode, sps, run, h, lagged, fans=fans,
+                                 masses=masses)
             rates = {r: (temps[r] - before[r]) / h for r in temps if before.get(r) is not None}
             for uid, v in y.items():
                 acc[uid] = acc.get(uid, 0.0) + v / substeps

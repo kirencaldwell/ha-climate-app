@@ -162,3 +162,26 @@ def test_rule_effect_keeps_the_default_scale():
     assert abs(hm.rule_effect(4.0, u) - 4.0) < 1e-9
     weak = hm.UnitModel(k0=0.2, k1=0.0, ymin=0.15)  # runs at 0.2: an effect of 20 per unit output is 5 F/h
     assert abs(hm.rule_effect(20.0, weak) - 20.0 * 0.2 / 0.8) < 1e-9
+
+
+def test_mass_state_fitted_by_paths():
+    # A room whose air swings fast around a slower mass: heater on 20 min of every 90, cool outside.
+    n, tau, km, loss, heat = 3000, 4.0, 3.0, 0.2, 12.0
+    t, M = 66.0, 66.0
+    T, out, sun, Yh = [], [], [], []
+    for k in range(n):
+        y = 1.0 if (k % 90) < 20 else 0.0
+        T.append(round(t / 0.18) * 0.18)
+        out.append(45.0)
+        sun.append({})
+        Yh.append(y)
+        d = loss * (45 - t) + km * (M - t) + heat * y
+        M += (t - M) * (1 - pow(2.718281828459045, -1 / (tau * 60)))
+        t += d / 60
+    rm = hm.RoomModel(loss=0.3, heat={"u": 5.0}, cool={"u": 0.0})
+    Ts, Ye, Lk = {"r": T}, {"u": Yh}, {"u": [0.0] * n}
+    one, rep1 = fit.refine_paths("r", rm, Ts, out, sun, Ye, Lk, 2400)
+    two, rep2 = fit.refine_mass("r", one, rep1["sse"], Ts, out, sun, Ye, Lk, 2400)
+    assert rep2 is not None and two.mass_k > 0.5
+    assert rep2["path_rmse_F"] < 0.6 * rep1["path_rmse_F"]
+    assert abs(hm.mass_step(two, 60.0, 70.0, two.mass_tau_h) - (60 + 10 * (1 - pow(2.718281828459045, -1)))) < 1e-6

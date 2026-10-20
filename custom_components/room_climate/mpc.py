@@ -79,6 +79,7 @@ class ShadowPlanner:
         self.points: deque = deque()  # (t_eval, room, horizon_min, predicted F): for charts
         self.readings: dict = {}  # room -> deque[(t, F)]
         self.lagged: dict = {}  # unit id -> effective output now (model.step), followed from what the units really do
+        self.masses: dict = {}  # room id -> its mass temperature now (rooms with a mass state), followed from readings
         self.targets: dict = {}  # unit id -> target last planned (with the outer loop)
 
     def set_model(self, m: hm.HouseModel):
@@ -100,6 +101,7 @@ class ShadowPlanner:
         if self.model is None or actual is None:
             return
         try:
+            self._follow_mass(now, temps)
             self._follow_lag(now, temps, actual)
             self._advance(now, temps, actual, outdoor, sun)
             if self.next_track is None or now >= self.next_track:
@@ -108,13 +110,28 @@ class ShadowPlanner:
                 if start:
                     self.records.append({"t0": now, "t": now, "start": start, "temps": dict(start), "done": set(),
                                          "running": {u: bool(a.get("running")) for u, a in actual.items()},
-                                         "lagged": dict(self.lagged)})
+                                         "lagged": dict(self.lagged), "masses": dict(self.masses)})
         except Exception as e:  # never let the model take the integration down; show it instead
             self.error = f"{type(e).__name__}: {e}"
         while self.records and now - self.records[0]["t0"] > timedelta(minutes=max(HORIZONS_MIN) + 10):
             self.records.popleft()
         while self.errors and now - self.errors[0][0] > self.keep:
             self.errors.popleft()
+
+    def _follow_mass(self, now, temps):
+        """Each room's mass temperature now, driven by its readings (model.mass_step): the model's second state, which
+        can't be measured, follows from the room's history. Starts at the reading; after a restart it takes a few of
+        its time constants to settle (until then a room's mass sits nearer its air than it really is)."""
+        last = getattr(self, "_mass_at", None)
+        dt_h = 0.0 if last is None else max(0.0, min(0.5, (now - last).total_seconds() / 3600))
+        self._mass_at = now
+        for rid, r in self.model.rooms.items():
+            if not r.mass_k:
+                self.masses.pop(rid, None)
+                continue
+            t = temps.get(rid)
+            if t is not None:
+                self.masses[rid] = hm.mass_step(r, self.masses.get(rid), t, dt_h)
 
     def _follow_lag(self, now, temps, actual):
         """Each unit's effective output now: its estimated output (running or not, and how hard from its setpoint gap)
@@ -150,7 +167,7 @@ class ShadowPlanner:
             for _ in range(n if dt > 0 else 0):
                 rec["temps"], rec["running"], _ = hm.step(self.model, rec["temps"], outdoor, sun, modes, sps,
                                                           ran, dt / n, rec.setdefault("lagged", {}), hold=True,
-                                                          fans=fans)
+                                                          fans=fans, masses=rec.setdefault("masses", {}))
             rec["t"] = now
             age = (now - rec["t0"]).total_seconds() / 60
             for h in HORIZONS_MIN:
@@ -194,7 +211,7 @@ class ShadowPlanner:
         traj, _, _ = hm.rollout(self.model, dict(start), modes, {u: a.get("setpoint") for u, a in actual.items()},
                                 {u: bool(a.get("running")) for u, a in actual.items()}, _seq(outdoor, times),
                                 [sun_at(t) for t in times], step_min / 60, substeps=2, lagged=dict(self.lagged),
-                                fans={u: a.get("fan") for u, a in actual.items()})
+                                fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses))
         self.projection = {"at": now.isoformat(), "temps": {
             r: [[t.isoformat(), round(step[r], 2)] for t, step in zip(times, traj)] for r in start}}
 
@@ -212,7 +229,7 @@ class ShadowPlanner:
         p = optimizer.plan(self.model, rooms, units, temps, now, self.house, now_sp, running, _seq(outdoor, times),
                            [sun_at(t) for t in times], settings, ps, ignore=set(ignore), fixed=fixed,
                            drives=drives if settings.drive else None, lagged=dict(self.lagged),
-                           fans={u: a.get("fan") for u, a in actual.items()})
+                           fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses))
         setpoints, first = p.setpoints, p.first
         forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)
         if forced and self.house.mode != forced:

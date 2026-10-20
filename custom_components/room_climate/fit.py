@@ -286,9 +286,26 @@ OE_HORIZON_MIN, OE_STEP_MIN, OE_EVERY_MIN, OE_ITERS = 120, 5, 30, 25
 OE_PRIOR = 0.01  # pull toward the slope fit, relative to each parameter's curvature there: keeps poorly seen ones put
 
 
+MASS_TAUS_H = (0.5, 1.0, 2.0, 4.0, 8.0)  # candidate mass time constants for refine_mass
+MASS_GAIN = 0.05  # a mass state is kept only if it cuts the training paths' squared miss by this share
+MASS_K_MAX = 20.0  # 1/h: the air settling on its mass within a few minutes is as fast as 5-minute steps can follow
+
+
+def mass_series(v: list, tau_h: float) -> list:
+    """A room's mass temperature each minute, driven by its readings (dM/dt = (T - M) / tau): what the model's mass
+    would be given the room's real history, so a path can start from it."""
+    a = 1.0 - pow(2.718281828459045, -1.0 / (tau_h * 60))
+    out, M = [], None
+    for t in v:
+        if t is not None:
+            M = t if M is None else M + (t - M) * a
+        out.append(M)
+    return out
+
+
 def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: dict, Lk: dict, end: int,
                  horizon: int = OE_HORIZON_MIN, step: int = OE_STEP_MIN, every: int = OE_EVERY_MIN,
-                 iters: int = OE_ITERS):
+                 iters: int = OE_ITERS, tau_h: float = 0.0):
     """Refine one room's parameters (from the slope fit) so that its simulated paths match its readings.
 
     From every `every` minutes of its training part (before `end`), the room is simulated `horizon` minutes ahead the
@@ -296,16 +313,23 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
     weather, the sun and the units at what was logged, and its own temperature simulated. The squared miss at every
     step along every path is minimised by projected Levenberg-Marquardt with forward sensitivities (the model is linear
     in its parameters but a path isn't: the room's own temperature feeds back through loss and coupling). Parameters
-    stay >= 0 except bias. -> (room model, report)."""
+    stay >= 0 except bias. With `tau_h`, the room gets a mass state of that time constant, starting each path from
+    mass_series, and its coupling to the air (mass_k) is fitted too. -> (room model, report)."""
     nbrs, us, own = list(rm.coupling), list(rm.heat), list(rm.leak)
     names = (["loss"] + [f"c:{j}" for j in nbrs] + ["solar"] + [f"sun:{k}" for k in hm.WALLS] + ["bias"]
              + [f"h:{u}" for u in us] + [f"k:{u}" for u in us] + [f"l:{u}" for u in own])
     th0 = ([rm.loss] + [rm.coupling[j] for j in nbrs] + [rm.solar] + [rm.sun_dir.get(k, 0.0) for k in hm.WALLS]
            + [rm.bias] + [rm.heat[u] for u in us] + [rm.cool[u] for u in us] + [rm.leak[u] for u in own])
+    if tau_h > 0:
+        names.append("mass")
+        th0.append(rm.mass_k if rm.mass_tau_h == tau_h else 0.0)
     p, nb_n, bias_i = len(names), len(nbrs), names.index("bias")
+    mi = p - 1 if tau_h > 0 else None
+    beta = (1.0 - pow(2.718281828459045, -step / (tau_h * 60))) if tau_h > 0 else 0.0
     h = step / 60.0
     Tr = T[rid]
-    segs = []  # [(start temp, [(outdoor, [neighbour temps], other features, target or None)])]
+    Ms = mass_series(Tr, tau_h) if tau_h > 0 else None
+    segs = []  # [(start temp, start mass, [(outdoor, [neighbour temps], other features, target or None)])]
     for a in range(0, max(0, end - horizon), every):
         if Tr[a] is None:
             continue
@@ -323,7 +347,7 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
                  + [sum(Lk[u][sl]) / step for u in own])
             steps.append((o, nb, g, Tr[k + step] if k + step < len(Tr) else None))
         if sum(st[3] is not None for st in steps) >= 3:
-            segs.append((Tr[a], steps))
+            segs.append((Tr[a], Ms[a] if Ms else None, steps))
     if not segs:
         return rm, {"paths": 0}
 
@@ -333,14 +357,23 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
         gr = [0.0] * p
         cost, cnt = 0.0, 0
         a_self = th[0] + sum(th[1:1 + nb_n])
-        for t0, steps in segs:
-            t = t0
+        km = th[mi] if mi is not None else 0.0
+        for t0, M0, steps in segs:
+            t, M = t0, M0
             S = [0.0] * p
+            R = [0.0] * p  # d(mass)/d(params)
             for o, nb, g, tgt in steps:
-                phi = [o - t] + [v - t for v in nb] + g
+                phi = [o - t] + [v - t for v in nb] + g + ([M - t] if mi is not None else [])
                 f = sum(th[j] * phi[j] for j in range(p))
                 if need_j:
-                    S = [S[j] + h * (phi[j] - a_self * S[j]) for j in range(p)]
+                    if mi is None:
+                        S2 = [S[j] + h * (phi[j] - a_self * S[j]) for j in range(p)]
+                    else:
+                        S2 = [S[j] + h * (phi[j] - (a_self + km) * S[j] + km * R[j]) for j in range(p)]
+                        R = [R[j] + beta * (S[j] - R[j]) for j in range(p)]
+                    S = S2
+                if mi is not None:
+                    M = M + beta * (t - M)
                 t = t + h * f
                 if abs(t) > 500:
                     return float("inf"), H, gr, cnt
@@ -382,6 +415,8 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
         cand = list(th)
         for i, d in zip(free, dx):
             cand[i] = th[i] + d if i == bias_i else max(0.0, th[i] + d)
+        if mi is not None:
+            cand[mi] = min(MASS_K_MAX, cand[mi])
         cn, Hn, gn, _ = evaluate(cand)
         tn = total(cn, cand)
         if tn < best:
@@ -398,13 +433,27 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
     new = hm.RoomModel(loss=round(q["loss"], 4), solar=round(q["solar"], 3), bias=round(q["bias"], 3),
                        sun_dir={k: round(q[f"sun:{k}"], 3) for k in hm.WALLS},
                        heat={u: round(q[f"h:{u}"], 3) for u in us}, cool={u: round(q[f"k:{u}"], 3) for u in us},
-                       coupling={j: round(q[f"c:{j}"], 4) for j in nbrs}, leak={u: round(q[f"l:{u}"], 3) for u in own})
+                       coupling={j: round(q[f"c:{j}"], 4) for j in nbrs}, leak={u: round(q[f"l:{u}"], 3) for u in own},
+                       mass_k=round(q.get("mass", 0.0), 4), mass_tau_h=tau_h if q.get("mass", 0.0) > 0 else 0.0)
     return new, {"paths": len(segs), "iters": it, "path_rmse_slope_fit_F": round((c0 / cnt) ** 0.5, 2),
-                 "path_rmse_F": round((c / cnt) ** 0.5, 2)}
+                 "path_rmse_F": round((c / cnt) ** 0.5, 2), "sse": c}
+
+
+def refine_mass(rid: str, rm: hm.RoomModel, base_sse: float, *args, **kw):
+    """Try a mass state for one room at each of MASS_TAUS_H, refined from the one-state paths fit `rm`; keep the best
+    only if it cuts the training paths' squared miss by MASS_GAIN. -> (room model, report or None)."""
+    best = None
+    for tau in MASS_TAUS_H:
+        cand, rep = refine_paths(rid, rm, *args, tau_h=tau, **kw)
+        if cand.mass_k > 0 and rep.get("sse") is not None and (best is None or rep["sse"] < best[1]["sse"]):
+            best = (cand, rep)
+    if best is None or best[1]["sse"] > (1 - MASS_GAIN) * base_sse:
+        return rm, None
+    return best[0], {"tau_h": best[0].mass_tau_h, "mass_k": best[0].mass_k, "path_rmse_F": best[1]["path_rmse_F"]}
 
 
 def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: float = 0.25, lam: float = 1e-3,
-        paths: bool = True):
+        paths: bool = True, mass: bool = True):
     """-> (HouseModel, report). layout: {"rooms": {id: {"units": [...], "neighbors": [...]}},
     "units": {id: {"sensor_rooms": [...] (optional: detected when missing), "zone": [...]}}}"""
     rooms, units = list(layout["rooms"]), list(layout["units"])
@@ -539,10 +588,18 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     # The slope fit explains each half hour on its own; refine each room so its 2 h simulated paths match too (what
     # the planner and the accuracy checks use). A fast room can otherwise explain its half hours with effects so large
     # that they run away over two hours.
+    one_state = {}
     if paths:
         Ye = {u: lagged(v, lags.get(u, 0)) for u, v in scaled(Y, F, scales).items()}
         for rid in list(fitted):
             fitted[rid], rep[rid]["paths"] = refine_paths(rid, fitted[rid], T, out, sun, Ye, Lk, splits[rid])
+            one_state[rid] = fitted[rid]
+            if mass and rep[rid]["paths"].get("sse") is not None:
+                # A second state (the room's mass) where it explains the paths clearly better: a small room whose air
+                # swings fast around slower walls and furniture can't be one temperature.
+                fitted[rid], rep[rid]["mass"] = refine_mass(rid, fitted[rid], rep[rid]["paths"]["sse"], T, out, sun,
+                                                            Ye, Lk, splits[rid])
+            rep[rid]["paths"].pop("sse", None)
     m.rooms.update(fitted)
     report.update(rep)
     zones = {u: spec.get("zone", []) for u, spec in layout["units"].items()}
@@ -556,7 +613,23 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     report["outputs"] = learned_out
     report["lags_min"] = lags
     report["fan_scale"] = {u: {"relative_to": ref_fan.get(u), **v} for u, v in scales.items() if v}
-    report["holdout"] = validate(m, ts, T, out, sun, effective(Y, F, m), {r: splits[r] for r in m.rooms}, Lk)
+    Yv, sp_v = effective(Y, F, m), {r: splits[r] for r in m.rooms}
+    report["holdout"] = validate(m, ts, T, out, sun, Yv, sp_v, Lk)
+    # A room keeps its mass state only where it predicts the held-out part better than without (the live accuracy
+    # gate, mpc.readiness, then checks the result on predictions nobody has seen).
+    massy = [r for r in m.rooms if m.rooms[r].mass_k and r in one_state]
+    if massy:
+        m1 = hm.HouseModel(rooms={**m.rooms, **{r: one_state[r] for r in massy}}, units=m.units)
+        h1 = validate(m1, ts, T, out, sun, Yv, sp_v, Lk)
+        worse = [r for r in massy if h1[r]["model_rmse_F"] is not None and (
+            report["holdout"][r]["model_rmse_F"] is None or h1[r]["model_rmse_F"] <= report["holdout"][r]["model_rmse_F"])]
+        for r in worse:
+            m.rooms[r] = one_state[r]
+            report[r]["mass"] = {**(report[r].get("mass") or {}), "kept": False,
+                                 "held_out_with_F": report["holdout"][r]["model_rmse_F"],
+                                 "held_out_without_F": h1[r]["model_rmse_F"]}
+        if worse:
+            report["holdout"] = validate(m, ts, T, out, sun, Yv, sp_v, Lk)
     report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
     # Every room with enough held-out checks must beat "nothing changes"; at least one must have been checked. A room
     # whose sensor only just started may have none yet: the live accuracy gate (mpc.readiness) still covers it.
@@ -577,17 +650,20 @@ def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, L=None, horizon_min: i
     base = {r: [] for r in m.rooms}
     n = len(ts)
     splits = split if isinstance(split, dict) else {r: split for r in m.rooms}  # room -> first held-out minute
+    MS = {r: mass_series(T[r], m.rooms[r].mass_tau_h) for r in m.rooms if m.rooms[r].mass_k}
     for a in range(min(splits.values(), default=n), n - horizon_min, every_min):
         start = {r: T[r][a] for r in m.rooms if T[r][a] is not None}  # rooms without a reading sit this one out
         if not start:
             continue
         cur = dict(start)
+        masses = {r: v[a] for r, v in MS.items() if r in cur}
         for k in range(a, a + horizon_min, step_min):
             seg = slice(k, k + step_min)
             o = _mean(out[seg])
             y = {u: sum(Y[u][seg]) / step_min for u in Y}
             lk = {u: sum(v[seg]) / step_min for u, v in (L or {}).items()}
-            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y, lk)
+            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y, lk, masses)
+            masses = {r: hm.mass_step(m.rooms[r], v, cur[r], step_min / 60) for r, v in masses.items()}
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
         z = a + horizon_min
         for r in start:
@@ -634,14 +710,17 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
     Y = effective(Y, F, m)
     res = {r: {str(h): [] for h in horizons} for r in rooms}
     hmax = max(horizons)
+    MS = {r: mass_series(T[r], m.rooms[r].mass_tau_h) for r in rooms if m.rooms[r].mass_k}
     for a in range(0, len(ts) - hmax, every_min):
         cur = {r: T[r][a] for r in rooms if T[r][a] is not None}
         if not cur:
             continue
+        masses = {r: v[a] for r, v in MS.items() if r in cur}
         for k in range(a, a + hmax, step_min):
             seg = slice(k, k + step_min)
             d = hm.derivative(m, cur, _mean(out[seg]), hm.mean_sun(sun[seg]), {u: sum(Y[u][seg]) / step_min for u in Y},
-                              {u: sum(v[seg]) / step_min for u, v in Lk.items()})
+                              {u: sum(v[seg]) / step_min for u, v in Lk.items()}, masses)
+            masses = {r: hm.mass_step(m.rooms[r], v, cur[r], step_min / 60) for r, v in masses.items()}
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
             done = k + step_min - a
             if done in horizons:
