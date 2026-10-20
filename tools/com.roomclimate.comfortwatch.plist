@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Comfort watch every 5 minutes (tools/comfort_watch.py). Install:
+<!-- Comfort watch every 5 minutes (tools/comfort_watch.py), run from a clone outside ~/Documents
+     (macOS blocks launchd jobs from ~/Documents):
+       git clone https://github.com/kirencaldwell/ha-climate-app ~/.local/share/room-climate-watch/repo
+     Install:
        cp tools/com.roomclimate.comfortwatch.plist ~/Library/LaunchAgents/
        launchctl load ~/Library/LaunchAgents/com.roomclimate.comfortwatch.plist
      Stop: launchctl unload ~/Library/LaunchAgents/com.roomclimate.comfortwatch.plist -->
@@ -10,7 +13,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>/Users/kirencaldwell/Documents/ha-climate-app/tools/comfort_watch.py</string>
+    <string>/Users/kirencaldwell/.local/share/room-climate-watch/repo/tools/comfort_watch.py</string>
   </array>
   <key>StartInterval</key><integer>300</integer>
   <key>StandardOutPath</key><string>/Users/kirencaldwell/.local/state/room-climate-watch/watch.log</string>
