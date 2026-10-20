@@ -28,8 +28,15 @@ def test_fit_recovers_the_simulated_house():
                  for rid, r in truth.rooms.items()}
     layout = {"rooms": {rid: {"units": list(truth.units), "neighbors": neighbors[rid]} for rid in truth.rooms},
               "units": {u: {"zone": [r.id for r in rooms if r.unit == u]} for u in truth.units}}  # sensor rooms: detected
-    m, rep = fit.fit(log, layout)
+    # The truth has one temperature per room, so its parameters are what the one-state fit must recover; the full fit
+    # (every room with a mass state, shrunk toward none) must predict as well (a mass state can stand in for some of
+    # a unit's lag, which shifts its raw coefficients without changing what it predicts).
+    full, full_rep = fit.fit(log, layout)
+    assert full.meta["usable"]
+    m, rep = fit.fit(log, layout, mass=False)
     assert m.meta["usable"]
+    for rid, v in rep["holdout"].items():
+        assert full_rep["holdout"][rid]["model_rmse_F"] <= v["model_rmse_F"] + 0.05, (rid, full_rep["holdout"][rid], v)
     refs = {u: (rep.get("fan_scale", {}).get(u) or {}).get("relative_to") or "auto" for u in truth.units}
     for rid, tr in truth.rooms.items():
         fr = m.rooms[rid]
