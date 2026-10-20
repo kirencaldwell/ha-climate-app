@@ -57,16 +57,66 @@ def compressor_drive(extra: dict):
     return None
 
 
-def series(rows: list, rooms: list, units: list):
-    """Per-minute lists: times, temps[room], outdoor, sun, y[unit] (signed estimated output, before any fan scaling),
-    unit readings, fan mode[unit]."""
-    d = hm.UnitModel()
+def _gap(x: dict):
+    """A logged unit's setpoint gap in the direction it's working (None when idle or unknown)."""
+    act, sp, rd = x.get("action"), x.get("sp"), x.get("temp")
+    if act not in ("heating", "cooling") or sp is None or rd is None:
+        return None
+    return (sp - rd) if act == "heating" else (rd - sp)
+
+
+OUT_MIN_SOLO = 60  # minutes of a unit running alone with the outdoor unit's power logged before its output is learned
+OUT_SKIP_MIN = 3  # first minutes of a run left out: the compressor is still spinning up
+
+
+def fit_outputs(rows: list, units: list) -> dict:
+    """Each unit's output while running, learned from the outdoor unit's measured draw (compressor_drive) in minutes
+    when it runs alone: output = clip(k0 + k1 * gap, ymin, 1), k1 >= 0 (gap: setpoint past its reading in the
+    direction it works). -> {unit: {"k0", "k1", "ymin", "minutes"}} for units with enough such minutes."""
+    pts = {u: [] for u in units}
+    since = {u: None for u in units}  # minute index each unit's current run started
+    for k, row in enumerate(rows):
+        xs = {u: (row.get("units", {}).get(u) or {}) for u in units}
+        run = [u for u in units if xs[u].get("action") in ("heating", "cooling")]
+        for u in units:
+            since[u] = (since[u] if since[u] is not None else k) if u in run else None
+        if len(run) != 1:
+            continue
+        u = run[0]
+        d, g = compressor_drive(row.get("extra")), _gap(xs[u])
+        if d is None or g is None or k - since[u] < OUT_SKIP_MIN:
+            continue
+        pts[u].append((max(-1.0, min(4.0, g)), d))
+    res = {}
+    for u, v in pts.items():
+        if len(v) < OUT_MIN_SOLO:
+            continue
+        n = len(v)
+        mg, md = sum(g for g, _ in v) / n, sum(d for _, d in v) / n
+        sgg = sum((g - mg) ** 2 for g, _ in v)
+        k1 = max(0.0, sum((g - mg) * (d - md) for g, d in v) / sgg) if sgg > 1e-9 else 0.0
+        k0 = md - k1 * mg
+        ds = sorted(d for _, d in v)
+        ymin = max(0.02, min(max(k0, 0.02), ds[n // 10]))
+        res[u] = {"k0": round(max(0.02, k0), 3), "k1": round(k1, 3), "ymin": round(ymin, 3), "minutes": n}
+    return res
+
+
+def series(rows: list, rooms: list, units: list, outputs: dict = None):
+    """Per-minute lists: times, temps[room], outdoor, sun, y[unit] (signed output, before any fan scaling), unit
+    readings, fan mode[unit], leak drive[unit].
+
+    A running unit's output is the outdoor unit's measured draw (compressor_drive) when it's logged, split between the
+    units running by what each would give on its own; otherwise what it would give by its output rule (`outputs`:
+    unit -> UnitModel with learned k0/k1/ymin, else the defaults), so minutes with and without the power logged are on
+    the same scale."""
     ts, out, sun = [], [], []
     T = {r: [] for r in rooms}
     Y = {u: [] for u in units}
     U = {u: [] for u in units}
     F = {u: [] for u in units}
     L = {u: [] for u in units}
+    rule = {u: (outputs or {}).get(u) or hm.UnitModel() for u in units}
     for row in rows:
         ts.append(datetime.fromisoformat(row["t"]))
         for r in rooms:
@@ -81,24 +131,30 @@ def series(rows: list, rooms: list, units: list):
             sun.append(hm.sun_from_irradiance(sn.get("elev"), sn.get("az"), sn.get("ghi"), sn.get("dni"), sn.get("dhi")))
         else:
             sun.append(hm.sun_vector(sn.get("elev"), sn.get("az"), (row.get("weather") or {}).get("cloud")))
+        drive = compressor_drive(row.get("extra"))
+        est = {}
         for u in units:
             x = row.get("units", {}).get(u) or {}
-            act, sp, rd = x.get("action"), x.get("sp"), x.get("temp")
+            rd = x.get("temp")
             U[u].append(None if rd is None else float(rd))
             F[u].append(x.get("fan"))
-            if act in ("heating", "cooling"):
-                y = 1.0
-                if sp is not None and rd is not None:
-                    err = (sp - rd) if act == "heating" else (rd - sp)
-                    y = max(d.ymin, min(1.0, d.k0 + d.k1 * err))
-                Y[u].append(y if act == "heating" else -y)
-            else:
+            if x.get("action") in ("heating", "cooling"):
+                g, d = _gap(x), rule[u]
+                est[u] = (1.0 if g is None else max(d.ymin, min(1.0, d.k0 + d.k1 * g)), x["action"] == "heating")
+        tot = sum(y for y, _ in est.values())
+        for u in units:
+            if u not in est:
                 Y[u].append(0.0)
+                continue
+            y, heating = est[u]
+            if drive is not None and tot > 0:
+                y = drive * y / tot
+            Y[u].append(y if heating else -y)
         # Leak drive for idle units (model.leak_inputs): how hard the shared compressor works, else the other units'
         # output in that mode. See compressor_drive.
         modes = {u: (row.get("units", {}).get(u) or {}).get("state") for u in units}
-        running = {u: (row.get("units", {}).get(u) or {}).get("action") in ("heating", "cooling") for u in units}
-        lk = hm.leak_inputs(modes, running, {u: Y[u][-1] for u in units}, units, compressor_drive(row.get("extra")))
+        running = {u: u in est for u in units}
+        lk = hm.leak_inputs(modes, running, {u: Y[u][-1] for u in units}, units, drive)
         for u in units:
             L[u].append(lk[u])
     return ts, T, out, sun, Y, U, F, L
@@ -352,7 +408,9 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     """-> (HouseModel, report). layout: {"rooms": {id: {"units": [...], "neighbors": [...]}},
     "units": {id: {"sensor_rooms": [...] (optional: detected when missing), "zone": [...]}}}"""
     rooms, units = list(layout["rooms"]), list(layout["units"])
-    ts, T, out, sun, Y, U, F, Lk = series(rows, rooms, units)
+    learned_out = fit_outputs(rows, units)
+    rule = {u: hm.UnitModel(k0=v["k0"], k1=v["k1"], ymin=v["ymin"]) for u, v in learned_out.items()}
+    ts, T, out, sun, Y, U, F, Lk = series(rows, rooms, units, rule)
     n = len(ts)
     # A room's readings from before its `since` (a sensor that was replaced or moved) aren't the room: leave them out.
     for rid, spec in layout["rooms"].items():
@@ -491,8 +549,11 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     detected = detect_sensor_rooms(T, U, zones)
     for uid, spec in layout["units"].items():
         sr, off = (spec["sensor_rooms"], 0.0) if spec.get("sensor_rooms") is not None else detected.get(uid, ([], 0.0))
+        r0 = rule.get(uid) or hm.UnitModel()
         m.units[uid] = hm.UnitModel(sensor_rooms=[r for r in sr if r in m.rooms], sensor_offset=off,
-                                    lag_h=round(lags.get(uid, 0) / 60, 4), fan_scale=scales.get(uid, {}))
+                                    lag_h=round(lags.get(uid, 0) / 60, 4), fan_scale=scales.get(uid, {}),
+                                    k0=r0.k0, k1=r0.k1, ymin=r0.ymin)
+    report["outputs"] = learned_out
     report["lags_min"] = lags
     report["fan_scale"] = {u: {"relative_to": ref_fan.get(u), **v} for u, v in scales.items() if v}
     report["holdout"] = validate(m, ts, T, out, sun, effective(Y, F, m), {r: splits[r] for r in m.rooms}, Lk)
@@ -569,7 +630,7 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
     weather and the sun did and predict each room `horizons` minutes ahead. -> {room: {"60": [[iso, F]], ...}}, each
     point at the time it's a prediction for, so it plots against the actual reading at that moment."""
     rooms, units = list(m.rooms), sorted({u for row in rows for u in row.get("units", {})})
-    ts, T, out, sun, Y, _, F, Lk = series(rows, rooms, units)
+    ts, T, out, sun, Y, _, F, Lk = series(rows, rooms, units, m.units)
     Y = effective(Y, F, m)
     res = {r: {str(h): [] for h in horizons} for r in rooms}
     hmax = max(horizons)

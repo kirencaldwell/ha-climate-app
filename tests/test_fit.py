@@ -128,3 +128,37 @@ if __name__ == "__main__":
     test_backtest_runs_the_model_over_logged_history()
     test_rooms_without_data_are_left_out_not_poisonous()
     print("ok")
+
+
+def test_compressor_drive_ignores_zero_frequency_and_uses_power():
+    assert fit.compressor_drive({"sensor.a_compressor_frequency": 0.0}) is None
+    assert fit.compressor_drive({"sensor.a_compressor_frequency": 50.0}) == 0.5
+    d = fit.compressor_drive({"sensor.a_compressor_frequency": 0.0, "sensor.a_input_power": 1500.0,
+                              "sensor.b_input_power": 8.0})
+    assert abs(d - 1500.0 / fit.POWER_REF_W) < 1e-9
+    assert fit.compressor_drive({"sensor.a_input_power": "unavailable"}) is None
+
+
+def test_outputs_learned_from_power_when_one_unit_runs():
+    t0 = datetime(2026, 10, 19, 0, 0)
+    rows = []
+    for k in range(200):
+        on = 20 <= k < 180
+        gap = 1.0 + (k % 3)  # the setpoint gap varies, the draw doesn't: output doesn't depend on the gap
+        rows.append({"t": (t0 + timedelta(minutes=k)).isoformat(),
+                     "units": {"a": {"action": "heating" if on else "idle", "sp": 66 + gap, "temp": 66.0},
+                               "b": {"action": "idle", "sp": 60, "temp": 66.0}},
+                     "extra": {"sensor.x_input_power": 600.0 if on else 10.0}})
+    out = fit.fit_outputs(rows, ["a", "b"])
+    assert "b" not in out
+    assert abs(out["a"]["k0"] - 0.2) < 0.01 and out["a"]["k1"] < 0.01
+    # series uses the measured draw for the running unit
+    _, _, _, _, Y, _, _, _ = fit.series(rows, [], ["a", "b"], {"a": hm.UnitModel(k0=0.2, k1=0.0, ymin=0.1)})
+    assert abs(Y["a"][100] - 0.2) < 1e-9 and Y["b"][100] == 0.0
+
+
+def test_rule_effect_keeps_the_default_scale():
+    u = hm.UnitModel()
+    assert abs(hm.rule_effect(4.0, u) - 4.0) < 1e-9
+    weak = hm.UnitModel(k0=0.2, k1=0.0, ymin=0.15)  # runs at 0.2: an effect of 20 per unit output is 5 F/h
+    assert abs(hm.rule_effect(20.0, weak) - 20.0 * 0.2 / 0.8) < 1e-9

@@ -414,21 +414,20 @@ class Manager:
             return None, None
         eff = [(m.rooms[r.id].heat if mode == "heat" else m.rooms[r.id].cool).get(unit_id, 0.0)
                for r in rooms if r.unit == unit_id and r.id in m.rooms]
-        return (sum(eff) / len(eff) if eff else None), m.units[unit_id]
+        # on the default output rule's scale, which the outer loop's gain and push limits are tuned for
+        return hm.rule_effect(sum(eff) / len(eff) if eff else None, m.units[unit_id]), m.units[unit_id]
 
     def drive_max_push(self, unit_id: str, mode: str, rooms: list, settings: core.Settings) -> float:
         """How far past the room a unit may be pushed: set per unit, else from its learned effect (core.max_push_for)."""
-        eff, um = self._own_effect(unit_id, mode, rooms)
-        return core.max_push_for(unit_id, eff, settings, *((um.k0, um.k1) if um else ()))
+        eff, _ = self._own_effect(unit_id, mode, rooms)
+        return core.max_push_for(unit_id, eff, settings)
 
     def drive_kp(self, unit_id: str, mode: str, rooms: list, settings: core.Settings) -> float:
         """Outer-loop gain for a unit, from the model's learned effect of the unit on its own rooms (core.drive_gain)."""
-        m = self.shadow.model
-        if m is None or unit_id not in m.units:
+        eff, um = self._own_effect(unit_id, mode, rooms)
+        if um is None:
             return settings.drive_kp
-        eff = [(m.rooms[r.id].heat if mode == "heat" else m.rooms[r.id].cool).get(unit_id, 0.0)
-               for r in rooms if r.unit == unit_id and r.id in m.rooms]
-        return core.drive_gain(sum(eff) / len(eff) if eff else None, settings, m.units[unit_id].k1)
+        return core.drive_gain(eff, settings)
 
     def control(self, unit_id: str) -> str:
         ud = next((u for u in self.data["units"] if u["id"] == unit_id), {})

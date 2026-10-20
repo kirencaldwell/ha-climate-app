@@ -176,6 +176,19 @@ def unit_reading(m: HouseModel, unit_id: str, temps: dict):
     return None if not vals else sum(vals) / len(vals) + u.sensor_offset
 
 
+DEFAULT_OUT_1F = UnitModel().k0 + UnitModel().k1  # the default output rule's output 1 F past the reading
+
+
+def rule_effect(effect, u: UnitModel):
+    """A unit's learned effect (F/h per unit of output) restated on the default output rule's scale: its rate when
+    running 1 F past the reading, over what the default rule gives there. The outer loop's gain and push limits
+    (core.drive_gain, core.max_push_for) are tuned on that scale, so learning how hard a unit really runs (fit_outputs)
+    doesn't change them by itself."""
+    if effect is None:
+        return None
+    return effect * max(u.ymin, min(1.0, u.k0 + u.k1)) / DEFAULT_OUT_1F
+
+
 def unit_output(u: UnitModel, mode: str, setpoint, reading, running: bool, hold: bool = False):
     """(signed output: + heating, - cooling, 0 idle; still running?) for one unit. `hold`: whether it runs is known
     (replaying what a unit really did), so only how hard it runs is modelled."""

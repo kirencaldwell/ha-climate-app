@@ -118,9 +118,9 @@ def plan(m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime,
     kp, cap = {}, {}
     for u in known_units:
         eff = [m.rooms[r.id].heat.get(u.id, 0.0) for r in zone_rooms[u.id]]
-        e = sum(eff) / len(eff) if eff else None
-        kp[u.id] = core.drive_gain(e, settings, m.units[u.id].k1)
-        cap[u.id] = core.max_push_for(u.id, e, settings, m.units[u.id].k0, m.units[u.id].k1)
+        e = hm.rule_effect(sum(eff) / len(eff) if eff else None, m.units[u.id])
+        kp[u.id] = core.drive_gain(e, settings)
+        cap[u.id] = core.max_push_for(u.id, e, settings)
 
     fan_units = {x.strip() for x in settings.fan_units.split(",")}
 
