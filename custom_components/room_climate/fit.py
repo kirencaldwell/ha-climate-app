@@ -78,8 +78,9 @@ def series(rows: list, rooms: list, units: list):
             else:
                 Y[u].append(0.0)
         # Leak drive for idle units (model.leak_inputs): the compressor's frequency when a unit reports it, else the
-        # other units' output in that mode.
-        hz = [v for k, v in (row.get("extra") or {}).items() if "compressor_frequency" in k and isinstance(v, (int, float))]
+        # other units' output in that mode. Some units report a frequency that is always 0 (CN105 without it), so a
+        # frequency counts only when it's above 0; a stopped compressor gives 0 drive from the fallback too.
+        hz = [v for k, v in (row.get("extra") or {}).items() if "compressor_frequency" in k and isinstance(v, (int, float)) and v > 0]
         modes = {u: (row.get("units", {}).get(u) or {}).get("state") for u in units}
         running = {u: (row.get("units", {}).get(u) or {}).get("action") in ("heating", "cooling") for u in units}
         lk = hm.leak_inputs(modes, running, {u: Y[u][-1] for u in units}, units, max(hz) / 100.0 if hz else None)
