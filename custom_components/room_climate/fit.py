@@ -287,7 +287,6 @@ OE_PRIOR = 0.01  # pull toward the slope fit, relative to each parameter's curva
 
 
 MASS_TAUS_H = (0.5, 1.0, 2.0, 4.0, 8.0)  # candidate mass time constants for refine_mass
-MASS_GAIN = 0.05  # a mass state is kept only if it cuts the training paths' squared miss by this share
 MASS_K_MAX = 20.0  # 1/h: the air settling on its mass within a few minutes is as fast as 5-minute steps can follow
 
 
@@ -439,15 +438,17 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
                  "path_rmse_F": round((c / cnt) ** 0.5, 2), "sse": c}
 
 
-def refine_mass(rid: str, rm: hm.RoomModel, base_sse: float, *args, **kw):
-    """Try a mass state for one room at each of MASS_TAUS_H, refined from the one-state paths fit `rm`; keep the best
-    only if it cuts the training paths' squared miss by MASS_GAIN. -> (room model, report or None)."""
+def refine_mass(rid: str, rm: hm.RoomModel, *args, **kw):
+    """Every room's mass state, refined from its one-state paths fit `rm`: its time constant is the one of
+    MASS_TAUS_H whose paths fit best, and how strongly the air trades heat with it (mass_k) starts at 0 and is pulled
+    back toward 0 like every other parameter (OE_PRIOR), so a room that doesn't need it ends up with little or none.
+    -> (room model, report)."""
     best = None
     for tau in MASS_TAUS_H:
         cand, rep = refine_paths(rid, rm, *args, tau_h=tau, **kw)
-        if cand.mass_k > 0 and rep.get("sse") is not None and (best is None or rep["sse"] < best[1]["sse"]):
+        if rep.get("sse") is not None and (best is None or rep["sse"] < best[1]["sse"]):
             best = (cand, rep)
-    if best is None or best[1]["sse"] > (1 - MASS_GAIN) * base_sse:
+    if best is None:
         return rm, None
     return best[0], {"tau_h": best[0].mass_tau_h, "mass_k": best[0].mass_k, "path_rmse_F": best[1]["path_rmse_F"]}
 
@@ -588,17 +589,14 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     # The slope fit explains each half hour on its own; refine each room so its 2 h simulated paths match too (what
     # the planner and the accuracy checks use). A fast room can otherwise explain its half hours with effects so large
     # that they run away over two hours.
-    one_state = {}
     if paths:
         Ye = {u: lagged(v, lags.get(u, 0)) for u, v in scaled(Y, F, scales).items()}
         for rid in list(fitted):
             fitted[rid], rep[rid]["paths"] = refine_paths(rid, fitted[rid], T, out, sun, Ye, Lk, splits[rid])
-            one_state[rid] = fitted[rid]
             if mass and rep[rid]["paths"].get("sse") is not None:
-                # A second state (the room's mass) where it explains the paths clearly better: a small room whose air
-                # swings fast around slower walls and furniture can't be one temperature.
-                fitted[rid], rep[rid]["mass"] = refine_mass(rid, fitted[rid], rep[rid]["paths"]["sse"], T, out, sun,
-                                                            Ye, Lk, splits[rid])
+                # Every room's second state (its mass): a small room's air swings fast around slower walls and
+                # furniture, which one temperature can't follow.
+                fitted[rid], rep[rid]["mass"] = refine_mass(rid, fitted[rid], T, out, sun, Ye, Lk, splits[rid])
             rep[rid]["paths"].pop("sse", None)
     m.rooms.update(fitted)
     report.update(rep)
@@ -615,21 +613,6 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     report["fan_scale"] = {u: {"relative_to": ref_fan.get(u), **v} for u, v in scales.items() if v}
     Yv, sp_v = effective(Y, F, m), {r: splits[r] for r in m.rooms}
     report["holdout"] = validate(m, ts, T, out, sun, Yv, sp_v, Lk)
-    # A room keeps its mass state only where it predicts the held-out part better than without (the live accuracy
-    # gate, mpc.readiness, then checks the result on predictions nobody has seen).
-    massy = [r for r in m.rooms if m.rooms[r].mass_k and r in one_state]
-    if massy:
-        m1 = hm.HouseModel(rooms={**m.rooms, **{r: one_state[r] for r in massy}}, units=m.units)
-        h1 = validate(m1, ts, T, out, sun, Yv, sp_v, Lk)
-        worse = [r for r in massy if h1[r]["model_rmse_F"] is not None and (
-            report["holdout"][r]["model_rmse_F"] is None or h1[r]["model_rmse_F"] <= report["holdout"][r]["model_rmse_F"])]
-        for r in worse:
-            m.rooms[r] = one_state[r]
-            report[r]["mass"] = {**(report[r].get("mass") or {}), "kept": False,
-                                 "held_out_with_F": report["holdout"][r]["model_rmse_F"],
-                                 "held_out_without_F": h1[r]["model_rmse_F"]}
-        if worse:
-            report["holdout"] = validate(m, ts, T, out, sun, Yv, sp_v, Lk)
     report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
     # Every room with enough held-out checks must beat "nothing changes"; at least one must have been checked. A room
     # whose sensor only just started may have none yet: the live accuracy gate (mpc.readiness) still covers it.

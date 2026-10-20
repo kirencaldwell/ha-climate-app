@@ -181,7 +181,7 @@ def test_mass_state_fitted_by_paths():
     rm = hm.RoomModel(loss=0.3, heat={"u": 5.0}, cool={"u": 0.0})
     Ts, Ye, Lk = {"r": T}, {"u": Yh}, {"u": [0.0] * n}
     one, rep1 = fit.refine_paths("r", rm, Ts, out, sun, Ye, Lk, 2400)
-    two, rep2 = fit.refine_mass("r", one, rep1["sse"], Ts, out, sun, Ye, Lk, 2400)
+    two, rep2 = fit.refine_mass("r", one, Ts, out, sun, Ye, Lk, 2400)
     assert rep2 is not None and two.mass_k > 0.5
     assert rep2["path_rmse_F"] < 0.6 * rep1["path_rmse_F"]
     assert abs(hm.mass_step(two, 60.0, 70.0, two.mass_tau_h) - (60 + 10 * (1 - pow(2.718281828459045, -1)))) < 1e-6
