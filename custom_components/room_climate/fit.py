@@ -40,6 +40,23 @@ def _median(xs):
     return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
 
 
+POWER_REF_W = 3000.0  # outdoor unit draw counted as full compressor drive (about its most, heating, at 50 F out)
+
+
+def compressor_drive(extra: dict):
+    """0..1 drive of the shared compressor from the units' telemetry, or None when it isn't reported: its frequency
+    over 100 Hz when a unit reports one above 0 (these CN105 units report 0 always, so 0 isn't a reading), else the
+    largest input power a unit reports over POWER_REF_W (one of the units reports the whole outdoor unit's draw; the
+    others report a few watts or nothing)."""
+    hz = [v for k, v in (extra or {}).items() if "compressor_frequency" in k and isinstance(v, (int, float)) and v > 0]
+    if hz:
+        return min(1.0, max(hz) / 100.0)
+    pw = [v for k, v in (extra or {}).items() if k.endswith("input_power") and isinstance(v, (int, float))]
+    if pw:
+        return min(1.0, max(0.0, max(pw)) / POWER_REF_W)
+    return None
+
+
 def series(rows: list, rooms: list, units: list):
     """Per-minute lists: times, temps[room], outdoor, sun, y[unit] (signed estimated output, before any fan scaling),
     unit readings, fan mode[unit]."""
@@ -77,13 +94,11 @@ def series(rows: list, rooms: list, units: list):
                 Y[u].append(y if act == "heating" else -y)
             else:
                 Y[u].append(0.0)
-        # Leak drive for idle units (model.leak_inputs): the compressor's frequency when a unit reports it, else the
-        # other units' output in that mode. Some units report a frequency that is always 0 (CN105 without it), so a
-        # frequency counts only when it's above 0; a stopped compressor gives 0 drive from the fallback too.
-        hz = [v for k, v in (row.get("extra") or {}).items() if "compressor_frequency" in k and isinstance(v, (int, float)) and v > 0]
+        # Leak drive for idle units (model.leak_inputs): how hard the shared compressor works, else the other units'
+        # output in that mode. See compressor_drive.
         modes = {u: (row.get("units", {}).get(u) or {}).get("state") for u in units}
         running = {u: (row.get("units", {}).get(u) or {}).get("action") in ("heating", "cooling") for u in units}
-        lk = hm.leak_inputs(modes, running, {u: Y[u][-1] for u in units}, units, max(hz) / 100.0 if hz else None)
+        lk = hm.leak_inputs(modes, running, {u: Y[u][-1] for u in units}, units, compressor_drive(row.get("extra")))
         for u in units:
             L[u].append(lk[u])
     return ts, T, out, sun, Y, U, F, L
@@ -190,7 +205,150 @@ def solve(A: list, b: list, free: set, lam: float = 1e-3, iters: int = 3000) -> 
     return [x[j] / scale[j] for j in range(p)]
 
 
-def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: float = 0.25, lam: float = 1e-3):
+def _lin_solve(A: list, b: list) -> list:
+    """Solve A x = b (small, dense) by Gaussian elimination with partial pivoting."""
+    n = len(b)
+    M = [list(A[i]) + [b[i]] for i in range(n)]
+    for c in range(n):
+        piv = max(range(c, n), key=lambda r: abs(M[r][c]))
+        if abs(M[piv][c]) < 1e-15:
+            return [0.0] * n
+        M[c], M[piv] = M[piv], M[c]
+        for r in range(c + 1, n):
+            f = M[r][c] / M[c][c]
+            if f:
+                Mr, Mc = M[r], M[c]
+                for k in range(c, n + 1):
+                    Mr[k] -= f * Mc[k]
+    x = [0.0] * n
+    for c in range(n - 1, -1, -1):
+        x[c] = (M[c][n] - sum(M[c][k] * x[k] for k in range(c + 1, n))) / M[c][c]
+    return x
+
+
+OE_HORIZON_MIN, OE_STEP_MIN, OE_EVERY_MIN, OE_ITERS = 120, 5, 30, 25
+OE_PRIOR = 0.01  # pull toward the slope fit, relative to each parameter's curvature there: keeps poorly seen ones put
+
+
+def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: dict, Lk: dict, end: int,
+                 horizon: int = OE_HORIZON_MIN, step: int = OE_STEP_MIN, every: int = OE_EVERY_MIN,
+                 iters: int = OE_ITERS):
+    """Refine one room's parameters (from the slope fit) so that its simulated paths match its readings.
+
+    From every `every` minutes of its training part (before `end`), the room is simulated `horizon` minutes ahead the
+    way validate does (Euler steps of `step` minutes, inputs averaged over each step), with its neighbours, the
+    weather, the sun and the units at what was logged, and its own temperature simulated. The squared miss at every
+    step along every path is minimised by projected Levenberg-Marquardt with forward sensitivities (the model is linear
+    in its parameters but a path isn't: the room's own temperature feeds back through loss and coupling). Parameters
+    stay >= 0 except bias. -> (room model, report)."""
+    nbrs, us, own = list(rm.coupling), list(rm.heat), list(rm.leak)
+    names = (["loss"] + [f"c:{j}" for j in nbrs] + ["solar"] + [f"sun:{k}" for k in hm.WALLS] + ["bias"]
+             + [f"h:{u}" for u in us] + [f"k:{u}" for u in us] + [f"l:{u}" for u in own])
+    th0 = ([rm.loss] + [rm.coupling[j] for j in nbrs] + [rm.solar] + [rm.sun_dir.get(k, 0.0) for k in hm.WALLS]
+           + [rm.bias] + [rm.heat[u] for u in us] + [rm.cool[u] for u in us] + [rm.leak[u] for u in own])
+    p, nb_n, bias_i = len(names), len(nbrs), names.index("bias")
+    h = step / 60.0
+    Tr = T[rid]
+    segs = []  # [(start temp, [(outdoor, [neighbour temps], other features, target or None)])]
+    for a in range(0, max(0, end - horizon), every):
+        if Tr[a] is None:
+            continue
+        steps = []
+        for k in range(a, a + horizon, step):
+            sl = slice(k, k + step)
+            o = _mean(out[sl])
+            nb = [_mean(T[j][sl]) for j in nbrs]
+            if o is None or any(v is None for v in nb):
+                break
+            sv = hm.mean_sun(sun[sl])
+            g = ([sv.get("h", 0.0)] + [sv.get(w, 0.0) for w in hm.WALLS] + [1.0]
+                 + [sum(max(0.0, y) for y in Ye[u][sl]) / step for u in us]
+                 + [sum(min(0.0, y) for y in Ye[u][sl]) / step for u in us]
+                 + [sum(Lk[u][sl]) / step for u in own])
+            steps.append((o, nb, g, Tr[k + step] if k + step < len(Tr) else None))
+        if sum(st[3] is not None for st in steps) >= 3:
+            segs.append((Tr[a], steps))
+    if not segs:
+        return rm, {"paths": 0}
+
+    def evaluate(th, need_j=True):
+        """(cost, J'J, J'r, residual count) of the paths at th."""
+        H = [[0.0] * p for _ in range(p)] if need_j else None
+        gr = [0.0] * p
+        cost, cnt = 0.0, 0
+        a_self = th[0] + sum(th[1:1 + nb_n])
+        for t0, steps in segs:
+            t = t0
+            S = [0.0] * p
+            for o, nb, g, tgt in steps:
+                phi = [o - t] + [v - t for v in nb] + g
+                f = sum(th[j] * phi[j] for j in range(p))
+                if need_j:
+                    S = [S[j] + h * (phi[j] - a_self * S[j]) for j in range(p)]
+                t = t + h * f
+                if abs(t) > 500:
+                    return float("inf"), H, gr, cnt
+                if tgt is None:
+                    continue
+                r = t - tgt
+                cost += r * r
+                cnt += 1
+                if need_j:
+                    for i in range(p):
+                        Si = S[i]
+                        if Si:
+                            gr[i] += Si * r
+                            Hi = H[i]
+                            for j in range(i, p):
+                                Hi[j] += Si * S[j]
+        if need_j:
+            for i in range(p):
+                for j in range(i):
+                    H[i][j] = H[j][i]
+        return cost, H, gr, cnt
+
+    c0, H0, g0, cnt = evaluate(th0)
+    if not cnt or c0 == float("inf"):
+        return rm, {"paths": len(segs)}
+    prior = [OE_PRIOR * max(H0[j][j], 1e-9) for j in range(p)]
+
+    def total(c, th):
+        return c + sum(prior[j] * (th[j] - th0[j]) ** 2 for j in range(p))
+
+    th, c, H, gr = list(th0), c0, H0, g0
+    best = total(c, th)
+    mu, it = 1e-3, 0
+    for it in range(1, iters + 1):
+        grad = [gr[j] + prior[j] * (th[j] - th0[j]) for j in range(p)]
+        free = [j for j in range(p) if j == bias_i or th[j] > 1e-12 or grad[j] < 0]
+        A = [[H[i][j] + ((prior[i] + mu * max(H[i][i], 1e-9)) if i == j else 0.0) for j in free] for i in free]
+        dx = _lin_solve(A, [-grad[i] for i in free])
+        cand = list(th)
+        for i, d in zip(free, dx):
+            cand[i] = th[i] + d if i == bias_i else max(0.0, th[i] + d)
+        cn, Hn, gn, _ = evaluate(cand)
+        tn = total(cn, cand)
+        if tn < best:
+            gain = (best - tn) / best if best > 0 else 0.0
+            th, c, H, gr, best = cand, cn, Hn, gn, tn
+            mu = max(1e-7, mu / 3)
+            if gain < 1e-4:
+                break
+        else:
+            mu *= 4
+            if mu > 1e4:
+                break
+    q = dict(zip(names, th))
+    new = hm.RoomModel(loss=round(q["loss"], 4), solar=round(q["solar"], 3), bias=round(q["bias"], 3),
+                       sun_dir={k: round(q[f"sun:{k}"], 3) for k in hm.WALLS},
+                       heat={u: round(q[f"h:{u}"], 3) for u in us}, cool={u: round(q[f"k:{u}"], 3) for u in us},
+                       coupling={j: round(q[f"c:{j}"], 4) for j in nbrs}, leak={u: round(q[f"l:{u}"], 3) for u in own})
+    return new, {"paths": len(segs), "iters": it, "path_rmse_slope_fit_F": round((c0 / cnt) ** 0.5, 2),
+                 "path_rmse_F": round((c / cnt) ** 0.5, 2)}
+
+
+def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: float = 0.25, lam: float = 1e-3,
+        paths: bool = True):
     """-> (HouseModel, report). layout: {"rooms": {id: {"units": [...], "neighbors": [...]}},
     "units": {id: {"sensor_rooms": [...] (optional: detected when missing), "zone": [...]}}}"""
     rooms, units = list(layout["rooms"]), list(layout["units"])
@@ -320,6 +478,13 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
             if not moved:
                 break
     fitted, rep, _ = trial(lags, scales)
+    # The slope fit explains each half hour on its own; refine each room so its 2 h simulated paths match too (what
+    # the planner and the accuracy checks use). A fast room can otherwise explain its half hours with effects so large
+    # that they run away over two hours.
+    if paths:
+        Ye = {u: lagged(v, lags.get(u, 0)) for u, v in scaled(Y, F, scales).items()}
+        for rid in list(fitted):
+            fitted[rid], rep[rid]["paths"] = refine_paths(rid, fitted[rid], T, out, sun, Ye, Lk, splits[rid])
     m.rooms.update(fitted)
     report.update(rep)
     zones = {u: spec.get("zone", []) for u, spec in layout["units"].items()}
