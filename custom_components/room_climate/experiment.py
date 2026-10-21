@@ -10,8 +10,13 @@ A plan is a list of blocks over the time allotted:
 - "restore": the last hour is normal control, so the house is back on schedule when the time is up.
 
 One mode for the whole experiment (the units share a compressor, and mode switches are what we least want): the
-house's current one, else heat when it's cool outside. The house-wide hard floor and ceiling still hold: a unit stops
-pushing a room past the ceiling (heat) or floor (cool), and heats a room that has fallen below the floor.
+house's current one, else heat when it's cool outside. The house-wide hard floor still holds: a unit heats a room that
+has fallen below it. The ceiling holds with CEILING_EXTRA more room (the house is empty on an experiment day, and a unit
+that stops at the everyday ceiling teaches the model nothing for the rest of its block): a unit stops pushing a room
+past it (heat), or past the floor (cool).
+
+Units whose room warms when another unit's compressor runs (the leak) go first: they are the ones that hit the ceiling
+from the others' runs, so later their own block would be idle.
 Pure Python, no Home Assistant imports.
 """
 from __future__ import annotations
@@ -28,12 +33,19 @@ FLOAT_MIN, SOLO_MIN, FAN_STEP_MIN, COAST_MIN, RESTORE_MIN = 90, 45, 15, 30, 60
 FAN_CYCLE = ("quiet", "low", "medium", "auto")
 PUSH = 2.0  # F past the room for a solo unit (the outer loop's largest push)
 MIN_H, MAX_H = 2, 24
+CEILING_EXTRA = 3.0  # F above the everyday ceiling a unit may push a room to during an experiment
 
 
 def pick_mode(house_mode: str, outdoor: Optional[float]) -> str:
     if house_mode in ("heat", "cool"):
         return house_mode
     return "cool" if outdoor is not None and outdoor >= 65 else "heat"
+
+
+def order(unit_ids: list, leaky=()) -> list:
+    """Unit ids in the order their solo runs go: units with a leak first (their room is warmed by the others' runs),
+    else as given."""
+    return sorted(unit_ids, key=lambda u: u not in leaky)
 
 
 def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat") -> dict:
@@ -100,7 +112,7 @@ def commands(b: dict, mode: str, cmds: dict, unit_rooms: dict, readings: dict, s
         why = f"experiment: {describe(b)}"
         if mode == "heat" and temps and min(temps) < settings.floor:
             solo, why = True, "experiment: a room is below the floor; heating"  # never let the empty house get cold
-        elif solo and temps and (max(temps) >= settings.ceiling - 0.5 if mode == "heat" else min(temps) <= settings.floor + 0.5):
+        elif solo and temps and (max(temps) >= settings.ceiling + CEILING_EXTRA - 0.5 if mode == "heat" else min(temps) <= settings.floor + 0.5):
             solo, why = False, "experiment: at the house limit; idling"
         push = PUSH if solo else -settings.drive_stop_push
         sp = core.to_grid(c.room + c.offset + s * push)

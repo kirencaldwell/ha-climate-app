@@ -34,6 +34,13 @@ def test_current_block_and_mode():
     assert ex.pick_mode("cool", 40) == "cool" and ex.pick_mode("off", 50) == "heat" and ex.pick_mode("off", 75) == "cool"
 
 
+def test_leaky_units_go_first():
+    assert ex.order(UNITS, leaky={"minisplit_2"}) == ["minisplit_2", "air_handler", "minisplit_1"]
+    assert ex.order(UNITS, leaky=()) == UNITS  # no leak fitted: as given
+    first = ex.plan(T0, 8, ex.order(UNITS, {"minisplit_2"}), ("minisplit_1", "minisplit_2"))["blocks"]
+    assert [x["unit"] for x in first if x["kind"] == "solo"][0] == "minisplit_2"
+
+
 def _cmds(room=66.0):
     return {u: core.Command("heat", 66.0, "", True, 66.0, 67.0, room, 0.0) for u in UNITS}
 
@@ -45,8 +52,10 @@ def test_solo_unit_pushes_and_the_others_idle():
     out = ex.commands(b, "heat", _cmds(), rooms, {"kitchen": 66.0, "primary_bedroom": 66.0, "bedroom_3": 66.0}, s)
     assert out["minisplit_2"].setpoint >= 67.5 and out["minisplit_2"].fan == "low" and out["minisplit_2"].active
     assert all(out[u].setpoint <= 64.5 and out[u].fan is None for u in ("air_handler", "minisplit_1"))
-    # the house limits still hold
-    hot = ex.commands(b, "heat", _cmds(71.8), rooms, {"kitchen": 66.0, "primary_bedroom": 66.0, "bedroom_3": 71.8}, s)
+    # the house limits still hold; the ceiling has CEILING_EXTRA more room on an experiment day
+    warm = ex.commands(b, "heat", _cmds(73.5), rooms, {"kitchen": 66.0, "primary_bedroom": 66.0, "bedroom_3": 73.5}, s)
+    assert warm["minisplit_2"].active  # past the everyday ceiling (72), under the experiment's
+    hot = ex.commands(b, "heat", _cmds(75.0), rooms, {"kitchen": 66.0, "primary_bedroom": 66.0, "bedroom_3": 75.0}, s)
     assert not hot["minisplit_2"].active
     cold = ex.commands({"kind": "float"}, "heat", _cmds(62.5), rooms, {"kitchen": 62.5, "primary_bedroom": 66.0, "bedroom_3": 66.0}, s)
     assert cold["air_handler"].active and not cold["minisplit_1"].active
