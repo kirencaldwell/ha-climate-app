@@ -34,6 +34,16 @@ def test_current_block_and_mode():
     assert ex.pick_mode("cool", 40) == "cool" and ex.pick_mode("off", 50) == "heat" and ex.pick_mode("off", 75) == "cool"
 
 
+def test_leaky_units_are_the_ones_with_a_real_leak():
+    class R:  # the fit lists every unit for its own room, with a zero where there is no leak
+        def __init__(self, leak):
+            self.leak = leak
+    rooms = [R({"air_handler": 0.0}), R({"minisplit_1": 0.0}), R({"minisplit_2": 6.9})]
+    assert ex.leaky_units(rooms) == {"minisplit_2"}
+    assert ex.order(UNITS, ex.leaky_units(rooms)) == ["minisplit_2", "air_handler", "minisplit_1"]
+    assert ex.leaky_units([]) == set()
+
+
 def test_leaky_units_go_first():
     assert ex.order(UNITS, leaky={"minisplit_2"}) == ["minisplit_2", "air_handler", "minisplit_1"]
     assert ex.order(UNITS, leaky=()) == UNITS  # no leak fitted: as given

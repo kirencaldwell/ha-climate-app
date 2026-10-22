@@ -391,8 +391,7 @@ class Manager:
         mode = experiment.pick_mode(self.house.mode, self._outdoor(settings))
         fan_units = {x.strip() for x in settings.fan_units.split(",")}
         m = self.shadow.model
-        leaky = {uid for r in (m.rooms.values() if m else ()) for uid in r.leak}
-        ours = experiment.order(ours, leaky)
+        ours = experiment.order(ours, experiment.leaky_units(m.rooms.values() if m else ()))
         self.data["experiment"] = experiment.plan(now, hours, ours, fan_units, mode)
         _LOGGER.info("experiment started: %s h in %s mode for %s", hours, mode, ", ".join(ours))
         await self.async_save()

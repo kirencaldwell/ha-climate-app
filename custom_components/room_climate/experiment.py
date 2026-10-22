@@ -33,6 +33,7 @@ FLOAT_MIN, SOLO_MIN, FAN_STEP_MIN, COAST_MIN, RESTORE_MIN = 90, 45, 15, 30, 60
 FAN_CYCLE = ("quiet", "low", "medium", "auto")
 PUSH = 2.0  # F past the room for a solo unit (the outer loop's largest push)
 MIN_H, MAX_H = 2, 24
+LEAK_MIN = 0.5  # F/h of leak (per unit of the compressor's drive) that counts: the fit lists every unit, most at 0
 CEILING_EXTRA = 3.0  # F above the everyday ceiling a unit may push a room to during an experiment
 
 
@@ -40,6 +41,12 @@ def pick_mode(house_mode: str, outdoor: Optional[float]) -> str:
     if house_mode in ("heat", "cool"):
         return house_mode
     return "cool" if outdoor is not None and outdoor >= 65 else "heat"
+
+
+def leaky_units(rooms) -> set:
+    """Unit ids that warm a room through the shared compressor by at least LEAK_MIN, from the model's rooms (each
+    room's `leak`: unit id -> F/h; the fit lists a zero for the units that don't)."""
+    return {uid for r in rooms for uid, c in r.leak.items() if abs(c) >= LEAK_MIN}
 
 
 def order(unit_ids: list, leaky=()) -> list:
