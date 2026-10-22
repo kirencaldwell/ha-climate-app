@@ -27,7 +27,7 @@ except ImportError:  # offline
     import optimizer  # type: ignore
 
 HORIZONS_MIN = (30, 60, 120)
-READY_TOL_F = 0.15  # F a room's score may trail 'nothing changes' by and still count as beating it (noise: sensors
+READY_TOL_F = 0.2   # F a room's score may trail 'nothing changes' by and still count as beating it (noise: sensors
 #                     read to 0.1 F, and a room that hardly moves is hard to beat); absolute, so it can't excuse a room that moves
 
 

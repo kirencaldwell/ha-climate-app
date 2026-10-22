@@ -112,9 +112,9 @@ def test_readiness_tolerates_noise_but_not_a_real_miss():
     good.model.meta["usable"] = True
     rooms = {"kitchen"}
     score = lambda m, b: {"kitchen": {h: {"n": 100, "rmse": m, "base_rmse": b} for h in ("60", "120")}}
-    good.accuracy = lambda: score(0.63, 0.49)  # 0.14 F behind a room that hardly moves: noise
+    good.accuracy = lambda: score(0.63, 0.49)  # 0.14 F behind a room that hardly moves (the kitchen today): noise
     assert good.readiness(sim.now, rooms)[0]
-    good.accuracy = lambda: score(0.70, 0.49)  # 0.21 F behind: a real miss
+    good.accuracy = lambda: score(0.70, 0.49)  # 0.21 F behind: past the tolerance, a real miss
     assert not good.readiness(sim.now, rooms)[0]
     good.accuracy = lambda: score(2.7, 2.5)  # a room that moves, 0.2 F behind: still a miss to hand over on...
     assert not good.readiness(sim.now, rooms)[0]
