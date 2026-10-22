@@ -27,6 +27,8 @@ except ImportError:  # offline
     import optimizer  # type: ignore
 
 HORIZONS_MIN = (30, 60, 120)
+READY_TOL_F = 0.15  # F a room's score may trail 'nothing changes' by and still count as beating it (noise: sensors
+#                     read to 0.1 F, and a room that hardly moves is hard to beat); absolute, so it can't excuse a room that moves
 
 
 def along(now: datetime, current, points):
@@ -271,7 +273,8 @@ class ShadowPlanner:
     def readiness(self, now: datetime, rooms_needed, strict: bool = True, min_n: int = 36):
         """(ready to control units?, reasons it isn't). Strict, for handing a unit over: a usable fit, a fresh plan,
         and for every room it scores, 60- and 120-min predictions (at least `min_n` each, about 6 h) beating "nothing
-        changes". Not strict, for staying in control: 10% slack and fewer scores, so it doesn't flap."""
+        changes" (to within READY_TOL_F). Not strict, for staying in control: 10% slack on top and fewer scores, so it doesn't
+        flap."""
         why = []
         m = self.model
         if m is None:
@@ -289,7 +292,7 @@ class ShadowPlanner:
                 v = acc.get(rid, {}).get(h)
                 if not v or v["n"] < need:
                     why.append(f"{rid}: {0 if not v else v['n']}/{need} {h}-min predictions scored so far")
-                elif v["rmse"] >= v["base_rmse"] * slack:
+                elif v["rmse"] >= v["base_rmse"] * slack + READY_TOL_F:
                     why.append(f"{rid}: {h}-min predictions off by {v['rmse']}°, no better than 'nothing changes' "
                                f"({v['base_rmse']}°)")
         return not why, why

@@ -107,6 +107,20 @@ def test_readiness_gate():
     assert not ok and any("no better" in w for w in why), why
 
 
+def test_readiness_tolerates_noise_but_not_a_real_miss():
+    good, sim = _shadow_run(coupled.the_house(), 12)
+    good.model.meta["usable"] = True
+    rooms = {"kitchen"}
+    score = lambda m, b: {"kitchen": {h: {"n": 100, "rmse": m, "base_rmse": b} for h in ("60", "120")}}
+    good.accuracy = lambda: score(0.63, 0.49)  # 0.14 F behind a room that hardly moves: noise
+    assert good.readiness(sim.now, rooms)[0]
+    good.accuracy = lambda: score(0.70, 0.49)  # 0.21 F behind: a real miss
+    assert not good.readiness(sim.now, rooms)[0]
+    good.accuracy = lambda: score(2.7, 2.5)  # a room that moves, 0.2 F behind: still a miss to hand over on...
+    assert not good.readiness(sim.now, rooms)[0]
+    assert good.readiness(sim.now, rooms, strict=False)[0]  # ...but not enough to hand it back (10% slack on top)
+
+
 def test_thermostat_units_are_planned_around():
     truth, rooms, units, s = _house()
     start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
