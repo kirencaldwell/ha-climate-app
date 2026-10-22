@@ -561,11 +561,21 @@ class Manager:
             h.append((now, val))
             del h[:max(0, next((k for k, (t, _) in enumerate(h) if core.elapsed(now, t) <= settings.history_s), len(h)))]
             predicted[r.id] = core.predict(h, now, settings)
-        # Units under model control go back to today's controller as soon as the model stops being trustworthy.
+        # Units under model control go back to today's controller as soon as the model stops being trustworthy
+        # (unless the owner turned model_fallback off: then they stay, and a notification says the model isn't ready).
         model_units = [u for u in units if self.control(u.id) == MODEL]
         if model_units:
             ok, reasons = self.model_ready(strict=False)
-            if not ok:
+            if ok:
+                self._model_warned = False
+            elif not settings.model_fallback:
+                if not getattr(self, "_model_warned", False):
+                    self._model_warned = True
+                    persistent_notification.async_create(
+                        self.hass, "The model isn't ready, and " + ", ".join(u.id for u in model_units)
+                        + " stay on it (model_fallback is off): " + "; ".join(reasons[:3]), title="Room Climate",
+                        notification_id=f"{DOMAIN}_model_not_ready")
+            else:
                 for u in model_units:
                     await self.async_set_control(u.id, ROOM_CLIMATE, "model not ready: " + reasons[0])
                 persistent_notification.async_create(

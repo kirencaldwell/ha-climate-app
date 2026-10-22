@@ -98,6 +98,8 @@ class Settings:
     switch_min_s: int = 600  # compressor protection: at least this long in a mode before reversing
     vote_smooth_min: float = 5.0
     vote_exclude_coast: bool = False  # the older patch: rooms coasting after their unit stops sit out the vote
+    model_fallback: bool = True  # hand units under model control back to Room Climate when the model stops predicting well
+    # (off: they stay on the model, and a notification says it isn't ready; the owner's call)
     min_cost: float = 0.05  # demand below this counts as comfortable
     start_cost: float = 1.0  # demand needed to leave "off" (then confirmed for switch_confirm_s like any mode switch)
     max_offset: float = 6.0  # clamp on sensor-vs-unit-sensor compensation

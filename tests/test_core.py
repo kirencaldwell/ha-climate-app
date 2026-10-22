@@ -822,3 +822,9 @@ def test_accumulated_switching_ignores_spikes_and_acts_on_sustained_needs():
     old = Settings(switch_mode="thresholds")
     h3, why = core.choose_mode(0.0, 40.0, core.HouseState("heat", MON - timedelta(hours=2)), MON, old)
     assert "confirming" in why  # the older rules are still there
+
+
+def test_model_fallback_is_on_unless_the_owner_turns_it_off():
+    assert core.settings_from({}).model_fallback is True
+    assert core.settings_from({"model_fallback": False}).model_fallback is False
+    assert core.settings_from({"not_a_setting": 1}).model_fallback is True  # unknown names are ignored
