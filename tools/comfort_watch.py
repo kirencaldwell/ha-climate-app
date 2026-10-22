@@ -134,8 +134,11 @@ PROMPT = """You are reviewing the Room Climate controller for this house (repo i
 CLAUDE.md-style notes in docs/ if present). A comfort trigger fired: {trigger} at {now}: {detail}.
 
 The last 12 hours of the controller's minute log are summarised in {inputs} (read it first). The code is in
-custom_components/room_climate/ (core.py is today's controller; model.py/fit.py/mpc.py/optimizer.py the learned model
-and planner, which only watch for now). You have read-only tools and cannot change anything.
+custom_components/room_climate/ (core.py is the everyday controller; model.py/fit.py/mpc.py/optimizer.py the learned
+model and planner). Since the evening of 2026-10-21 the planner may be in control of the units: where the log's units
+show control "model" it picks the house mode and each unit's target, and core.py turns those into setpoints; it hands a
+unit back to core.py ("room_climate") on its own when the model stops predicting well, so check the log for that. You
+have read-only tools and cannot change anything.
 
 {fix_rules}
 Write a short review for the owner to read tomorrow, in plain language:
