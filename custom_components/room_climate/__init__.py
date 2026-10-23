@@ -265,6 +265,12 @@ class Manager:
             return
         self.hist5 = deque(rows + list(self.hist5))  # anything logged meanwhile goes after
 
+    def room_history(self, room_id: str, hours: float) -> dict:
+        """One room's reading against its target (and weight) from the 5-minute samples: [[iso, temp, target, weight], ...]."""
+        since = (dt_util.now() - timedelta(hours=hours)).isoformat()
+        pts = [[x["t"], *x["r"][room_id]] for x in self.hist5 if x["t"] >= since and room_id in x["r"]]
+        return {"room": room_id, "hours": hours, "points": pts}
+
     def model_history(self, hours: float) -> dict:
         """What the Model page's charts plot: samples, comfort score (actual vs the model's prediction), prediction
         accuracy by hour, predictions as they were made, and the two 2 h projections."""
@@ -1264,6 +1270,12 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     async def ws_model_history(hass, connection, msg):
         connection.send_result(msg["id"], mgr.model_history(msg["hours"]))
 
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/room_history", vol.Required("room_id"): str,
+                                      vol.Optional("hours", default=24): vol.All(vol.Coerce(float), vol.Range(min=1, max=HISTORY_H))})
+    @websocket_api.async_response
+    async def ws_room_history(hass, connection, msg):
+        connection.send_result(msg["id"], mgr.room_history(msg["room_id"], msg["hours"]))
+
     @websocket_api.websocket_command({"type": f"{DOMAIN}/reload_ml"})
     @websocket_api.async_response
     async def ws_reload_ml(hass, connection, msg):
@@ -1277,7 +1289,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         hass.async_create_task(mgr.async_fit())
         connection.send_result(msg["id"], {"started": True})
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_fit_model, ws_reload_ml,
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_fit_model, ws_reload_ml,
                ws_experiment_start, ws_experiment_stop):
         websocket_api.async_register_command(hass, fn)
 

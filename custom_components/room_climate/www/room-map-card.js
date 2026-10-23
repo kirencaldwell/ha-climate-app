@@ -224,6 +224,7 @@ class RoomMapCard extends HTMLElement {
     switch (t.dataset.act) {
       case "def": this._set({ default_temp: room.default_temp + d }); break;
       case "hold-step": this._holdTemp = (this._holdTemp ?? room.hold_temp ?? live.target) + d; this._panel(); break;
+      case "rh": this._rhHours = +t.dataset.h; this._roomHist(room.id, true); this._panel(); break;
       case "prio": this._set({ priority: +t.dataset.v }); break;
       case "hold": this._set({ hold_temp: this._holdTemp ?? room.hold_temp ?? live.target, hold_hours: +t.dataset.h }); break;
       case "hold-clear": this._set({ hold_temp: null, hold_hours: null }); break;
@@ -343,7 +344,60 @@ class RoomMapCard extends HTMLElement {
         <button data-act="sched" style="width:100%">Edit schedule…</button></div>
       <div class="rc-sect"><h4>Priority schedule · now P${pnow}</h4>
         <p class="rc-sub" style="margin:8px 0">${ptoday || "No priority schedule for today — using the default priority."}</p>
-        <button data-act="psched" style="width:100%">Edit priority schedule…</button></div>`;
+        <button data-act="psched" style="width:100%">Edit priority schedule…</button></div>
+      <div class="rc-sect"><h4>Temperature vs target</h4>${this._roomChart(room)}</div>`;
+    this._roomHist(room.id);
+  }
+
+  // Fetch (at most once a minute per room and span) the selected room's reading vs target; redraw only its chart.
+  async _roomHist(id, force = false) {
+    const hours = this._rhHours || 24, c = this._rh;
+    if (!force && c && c.id === id && c.hours === hours && Date.now() - c.at < 60000) return;
+    if (this._rhBusy) return;
+    this._rhBusy = true;
+    try {
+      const d = await this._hass.callWS({ type: "room_climate/room_history", room_id: id, hours });
+      this._rh = { id, hours, at: Date.now(), points: d.points };
+      const el = this._wrap && this._wrap.querySelector(".rc-hist");
+      if (el && this._sel === id) el.outerHTML = this._roomChart(this._data.rooms.find(r => r.id === id));
+    } catch (e) { this._rh = { id, hours, at: Date.now(), points: [] }; }
+    finally { this._rhBusy = false; }
+  }
+
+  // Reading (solid) against its target (dashed step) with the room's allowed-error band, from the 5-minute samples.
+  _roomChart(room) {
+    const hours = this._rhHours || 24, c = this._rh;
+    const btns = [6, 24, 72].map(h => `<button data-act="rh" data-h="${h}" class="${h === hours ? "on" : ""}">${h} h</button>`).join("");
+    const head = `<div class="rc-chips" style="margin:4px 0">${btns}</div>`;
+    const pts = c && c.id === room.id && c.hours === hours ? c.points : null;
+    if (!pts) return `<div class="rc-hist">${head}<p class="rc-sub">Loading…</p></div>`;
+    if (pts.length < 2) return `<div class="rc-hist">${head}<p class="rc-sub">No history yet.</p></div>`;
+    const W = 320, H = 170, L = 34, R = 8, T = 8, B = 20;
+    const ms = pts.map(p => Date.parse(p[0])), t1 = Date.now(), t0 = t1 - hours * 3600000;
+    const vals = pts.flatMap(p => [p[1], p[2]]).filter(v => v != null);
+    let lo = Math.floor(Math.min(...vals) - 1), hi = Math.ceil(Math.max(...vals) + 1);
+    if (hi - lo < 4) { lo -= 1; hi += 1; }
+    const x = t => L + (W - L - R) * (t - t0) / (t1 - t0), y = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+    const step = Math.max(1, Math.ceil((hi - lo) / 5));
+    let g = "";
+    for (let v = Math.ceil(lo / step) * step; v <= hi; v += step)
+      g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="currentColor" stroke-opacity=".12"/>` +
+           `<text x="${L - 4}" y="${y(v) + 4}" text-anchor="end" font-size="10" fill="currentColor" fill-opacity=".6">${v}°</text>`;
+    const tick = hours <= 6 ? 1 : hours <= 24 ? 6 : 24;
+    for (let t = Math.ceil(t0 / (tick * 3600000)) * tick * 3600000; t <= t1; t += tick * 3600000) {
+      const d = new Date(t), lbl = tick >= 24 ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()] : `${d.getHours() % 12 || 12}${d.getHours() < 12 ? "a" : "p"}`;
+      g += `<text x="${x(t)}" y="${H - 5}" text-anchor="middle" font-size="10" fill="currentColor" fill-opacity=".6">${lbl}</text>`;
+    }
+    const ok = pts.filter(p => p[1] != null && p[2] != null);
+    const seg = (f) => ok.map((p, i) => `${i ? "L" : "M"}${x(Date.parse(p[0])).toFixed(1)},${y(f(p)).toFixed(1)}`).join("");
+    const stepPath = ok.map((p, i) => `${i ? `H${x(Date.parse(p[0])).toFixed(1)}V` : "M"}${i ? "" : x(Date.parse(p[0])).toFixed(1) + ","}${y(p[2]).toFixed(1)}`).join("");
+    const band = ok.length ? `<path d="${ok.map((p, i) => `${i ? "L" : "M"}${x(Date.parse(p[0])).toFixed(1)},${y(p[2] + allowable(p[3] || 1)).toFixed(1)}`).join("")}` +
+      `${[...ok].reverse().map(p => `L${x(Date.parse(p[0])).toFixed(1)},${y(p[2] - allowable(p[3] || 1)).toFixed(1)}`).join("")}Z" fill="var(--primary-color, #03a9f4)" fill-opacity=".14"/>` : "";
+    const last = ok[ok.length - 1];
+    return `<div class="rc-hist">${head}<svg viewBox="0 0 ${W} ${H}" style="width:100%;display:block">${g}${band}` +
+      `<path d="${stepPath}" fill="none" stroke="currentColor" stroke-opacity=".7" stroke-width="1.5" stroke-dasharray="4 3"/>` +
+      `<path d="${seg(p => p[1])}" fill="none" stroke="var(--primary-color, #03a9f4)" stroke-width="2" stroke-linejoin="round"/></svg>` +
+      `<div class="rc-legend"><span><b style="color:var(--primary-color, #03a9f4)">━</b> temperature ${last ? last[1] + "°" : ""}</span><span>┅ target ${last ? last[2] + "°" : ""}</span><span>▒ allowed error</span></div></div>`;
   }
 
   // A unit's real state (from HA) next to what the controller wants. Shared by the home panel and diagnostics.
