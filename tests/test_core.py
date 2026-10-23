@@ -406,7 +406,7 @@ def test_priority_schedule_steps_and_falls_back_to_fixed_priority():
     assert core.room_priority(r, day.replace(hour=22)) == 5
     assert core.room_priority(r, day.replace(hour=7)) == 5  # Sunday had no entry, so Friday 20:00 carries
     assert core.room_priority(Room("x", "X", "u", priority=4), day) == 4
-    assert core.room_priority(Room("x", "X", "u", priority=9), day) == 5  # clamped
+    assert core.room_priority(Room("x", "X", "u", priority=9), day) == 9  # weights are no longer capped at 5
 
 
 def test_priority_schedule_shifts_unit_toward_the_room_in_use():
@@ -828,3 +828,31 @@ def test_model_fallback_is_on_unless_the_owner_turns_it_off():
     assert core.settings_from({}).model_fallback is True
     assert core.settings_from({"model_fallback": False}).model_fallback is False
     assert core.settings_from({"not_a_setting": 1}).model_fallback is True  # unknown names are ignored
+
+
+def test_allowable_error_is_the_inverse_square_root_of_the_weight():
+    assert core.allowable_error(1) == 1.0
+    assert abs(core.allowable_error(4) - 0.5) < 1e-9
+    assert abs(core.allowable_error(25) - 0.2) < 1e-9
+    assert abs(core.allowable_error(4, ref=2.0) - 1.0) < 1e-9
+    for w in (0.5, 1, 3, 10):  # the planner's multiplier is the miss measured in allowable errors; ref 1 = the weight itself
+        assert abs(core.error_weight(w) - w) < 1e-9
+
+
+def test_weights_beyond_five_are_kept_and_clamped():
+    now = datetime(2026, 10, 23, 12)
+    assert core.room_priority(Room("a", "A", "u", priority=10), now) == 10
+    assert core.room_priority(Room("a", "A", "u", priority=2.5), now) == 2.5
+    assert core.room_priority(Room("a", "A", "u", priority=1000), now) == core.MAX_PRIORITY
+
+
+def test_house_error_is_weighted_and_shares_add_up():
+    now = datetime(2026, 10, 23, 12)
+    a = Room("a", "A", "u", priority=9, default_temp=68)
+    b = Room("b", "B", "u", priority=1, default_temp=68)
+    s = core.house_error([a, b], {"a": 69.0, "b": 65.0}, now)
+    assert abs(s["weighted_rms_F"] - ((9 * 1 + 1 * 9) / 10) ** 0.5) < 1e-3
+    assert abs(sum(r["share"] for r in s["rooms"]) - 1) < 0.01
+    by = {r["id"]: r for r in s["rooms"]}
+    assert by["a"]["allowable_F"] == 0.33 and by["a"]["within"] is False and by["b"]["allowable_F"] == 1.0
+    assert core.house_error([a], {}, now) is None

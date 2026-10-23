@@ -57,12 +57,18 @@ FIT_DAYS = 14  # fit on this many days of the minute log
 HISTORY_H = 72  # the Model page's charts reach back this far (5-minute samples, rebuilt from the minute log)
 
 
+def _weight(v):
+    """A weight from stored or sent data: whole numbers stay ints (as the old priorities 1-5), fractions are kept."""
+    v = float(v)
+    return int(v) if v == int(v) else v
+
+
 def _room_from_dict(d: dict) -> core.Room:
     return core.Room(
         id=d["id"], name=d.get("name", d["id"]), unit=d.get("unit"), sensor=d.get("sensor"),
-        priority=int(d.get("priority", 3)), default_temp=float(d.get("default_temp", 68)),
+        priority=_weight(d.get("priority", 3)), default_temp=float(d.get("default_temp", 68)),
         schedule=[core.ScheduleEntry(list(e["days"]), e["start"], float(e["temp"])) for e in d.get("schedule", [])],
-        priority_schedule=[core.PriorityEntry(list(e["days"]), e["start"], int(e["priority"]))
+        priority_schedule=[core.PriorityEntry(list(e["days"]), e["start"], _weight(e["priority"]))
                            for e in d.get("priority_schedule", [])],
         hold_temp=d.get("hold_temp"),
         hold_until=dt_util.parse_datetime(d["hold_until"]) if d.get("hold_until") else None,
@@ -898,6 +904,10 @@ class Manager:
             c, h = info.get("rooms", {}).get(r.id, (None, None))
             row["rooms"][r.id] = {"temp": num(val), "target": core.target_temp(r, now), "prio": core.room_priority(r, now),
                                   "pred": num(predicted.get(r.id)), "unit": r.unit, "cold": c, "hot": h}
+        hs = core.house_error([r for r in rooms if r.sensor], {r.id: row["rooms"][r.id]["temp"] for r in rooms if r.id in row["rooms"]},
+                              now, core.settings_from(self.data.get("settings")))
+        if hs:
+            row["score"] = hs["weighted_rms_F"]  # whole-house weighted tracking error
         extra_ids = set()
         for u in units:
             cur, cmd = self.hass.states.get(u.entity), self.last.get(u.id)
@@ -1110,8 +1120,16 @@ class Manager:
             r = _room_from_dict(rd)
             val, _ = self._f(r.sensor) if r.sensor else (None, None)
             c = self.last.get(r.unit)
-            out["live"][r.id] = {"temp": val, "target": core.target_temp(r, now), "priority": core.room_priority(r, now),
+            w = core.room_priority(r, now)
+            out["live"][r.id] = {"temp": val, "target": core.target_temp(r, now), "priority": w,
+                                 "allowable": round(core.allowable_error(w, core.settings_from(self.data.get("settings")).allowable_ref_f), 2),
                                  "mode": c.mode if c else "off", "reason": c.reason if c else ""}
+        try:  # the whole-house tracking error, and each room's share of it
+            rooms_now = [_room_from_dict(rd) for rd in self.data["rooms"]]
+            out["score"] = core.house_error(rooms_now, {r.id: out["live"][r.id]["temp"] for r in rooms_now}, now,
+                                            core.settings_from(self.data.get("settings")))
+        except Exception:  # noqa: BLE001 - a display extra must never break the snapshot
+            out["score"] = None
         return out
 
 
@@ -1136,13 +1154,13 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
 
     @websocket_api.websocket_command({
         "type": f"{DOMAIN}/set_room", vol.Required("room_id"): str,
-        vol.Optional("priority"): vol.All(int, vol.Range(min=1, max=5)),
+        vol.Optional("priority"): vol.All(vol.Coerce(float), vol.Range(min=core.MIN_PRIORITY, max=core.MAX_PRIORITY)),
         vol.Optional("default_temp"): vol.Coerce(float),
         vol.Optional("schedule"): list,
         vol.Optional("priority_schedule"): [vol.Schema({
             vol.Required("days"): [vol.All(int, vol.Range(min=0, max=6))],
             vol.Required("start"): vol.Match(r"^\d{2}:\d{2}$"),
-            vol.Required("priority"): vol.All(int, vol.Range(min=1, max=5))})],
+            vol.Required("priority"): vol.All(vol.Coerce(float), vol.Range(min=core.MIN_PRIORITY, max=core.MAX_PRIORITY))})],
         vol.Optional("hold_temp"): vol.Any(None, vol.Coerce(float)),
         vol.Optional("hold_hours"): vol.Any(None, vol.Coerce(float)),
         vol.Optional("sensor"): vol.Any(None, vol.Match(r"^(sensor|climate)\.[a-z0-9_]+$")),

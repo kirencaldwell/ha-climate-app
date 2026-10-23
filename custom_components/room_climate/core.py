@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 
-MIN_PRIORITY, MAX_PRIORITY = 1, 5
+MIN_PRIORITY, MAX_PRIORITY = 0.1, 100.0  # a room's weight: the exchange rate between rooms' errors (was 1..5)
 
 
 @dataclass
@@ -100,6 +100,7 @@ class Settings:
     vote_exclude_coast: bool = False  # the older patch: rooms coasting after their unit stops sit out the vote
     model_fallback: bool = True  # hand units under model control back to Room Climate when the model stops predicting well
     # (off: they stay on the model, and a notification says it isn't ready; the owner's call)
+    allowable_ref_f: float = 1.0  # the error (F) a weight-1 room may have: larger counts comfort for less against cycling/energy
     min_cost: float = 0.05  # demand below this counts as comfortable
     start_cost: float = 1.0  # demand needed to leave "off" (then confirmed for switch_confirm_s like any mode switch)
     max_offset: float = 6.0  # clamp on sensor-vs-unit-sensor compensation
@@ -251,12 +252,48 @@ def target_temp(room: Room, now: datetime) -> float:
     return room.hold_temp if _hold_active(room, now) else scheduled_temp(room, now)
 
 
+def allowable_error(weight: float, ref: float = 1.0) -> float:
+    """The error (F) a room with this weight may have: `ref` at weight 1, falling as 1/sqrt(weight). A weight is an
+    exchange rate (1 F of error in a weight-4 room costs as much as 4 F in a weight-1 room), which
+    is the same thing as saying how large an error each room is allowed before it matters as much as 1 F of `ref`."""
+    return ref / math.sqrt(max(weight, 1e-9))
+
+
+def error_weight(weight: float, ref: float = 1.0) -> float:
+    """What the planner multiplies a room's squared miss by: 1 / allowable_error(weight)^2, i.e. the miss measured in
+    units of the room's allowable error. At the default ref of 1 F this is the weight itself."""
+    return 1.0 / allowable_error(weight, ref) ** 2
+
+
+def house_error(rooms: list, temps: dict, now: datetime, settings: "Settings" = None) -> Optional[dict]:
+    """The whole-house tracking error: sqrt(sum w_i e_i^2 / sum w_i) over the rooms with a unit and a reading, e = reading -
+    target, with each room's weight, allowable error and share of the total. None when nothing has a reading."""
+    s = settings or Settings()
+    items, num, den = [], 0.0, 0.0
+    for r in rooms:
+        v = temps.get(r.id)
+        if r.unit is None or v is None:
+            continue
+        w = room_priority(r, now)
+        e = v - target_temp(r, now)
+        num += w * e * e
+        den += w
+        items.append({"id": r.id, "weight": w, "allowable_F": round(allowable_error(w, s.allowable_ref_f), 2), "error_F": round(e, 2), "_c": w * e * e})
+    if not den:
+        return None
+    for it in items:
+        it["share"] = round(it.pop("_c") / num, 3) if num > 0 else 0.0
+        it["within"] = abs(it["error_F"]) <= it["allowable_F"]
+    return {"weighted_rms_F": round((num / den) ** 0.5, 3), "rooms": items}
+
+
 def room_priority(room: Room, now: datetime) -> int:
-    """Priority in force now: the latest priority-schedule entry at or before `now` (looking back up to a week),
+    """Priority (weight) in force now: the latest priority-schedule entry at or before `now` (looking back up to a week),
     else the room's fixed priority. Clamped to MIN_PRIORITY..MAX_PRIORITY."""
     past = [x for x in _entry_times(room, now, range(8), room.priority_schedule, lambda e: e.priority) if x[0] <= now]
     p = max(past)[1] if past else room.priority
-    return max(MIN_PRIORITY, min(MAX_PRIORITY, int(p)))
+    p = max(MIN_PRIORITY, min(MAX_PRIORITY, float(p)))
+    return int(p) if p == int(p) else p  # whole weights stay ints, as when they were priorities 1-5
 
 
 def weighted_error(rooms: list[Room], readings: dict[str, tuple[float, datetime]],
@@ -320,7 +357,7 @@ def room_costs(room: Room, current: float, predicted: Optional[float], now: date
     With `free_delta` set and an outdoor temperature, comfort demand the weather will settle by itself is dropped;
     the hard floor/ceiling always count."""
     t = target_temp(room, now)
-    w = room_priority(room, now)
+    w = error_weight(room_priority(room, now), settings.allowable_ref_f)
     lo = current if predicted is None else min(current, predicted)
     hi = current if predicted is None else max(current, predicted)
     free = settings.free_delta is not None and outdoor is not None

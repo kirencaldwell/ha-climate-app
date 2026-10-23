@@ -14,11 +14,20 @@
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const TEMP_MIN = 55, TEMP_MAX = 85;  // schedule editor range (F)
 // The chart editor edits either schedule: what each point's value is, its range and gridlines, and how it's shown.
+// A room's weight is an exchange rate between rooms' errors: 1 °F of error in a weight-w room costs as much as w °F in a
+// weight-1 room, i.e. the room is allowed 1/√w °F. The weight schedule is edited on this ladder (by index).
+const LADDER = [0.5, 1, 2, 3, 4, 5, 10, 25, 100];
+const nearestRung = w => LADDER.reduce((b, v, i) => Math.abs(Math.log(v / w)) < Math.abs(Math.log(LADDER[b] / w)) ? i : b, 0);
+const allowable = w => +(1 / Math.sqrt(Math.max(w, 0.01))).toFixed(2);
+const fmtW = w => `${+(+w).toFixed(2)}`;
+const pipsOn = w => Math.min(5, Math.ceil(Math.log2(w + 1)));
+const pipsHtml = w => `<span class="rc-pips" title="Weight ${fmtW(w)} · allowed error ±${allowable(w)}°">${[1, 2, 3, 4, 5].map(n => `<b class="${n <= pipsOn(w) ? "on" : ""}"></b>`).join("")}</span>`;
 const SCHED_KINDS = {
   temp: { key: "schedule", field: "temp", title: "Schedule", lo: TEMP_MIN, hi: TEMP_MAX, grid: 5, fmt: v => `${v}°`, def: r => r.default_temp,
           hint: "The temperature holds until the next point" },
-  prio: { key: "priority_schedule", field: "priority", title: "Priority schedule", lo: 1, hi: 5, grid: 1, fmt: v => `P${v}`, def: r => r.priority,
-          hint: "The priority holds until the next point (5 = matters most)" },
+  prio: { key: "priority_schedule", field: "priority", title: "Weight schedule", lo: 0, hi: LADDER.length - 1, grid: 1, fmt: v => `w${LADDER[v]}`, def: r => nearestRung(r.priority),
+          enc: w => nearestRung(w), dec: v => LADDER[v],
+          hint: "The weight holds until the next point. A room of weight w is allowed about 1/√w °F of error (1 → 1°, 4 → 0.5°, 25 → 0.2°); the planner trades errors between rooms at that rate" },
 };
 
 const toMin = s => { const [h, m] = s.split(":"); return +h * 60 + +m; };
@@ -314,15 +323,16 @@ class RoomMapCard extends HTMLElement {
       .sort((a, b) => toMin(a.start) - toMin(b.start))
       .map(e => `${fmtTime(toMin(e.start))} → ${fmt(e)}`).join(" · ");
     const today = todayOf(room.schedule, e => `${e.temp}°`);
-    const ptoday = todayOf(room.priority_schedule, e => `P${e.priority}`);
+    const ptoday = todayOf(room.priority_schedule, e => `w${fmtW(e.priority)}`);
     const pnow = live.priority ?? room.priority;
     el.innerHTML = `<h3>${room.name}</h3>
       <p class="rc-sub">${reading} · target ${live.target}° · ${((this._data.units_live || {})[room.unit] || {}).control === "room_climate"
         ? `Room Climate in control · unit ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}`
         : `<span style="color:#ffd166">thermostat in control</span> · Room Climate would ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}`}</p>
       <div class="rc-row"><span class="rc-lbl">Default temp</span>${step("def", room.default_temp)}</div>
-      <div class="rc-row"><span class="rc-lbl">${(room.priority_schedule || []).length ? "Default priority" : "Priority"}</span>
-        <div class="rc-chips">${[1, 2, 3, 4, 5].map(n => `<button data-act="prio" data-v="${n}" class="${n === room.priority ? "on" : ""}">${n}</button>`).join("")}</div></div>
+      <div class="rc-row"><span class="rc-lbl">${(room.priority_schedule || []).length ? "Default weight" : "Weight"}</span>
+        <div class="rc-chips" title="Exchange rate between rooms' errors; allowed error is about 1/√weight °F">${LADDER.map(n => `<button data-act="prio" data-v="${n}" class="${n === +room.priority ? "on" : ""}">${n}</button>`).join("")}</div></div>
+      <p class="rc-sub" style="margin:0 0 6px">Weight now ${fmtW(pnow)} → allowed error ±${allowable(pnow)}°</p>
       <div class="rc-sect"><h4>Hold${holding ? " · active" : ""}</h4>
         <div class="rc-row"><span class="rc-lbl">Hold at</span>${step("hold-step", holdVal)}</div>
         <div class="rc-row"><span class="rc-lbl">For</span><div class="rc-chips">
@@ -384,7 +394,7 @@ class RoomMapCard extends HTMLElement {
     const pr = top.map(r => {
       const c = r.delta == null ? "" : r.delta > db ? "hot" : r.delta < -db ? "cold" : "ok";
       return `<button class="rc-pr" data-room="${r.id}"><span class="nm">${r.name}${r.drv ? `<span class="star" title="Driving its unit">★</span>` : ""}
-        <span class="rc-pips" title="Priority ${r.priority}">${[1, 2, 3, 4, 5].map(n => `<b class="${n <= r.priority ? "on" : ""}"></b>`).join("")}</span></span>
+        ${pipsHtml(r.priority)}</span>
         <span class="rc-d ${c}">${r.temp == null ? "—" : r.temp.toFixed(1) + "°"} <small>→ ${r.target}°</small></span></button>`;
     }).join("");
     const ex = d.experiment, hm = iso => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
@@ -457,7 +467,7 @@ class RoomMapCard extends HTMLElement {
     const rows = units.flatMap(u => ((ul[u.id] || {}).rooms || []).map(r => ({ ...r, drv: ul[u.id].rooms.length > 1 && ul[u.id].driver === r.id })))
       .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name))
       .map(r => `<button class="rc-rm" data-room="${r.id}"><span class="nm">${r.name}${r.drv ? `<span class="star" title="Driving its unit">★</span>` : ""}
-          <span class="rc-pips" title="Priority ${r.priority}">${[1, 2, 3, 4, 5].map(n => `<b class="${n <= r.priority ? "on" : ""}"></b>`).join("")}</span></span>
+          ${pipsHtml(r.priority)}</span>
         ${gauge(r.delta)}<span class="t">${r.temp == null ? "—" : r.temp.toFixed(1) + "°"}</span></button>`).join("");
     const monRooms = d.rooms.filter(r => !r.unit);
     const mon = monRooms.map(r => { const l = (d.live || {})[r.id] || {};
@@ -468,7 +478,8 @@ class RoomMapCard extends HTMLElement {
       ${d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 4px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}</p>` : ""}
       <p class="rc-sub" style="margin:0">${running} of ${units.length} units running</p>
       <div class="rc-units">${tiles}</div>
-      <div class="rc-sect"><h4>Rooms · by priority</h4>
+      <div class="rc-sect"><h4>Rooms · by weight</h4>
+        ${this._scoreLine()}
         <div class="rc-rows">${rows}</div>
         <div class="rc-legend"><span>▼ colder than target</span><span>on target</span><span>warmer ▲</span></div></div>
       ${mon ? `<div class="rc-sect"><h4>Monitor only</h4><div class="rc-chips2">${mon}</div></div>` : ""}`;
@@ -781,7 +792,7 @@ class RoomMapCard extends HTMLElement {
     this._closeSchedule();
     const k = SCHED_KINDS[kind];
     const days = DAYS.map((_, d) => (room[k.key] || []).filter(e => e.days.includes(d))
-      .map(e => ({ m: toMin(e.start), t: e[k.field] })).sort((a, b) => a.m - b.m));
+      .map(e => ({ m: toMin(e.start), t: k.enc ? k.enc(e[k.field]) : e[k.field] })).sort((a, b) => a.m - b.m));
     // Every day gets an explicit 12:00 AM point (fixed in time) so the ends of the curve don't depend on other points.
     // Seeded with the temperature already in force, so existing behavior is unchanged. A day's end is the next day's start.
     const starts = days.map((_, d) => RoomMapCard._carryFor(days, d, k.def(room)));
@@ -919,7 +930,7 @@ class RoomMapCard extends HTMLElement {
     switch (b.dataset.x) {
       case "cancel": this._closeSchedule(); return;
       case "save": {
-        const k = ed.k, sched = this._toSchedule(ed.days, k.field);
+        const k = ed.k, sched = this._toSchedule(ed.days, k.field, k.dec);
         this._closeSchedule();
         this._set({ [k.key]: sched });
         return;
@@ -946,11 +957,19 @@ class RoomMapCard extends HTMLElement {
   }
 
   // Per-day point lists -> schedule entries, merging days that share an identical (time, value) point.
-  _toSchedule(days, field = "temp") {
+  // The whole-house tracking error: sqrt(Σ w·e² / Σ w), and the room that contributes most of it.
+  _scoreLine() {
+    const sc = (this._data || {}).score;
+    if (!sc) return "";
+    const top = [...sc.rooms].sort((a, b) => b.share - a.share)[0];
+    const name = id => ((this._data.rooms || []).find(r => r.id === id) || {}).name || id;
+    return `<p class="rc-sub" style="margin:0 0 6px" title="Weighted RMS of (reading − target) over rooms with a unit">House error <b>${sc.weighted_rms_F}°</b>${top ? ` · most from ${name(top.id)} (${Math.round(top.share * 100)}%, ${top.error_F > 0 ? "+" : ""}${top.error_F}° vs ±${top.allowable_F}° allowed)` : ""}</p>`;
+  }
+  _toSchedule(days, field = "temp", dec = null) {
     const by = new Map();
     days.forEach((pts, d) => pts.forEach(p => {
       const key = `${p.m}|${p.t}`;
-      if (!by.has(key)) by.set(key, { days: [], start: toHHMM(p.m), [field]: p.t });
+      if (!by.has(key)) by.set(key, { days: [], start: toHHMM(p.m), [field]: dec ? dec(p.t) : p.t });
       by.get(key).days.push(d);
     }));
     return [...by.values()].sort((a, b) => toMin(a.start) - toMin(b.start));
