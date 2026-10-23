@@ -287,7 +287,27 @@ OE_PRIOR = 0.01  # pull toward the slope fit, relative to each parameter's curva
 
 
 MASS_TAUS_H = (0.5, 1.0, 2.0, 4.0, 8.0)  # candidate mass time constants for refine_mass
+PULSE_TAUS_MIN = (12, 25)  # candidate decay times (min) of the start-up pulse, choose_pulse
+PULSE_SIZES = (0.0, 6.0, 12.0)  # candidate sizes (F/h), with the room's constant leak kept whole or halved
+PULSE_MIN_LEAK = 1.0  # F/h of fitted leak a room must have before it's offered a start-up pulse
+PULSE_MIN_GAIN = 0.03  # share the combined (training + held-out) 2 h error must fall by for the pulse to be kept
+PULSE_MAX_WORSE = 0.01  # ... while neither part may get this much worse
 MASS_K_MAX = 20.0  # 1/h: the air settling on its mass within a few minutes is as fast as 5-minute steps can follow
+
+
+def comp_on_series(Y: dict) -> list:
+    """Per minute: 1 while any unit is running (the shared compressor is on), else 0."""
+    n = max((len(v) for v in Y.values()), default=0)
+    return [1 if any(abs(v[i]) > 1e-9 for v in Y.values() if i < len(v)) else 0 for i in range(n)]
+
+
+def pulse_shapes(on: list, tau_min: float) -> list:
+    """Per minute exp(-t_on / tau) while the compressor is on (t_on: minutes since it started), 0 while off."""
+    out, t = [], 0
+    for o in on:
+        t = t + 1 if o else 0
+        out.append(pow(2.718281828459045, -(t - 0.5) / tau_min) if o else 0.0)
+    return out
 
 
 def mass_series(v: list, tau_h: float) -> list:
@@ -304,7 +324,7 @@ def mass_series(v: list, tau_h: float) -> list:
 
 def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: dict, Lk: dict, end: int,
                  horizon: int = OE_HORIZON_MIN, step: int = OE_STEP_MIN, every: int = OE_EVERY_MIN,
-                 iters: int = OE_ITERS, tau_h: float = 0.0):
+                 iters: int = OE_ITERS, tau_h: float = 0.0, Pk: list = None, pulse_tau_min: float = 0.0):
     """Refine one room's parameters (from the slope fit) so that its simulated paths match its readings.
 
     From every `every` minutes of its training part (before `end`), the room is simulated `horizon` minutes ahead the
@@ -313,12 +333,17 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
     step along every path is minimised by projected Levenberg-Marquardt with forward sensitivities (the model is linear
     in its parameters but a path isn't: the room's own temperature feeds back through loss and coupling). Parameters
     stay >= 0 except bias. With `tau_h`, the room gets a mass state of that time constant, starting each path from
-    mass_series, and its coupling to the air (mass_k) is fitted too. -> (room model, report)."""
+    mass_series, and its coupling to the air (mass_k) is fitted too. With `Pk` (per minute exp(-t_on / tau) while the
+    compressor runs, see pulse_shapes) the room gets a start-up pulse whose size (F/h) is fitted too. -> (room model,
+    report)."""
     nbrs, us, own = list(rm.coupling), list(rm.heat), list(rm.leak)
     names = (["loss"] + [f"c:{j}" for j in nbrs] + ["solar"] + [f"sun:{k}" for k in hm.WALLS] + ["bias"]
              + [f"h:{u}" for u in us] + [f"k:{u}" for u in us] + [f"l:{u}" for u in own])
     th0 = ([rm.loss] + [rm.coupling[j] for j in nbrs] + [rm.solar] + [rm.sun_dir.get(k, 0.0) for k in hm.WALLS]
            + [rm.bias] + [rm.heat[u] for u in us] + [rm.cool[u] for u in us] + [rm.leak[u] for u in own])
+    if Pk is not None:
+        names.append("pulse")
+        th0.append(rm.leak_pulse if rm.leak_pulse_tau_h * 60 == pulse_tau_min else 0.0)
     if tau_h > 0:
         names.append("mass")
         th0.append(rm.mass_k if rm.mass_tau_h == tau_h else 0.0)
@@ -343,7 +368,7 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
             g = ([sv.get("h", 0.0)] + [sv.get(w, 0.0) for w in hm.WALLS] + [1.0]
                  + [sum(max(0.0, y) for y in Ye[u][sl]) / step for u in us]
                  + [sum(min(0.0, y) for y in Ye[u][sl]) / step for u in us]
-                 + [sum(Lk[u][sl]) / step for u in own])
+                 + [sum(Lk[u][sl]) / step for u in own] + ([sum(Pk[sl]) / step] if Pk is not None else []))
             steps.append((o, nb, g, Tr[k + step] if k + step < len(Tr) else None))
         if sum(st[3] is not None for st in steps) >= 3:
             segs.append((Tr[a], Ms[a] if Ms else None, steps))
@@ -433,9 +458,57 @@ def refine_paths(rid: str, rm: hm.RoomModel, T: dict, out: list, sun: list, Ye: 
                        sun_dir={k: round(q[f"sun:{k}"], 3) for k in hm.WALLS},
                        heat={u: round(q[f"h:{u}"], 3) for u in us}, cool={u: round(q[f"k:{u}"], 3) for u in us},
                        coupling={j: round(q[f"c:{j}"], 4) for j in nbrs}, leak={u: round(q[f"l:{u}"], 3) for u in own},
-                       mass_k=round(q.get("mass", 0.0), 4), mass_tau_h=tau_h if q.get("mass", 0.0) > 0 else 0.0)
+                       mass_k=round(q.get("mass", 0.0), 4), mass_tau_h=tau_h if q.get("mass", 0.0) > 0 else 0.0,
+                       leak_pulse=round(q.get("pulse", 0.0), 3),
+                       leak_pulse_tau_h=round(pulse_tau_min / 60, 5) if q.get("pulse", 0.0) > 0 else 0.0)
     return new, {"paths": len(segs), "iters": it, "path_rmse_slope_fit_F": round((c0 / cnt) ** 0.5, 2),
                  "path_rmse_F": round((c / cnt) ** 0.5, 2), "sse": c}
+
+
+def choose_pulse(m: hm.HouseModel, rid: str, ts, T, out, sun, Y, splits, L, comp_on):
+    """A start-up pulse for a room with a leak: extra heat right after the compressor starts, decaying with time constant
+    from PULSE_TAUS_MIN, of a size from PULSE_SIZES, with the room's constant leak kept or halved (a pulse replaces most
+    of a leak that was really a start-up effect). Scored on the room's 2 h predictions with every room simulated together,
+    as the planner uses the model (the path fit gives each room its neighbours' real temperatures, which hides a pulse
+    that is really a neighbour warming up), on its training part and on its held-out part. Kept only if it helps over
+    both together by PULSE_MIN_GAIN and makes neither part worse by more than PULSE_MAX_WORSE: a pulse that helps in one
+    stretch of the log only is not a pulse. The held-out part moves forward every night, so a pulse that stops holding up
+    on new data is dropped at the next fit. -> report dict (m is changed when kept)."""
+    rm = m.rooms[rid]
+    leak0 = dict(rm.leak)
+    if sum(abs(v) for v in leak0.values()) < PULSE_MIN_LEAK:
+        return None
+
+    def score(size, tau, keep):
+        rm.leak = {u: v * keep for u, v in leak0.items()}
+        rm.leak_pulse, rm.leak_pulse_tau_h = size, (tau / 60 if size else 0.0)
+        tr = validate(m, ts, T, out, sun, Y, splits, L, every_min=60, comp_on=comp_on, train_span=True, only=rid)[rid]
+        ho = validate(m, ts, T, out, sun, Y, splits, L, every_min=60, comp_on=comp_on, only=rid)[rid]
+        if tr["model_rmse_F"] is None or ho["model_rmse_F"] is None:
+            return None
+        n1, n2 = tr["n"], ho["n"]
+        comb = ((n1 * tr["model_rmse_F"] ** 2 + n2 * ho["model_rmse_F"] ** 2) / (n1 + n2)) ** 0.5
+        return tr["model_rmse_F"], ho["model_rmse_F"], comb
+
+    base = score(0.0, PULSE_TAUS_MIN[0], 1.0)
+    best = None
+    if base is not None:
+        for size in PULSE_SIZES[1:]:
+            for tau in PULSE_TAUS_MIN:
+                for keep in (1.0, 0.5):
+                    sc = score(size, tau, keep)
+                    if sc and sc[0] <= base[0] * (1 + PULSE_MAX_WORSE) and sc[1] <= base[1] * (1 + PULSE_MAX_WORSE) \
+                            and sc[2] <= base[2] * (1 - PULSE_MIN_GAIN) and (best is None or sc[2] < best[0][2]):
+                        best = (sc, size, tau, keep)
+    kept = best is not None
+    sc, size, tau, keep = best if kept else (base, 0.0, 0, 1.0)
+    rm.leak = {u: v * (keep if kept else 1.0) for u, v in leak0.items()}
+    rm.leak_pulse, rm.leak_pulse_tau_h = (size, tau / 60) if kept else (0.0, 0.0)
+    info = {"kept": kept, "base_train_holdout_rmse_F": None if base is None else [round(base[0], 3), round(base[1], 3)]}
+    if kept:
+        info.update({"pulse_f_per_h": size, "tau_min": tau, "leak_kept": keep,
+                     "with_pulse_train_holdout_rmse_F": [round(sc[0], 3), round(sc[1], 3)]})
+    return info
 
 
 def refine_mass(rid: str, rm: hm.RoomModel, *args, **kw):
@@ -454,13 +527,14 @@ def refine_mass(rid: str, rm: hm.RoomModel, *args, **kw):
 
 
 def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: float = 0.25, lam: float = 1e-3,
-        paths: bool = True, mass: bool = True):
+        paths: bool = True, mass: bool = True, pulse: bool = True):
     """-> (HouseModel, report). layout: {"rooms": {id: {"units": [...], "neighbors": [...]}},
     "units": {id: {"sensor_rooms": [...] (optional: detected when missing), "zone": [...]}}}"""
     rooms, units = list(layout["rooms"]), list(layout["units"])
     learned_out = fit_outputs(rows, units)
     rule = {u: hm.UnitModel(k0=v["k0"], k1=v["k1"], ymin=v["ymin"]) for u, v in learned_out.items()}
     ts, T, out, sun, Y, U, F, Lk = series(rows, rooms, units, rule)
+    comp_on = comp_on_series(Y)
     n = len(ts)
     # A room's readings from before its `since` (a sensor that was replaced or moved) aren't the room: leave them out.
     for rid, spec in layout["rooms"].items():
@@ -612,7 +686,29 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
     report["lags_min"] = lags
     report["fan_scale"] = {u: {"relative_to": ref_fan.get(u), **v} for u, v in scales.items() if v}
     Yv, sp_v = effective(Y, F, m), {r: splits[r] for r in m.rooms}
-    report["holdout"] = validate(m, ts, T, out, sun, Yv, sp_v, Lk)
+    if pulse:
+        for rid in list(m.rooms):
+            info = choose_pulse(m, rid, ts, T, out, sun, Yv, sp_v, Lk, comp_on)
+            if info and isinstance(report.get(rid), dict):
+                report[rid]["pulse"] = info
+    report["holdout"] = validate(m, ts, T, out, sun, Yv, sp_v, Lk, comp_on=comp_on)
+    # A start-up pulse stays only in rooms where it does not make the held-out predictions worse.
+    pulsed = [r for r, rm_ in m.rooms.items() if rm_.leak_pulse]
+    if pulsed:
+        saved = {r: (m.rooms[r].leak_pulse, m.rooms[r].leak_pulse_tau_h, dict(m.rooms[r].leak)) for r in pulsed}
+        for r in pulsed:  # without the pulse: its start-up effect and the halving of the constant leak both undone
+            keep = report[r]["pulse"].get("leak_kept", 1.0)
+            m.rooms[r].leak_pulse = m.rooms[r].leak_pulse_tau_h = 0.0
+            m.rooms[r].leak = {u: v / keep for u, v in m.rooms[r].leak.items()}
+        plain = validate(m, ts, T, out, sun, Yv, sp_v, Lk, comp_on=comp_on)
+        for r, (a, tau, leak_p) in saved.items():
+            with_p, without = report["holdout"][r]["model_rmse_F"], plain[r]["model_rmse_F"]
+            if with_p is not None and without is not None and with_p <= without * 1.02:
+                m.rooms[r].leak_pulse, m.rooms[r].leak_pulse_tau_h, m.rooms[r].leak = a, tau, leak_p
+                report[r]["pulse"]["holdout_rmse_F"] = [without, with_p]
+            else:
+                report[r]["pulse"] = {"dropped": f"held-out {with_p} vs {without} without it"}
+        report["holdout"] = validate(m, ts, T, out, sun, Yv, sp_v, Lk, comp_on=comp_on)
     report["split"] = ts[split].isoformat() if 0 <= split < n else None  # trained before this, tested after
     # Every room with enough held-out checks must beat "nothing changes"; at least one must have been checked. A room
     # whose sensor only just started may have none yet: the live accuracy gate (mpc.readiness) still covers it.
@@ -627,14 +723,18 @@ def fit(rows: list, layout: dict, window: int = 30, stride: int = 10, holdout: f
 
 
 def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, L=None, horizon_min: int = 120, step_min: int = 5,
-             every_min: int = 30):
-    """2 h ahead on the held-out part with the units at their logged output: RMSE of the model vs 'nothing changes'."""
+             every_min: int = 30, comp_on: list = None, train_span: bool = False, only: str = None):
+    """2 h ahead on the held-out part with the units at their logged output: RMSE of the model vs 'nothing changes'.
+    `train_span`: on each room's training part instead (what choose_pulse scores); `only`: report just that room."""
     errs = {r: [] for r in m.rooms}
     base = {r: [] for r in m.rooms}
     n = len(ts)
     splits = split if isinstance(split, dict) else {r: split for r in m.rooms}  # room -> first held-out minute
     MS = {r: mass_series(T[r], m.rooms[r].mass_tau_h) for r in m.rooms if m.rooms[r].mass_k}
-    for a in range(min(splits.values(), default=n), n - horizon_min, every_min):
+    PS = {r: pulse_shapes(comp_on, rm_.leak_pulse_tau_h * 60) for r, rm_ in m.rooms.items()
+          if comp_on is not None and rm_.leak_pulse and rm_.leak_pulse_tau_h > 0}
+    lo = 0 if train_span else min(splits.values(), default=n)
+    for a in range(lo, n - horizon_min, every_min):
         start = {r: T[r][a] for r in m.rooms if T[r][a] is not None}  # rooms without a reading sit this one out
         if not start:
             continue
@@ -645,12 +745,14 @@ def validate(m: hm.HouseModel, ts, T, out, sun, Y, split, L=None, horizon_min: i
             o = _mean(out[seg])
             y = {u: sum(Y[u][seg]) / step_min for u in Y}
             lk = {u: sum(v[seg]) / step_min for u, v in (L or {}).items()}
-            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y, lk, masses)
+            d = hm.derivative(m, cur, o, hm.mean_sun(sun[seg]), y, lk, masses,
+                              pulse={r: sum(v[seg]) / step_min for r, v in PS.items()} or None)
             masses = {r: hm.mass_step(m.rooms[r], v, cur[r], step_min / 60) for r, v in masses.items()}
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
         z = a + horizon_min
         for r in start:
-            if a >= splits.get(r, n) and T[r][z] is not None:
+            in_span = (z <= splits.get(r, n)) if train_span else (a >= splits.get(r, n))
+            if in_span and T[r][z] is not None and (only is None or r == only):
                 errs[r].append(cur[r] - T[r][z])
                 base[r].append(start[r] - T[r][z])
 
@@ -690,7 +792,10 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
     point at the time it's a prediction for, so it plots against the actual reading at that moment."""
     rooms, units = list(m.rooms), sorted({u for row in rows for u in row.get("units", {})})
     ts, T, out, sun, Y, _, F, Lk = series(rows, rooms, units, m.units)
+    comp_on = comp_on_series(Y)
     Y = effective(Y, F, m)
+    PS = {r: pulse_shapes(comp_on, rm_.leak_pulse_tau_h * 60) for r, rm_ in m.rooms.items()
+          if rm_.leak_pulse and rm_.leak_pulse_tau_h > 0}
     res = {r: {str(h): [] for h in horizons} for r in rooms}
     hmax = max(horizons)
     MS = {r: mass_series(T[r], m.rooms[r].mass_tau_h) for r in rooms if m.rooms[r].mass_k}
@@ -702,7 +807,8 @@ def backtest(m: hm.HouseModel, rows: list, horizons=(60, 120), every_min: int = 
         for k in range(a, a + hmax, step_min):
             seg = slice(k, k + step_min)
             d = hm.derivative(m, cur, _mean(out[seg]), hm.mean_sun(sun[seg]), {u: sum(Y[u][seg]) / step_min for u in Y},
-                              {u: sum(v[seg]) / step_min for u, v in Lk.items()}, masses)
+                              {u: sum(v[seg]) / step_min for u, v in Lk.items()}, masses,
+                              pulse={r: sum(v[seg]) / step_min for r, v in PS.items()} or None)
             masses = {r: hm.mass_step(m.rooms[r], v, cur[r], step_min / 60) for r, v in masses.items()}
             cur = {r: cur[r] + d.get(r, 0.0) * step_min / 60 for r in cur}
             done = k + step_min - a

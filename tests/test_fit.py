@@ -192,3 +192,33 @@ def test_mass_state_fitted_by_paths():
     assert rep2 is not None and two.mass_k > 0.5
     assert rep2["path_rmse_F"] < 0.6 * rep1["path_rmse_F"]
     assert abs(hm.mass_step(two, 60.0, 70.0, two.mass_tau_h) - (60 + 10 * (1 - pow(2.718281828459045, -1)))) < 1e-6
+
+
+def test_start_up_pulse_is_recovered_and_absent_when_there_is_none():
+    truth = coupled.the_house()
+    b3 = truth.rooms["bedroom_3"]
+    b3.leak = {"minisplit_2": 1.0}
+    b3.leak_pulse, b3.leak_pulse_tau_h = 8.0, 25 / 60  # a small leaky room: a fast pulse of heat after every compressor start
+    cfg = {"rooms": [{"id": r, "unit": u, "priority": 3, "default_temp": 67} for r, u in (
+        ("kitchen", "air_handler"), ("living_room", "air_handler"), ("dining_area", "air_handler"),
+        ("bedroom_1", "air_handler"), ("bedroom_2", "air_handler"),
+        ("primary_bedroom", "minisplit_1"), ("bedroom_3", "minisplit_2"))],
+        "units": [{"id": u} for u in truth.units], "settings": {"floor": 63.0}}
+    rooms, units = coupled.rooms_units_from_config(cfg, truth)
+    s = coupled.settings_from_config(cfg)
+    start = datetime(2026, 10, 16)
+    log = []
+    coupled.run(truth, rooms, units, coupled.HeuristicController(rooms, units, s), start, 7,
+                coupled.Weather(start, 9, mean=50, seed=13), s, log=log, seed=13)
+    neighbors = {rid: sorted(set(r.coupling) | {j for j, o in truth.rooms.items() if rid in o.coupling})
+                 for rid, r in truth.rooms.items()}
+    layout = {"rooms": {rid: {"units": list(truth.units), "neighbors": neighbors[rid]} for rid in truth.rooms},
+              "units": {u: {"zone": [r.id for r in rooms if r.unit == u]} for u in truth.units}}
+    m, rep = fit.fit(log, layout, mass=False)
+    got = m.rooms["bedroom_3"]
+    assert 3.0 < got.leak_pulse < 14.0 and any(abs(got.leak_pulse_tau_h * 60 - t) < 0.1 for t in fit.PULSE_TAUS_MIN), (got.leak_pulse, got.leak_pulse_tau_h)
+    assert rep["bedroom_3"]["pulse"]["holdout_rmse_F"][1] <= rep["bedroom_3"]["pulse"]["holdout_rmse_F"][0] * 1.02, rep["bedroom_3"]["pulse"]
+    assert all(not r.leak_pulse for rid, r in m.rooms.items() if rid != "bedroom_3"), {rid: r.leak_pulse for rid, r in m.rooms.items()}
+    plain, _ = fit.fit(log, layout, mass=False, pulse=False)
+    # with the pulse the held-out predictions of Bedroom 3 must not be worse than without it
+    assert rep["holdout"]["bedroom_3"]["model_rmse_F"] <= _["holdout"]["bedroom_3"]["model_rmse_F"] * 1.02

@@ -117,6 +117,7 @@ class CoupledSim:
         self.room_step, self.unit_step, self.noise = room_step, unit_step, noise
         self.rng = random.Random(seed)
         self.starts = 0
+        self.comp_min = 0  # minutes the compressor has been running (for rooms with a start-up pulse)
         self.energy = 0.0  # full-output unit-hours
         self.commands = 0
 
@@ -161,8 +162,12 @@ class CoupledSim:
                 self.effect[uid] = hm.lag(u, self.effect[uid], y, 1 / 60)
                 self.energy += abs(y) / 60
             leaks = hm.leak_inputs(self.mode, self.running, self.output, self.m.units)
+            on = any(abs(y) > 1e-9 for y in self.output.values())
+            pulse = ({rid: math.exp(-(self.comp_min + 0.5) / (r.leak_pulse_tau_h * 60)) for rid, r in self.m.rooms.items()
+                      if r.leak_pulse and r.leak_pulse_tau_h > 0} if on else None)
+            self.comp_min = self.comp_min + 1 if on else 0
             d = hm.derivative(self.m, self.temps, self.weather.outdoor(self.now), self.weather.sun(self.now), self.effect,
-                              leaks)
+                              leaks, pulse=pulse)
             for rid, v in d.items():
                 self.temps[rid] += v / 60
             self.now += timedelta(minutes=1)
@@ -260,10 +265,11 @@ class MPCController:
     name = "mpc"
 
     def __init__(self, rooms, units, model: hm.HouseModel, settings=core.Settings(), ps=optimizer.PlanSettings(),
-                 every_min=10):
+                 every_min=10, observer=None, confirm_plans=1, name="mpc"):
         self.rooms, self.units, self.m, self.s, self.ps, self.every = rooms, units, model, settings, ps, every_min
         self.house, self.sent, self.next_at, self.last_plan = core.HouseState(), {}, None, None
         self.targets, self.drives, self.zone_hist = {}, {}, {}
+        self.observer, self.confirm, self.votes, self.name = observer, confirm_plans, 0, name  # see observer.py, mpc.py
 
     def _drive(self, sim: CoupledSim, now: datetime):
         """Every minute: the outer loop turns the planned targets into setpoints, as Manager.async_tick does."""
@@ -292,7 +298,17 @@ class MPCController:
             sim.command(u.id, cmd.mode, cmd.setpoint)
             sim.set_fan(u.id, cmd.fan)
 
+    def _observe(self, sim: CoupledSim, now: datetime):
+        if self.observer is None:
+            return
+        temps = {r.id: sim.reading(r.id) for r in self.rooms if r.id in sim.temps and r.id in self.m.rooms}
+        actual = {u.id: {"mode": sim.mode[u.id], "setpoint": sim.sp[u.id], "running": sim.action(u.id) in ("heating", "cooling"),
+                         "fan": sim.fan[u.id]} for u in self.units}
+        self.observer.update(self.m, now, temps, actual, sim.weather.outdoor(now), sim.weather.sun(now), dict(sim.effect),
+                             None, {"h": sim.comp_min / 60})
+
     def tick(self, sim: CoupledSim, now: datetime):
+        self._observe(sim, now)
         if self.next_at is not None and now < self.next_at:
             if self.s.drive:
                 self._drive(sim, now)
@@ -306,10 +322,12 @@ class MPCController:
             now_sp = dict(self.targets)
         else:
             now_sp = {u.id: (self.sent[u.id][0].setpoint if u.id in self.sent else None) for u in self.units}
+        fw = getattr(sim.weather, "w", sim.weather)  # the forecast: without the plant's own weather error
         p = optimizer.plan(self.m, self.rooms, self.units, temps, now, self.house, now_sp, running,
-                           [sim.weather.outdoor(t) for t in ts], [sim.weather.sun(t) for t in ts], self.s, self.ps,
+                           [fw.outdoor(t) for t in ts], [fw.sun(t) for t in ts], self.s, self.ps,
                            drives=dict(self.drives) if self.s.drive else None, lagged=dict(sim.effect),
-                           fans=dict(sim.fan))
+                           fans=dict(sim.fan), comp={"h": sim.comp_min / 60},
+                           **(self.observer.corrections() if self.observer else {}))
         self.last_plan = p
         setpoints = p.setpoints
         if self.house.mode not in ("heat", "cool"):
@@ -323,7 +341,13 @@ class MPCController:
                 return self.house.mode
             setpoints = p.by_mode[self.house.mode]["setpoints"]
         elif p.mode != self.house.mode:
-            self.house = core.HouseState(p.mode, now)
+            self.votes += 1
+            if self.votes >= self.confirm:
+                self.house, self.votes = core.HouseState(p.mode, now), 0
+            elif self.house.mode in p.by_mode:
+                setpoints = p.by_mode[self.house.mode]["setpoints"]
+        else:
+            self.votes = 0
         if self.s.drive:
             self.targets = dict(setpoints)
             self._drive(sim, now)
@@ -339,9 +363,10 @@ class MPCController:
 
 
 def run(truth: hm.HouseModel, rooms, units, controller, start: datetime, days: float, weather: Weather,
-        settings=core.Settings(), temps=None, log=None, seed=0) -> dict:
-    """Run `controller` on the true house; score on the true temperatures. `log`: list to append minute rows to."""
-    sim = CoupledSim(truth, start, weather, temps=temps, seed=seed)
+        settings=core.Settings(), temps=None, log=None, seed=0, sim=None) -> dict:
+    """Run `controller` on the true house; score on the true temperatures. `log`: list to append minute rows to.
+    `sim`: a ready simulated house (e.g. sim/disturbed.py's) instead of the default."""
+    sim = sim or CoupledSim(truth, start, weather, temps=temps, seed=seed)
     scored = [r for r in rooms if r.unit is not None and r.id in truth.rooms]
     disc, out_min, switches, last_mode = {r.id: 0.0 for r in scored}, {r.id: 0 for r in scored}, 0, None
     worst = {r.id: 0.0 for r in scored}

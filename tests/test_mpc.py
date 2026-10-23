@@ -21,7 +21,7 @@ def _house():
     return truth, rooms, units, coupled.settings_from_config(cfg)
 
 
-def _shadow_run(model, hours, ignore=()):
+def _shadow_run(model, hours, ignore=(), setup=None):
     truth, rooms, units, s = _house()
     start = datetime.fromisoformat("2026-10-16T00:00:00-07:00")
     w = coupled.Weather(start, 2, mean=52, seed=5)
@@ -29,6 +29,8 @@ def _shadow_run(model, hours, ignore=()):
     ctl = coupled.HeuristicController(rooms, units, s)
     shadow = mpc.ShadowPlanner()
     shadow.set_model(model)
+    if setup:
+        setup(shadow)
     for _ in range(int(hours * 60)):
         now = sim.now
         ctl.tick(sim, now)

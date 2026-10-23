@@ -41,6 +41,12 @@ class RoomModel:
     # dT/dt += mass_k * (M - T), dM/dt = (T - M) / mass_tau_h. 0: no mass state. Fitted (fit.refine_paths).
     mass_k: float = 0.0  # 1/h
     mass_tau_h: float = 0.0
+    # Start-up pulse: extra heat (F/h) right after the shared compressor starts, decaying as it keeps running:
+    # leak_pulse * exp(-t_on / leak_pulse_tau_h), t_on the hours the compressor has been running. On Bedroom 3 (small,
+    # leaky) it explains the fast rise after a start that a constant leak can't. Fitted (fit.refine_pulse), kept only
+    # where it wins on held-out data. 0: none.
+    leak_pulse: float = 0.0
+    leak_pulse_tau_h: float = 0.0
 
 
 @dataclass
@@ -239,9 +245,15 @@ def mass_step(r: RoomModel, M, t, dt_h: float):
 
 
 def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict, leaks: dict = None,
-               masses: dict = None) -> dict:
+               masses: dict = None, offsets: dict = None, leak_scale: dict = None, diag: dict = None,
+               effect_scale: dict = None, pulse: dict = None) -> dict:
     """dT/dt (F/h) for every modelled room with a temperature. `sun`: a sun vector (sun_vector) or overhead 0..1.
-    `masses`: room id -> its mass temperature (rooms with a mass state; missing: taken at the air's)."""
+    `masses`: room id -> its mass temperature (rooms with a mass state; missing: taken at the air's).
+    The observer's corrections (observer.py): `offsets` room id -> extra F/h the model doesn't explain, `leak_scale`
+    room id -> multiplier on that room's leak term (1: as fitted), `effect_scale` room id -> {unit id: multiplier on
+    that unit's heating and cooling effect on the room}. `diag`, if given, receives each room's leak term (F/h) under
+    diag["leak"][room] and each unit's effect under diag["unit"][room][unit] (signed: + warms). `pulse`: room id -> the
+    start-up pulse's current shape exp(-t_on / tau), 0..1 (rooms with a leak_pulse; missing: no pulse)."""
     out = {}
     sv = as_sun(sun)
     for rid, r in m.rooms.items():
@@ -257,13 +269,28 @@ def derivative(m: HouseModel, temps: dict, outdoor, sun: float, outputs: dict, l
             tj = temps.get(j)
             if tj is not None:
                 d += c * (tj - t)
+        es = (effect_scale or {}).get(rid)
         for uid, y in outputs.items():
+            e = 0.0
             if y > 0:
-                d += r.heat.get(uid, 0.0) * y
+                e = r.heat.get(uid, 0.0) * y
             elif y < 0:
-                d += r.cool.get(uid, 0.0) * y  # y is negative: cooling
+                e = r.cool.get(uid, 0.0) * y  # y is negative: cooling
+            if es:
+                e *= es.get(uid, 1.0)
+            d += e
+            if diag is not None and e:
+                diag.setdefault("unit", {}).setdefault(rid, {})[uid] = e
+        lk = 0.0
         for uid, c in r.leak.items():
-            d += c * (leaks or {}).get(uid, 0.0)
+            lk += c * (leaks or {}).get(uid, 0.0)
+        lk *= (leak_scale or {}).get(rid, 1.0)
+        d += lk
+        if pulse and r.leak_pulse:
+            d += r.leak_pulse * pulse.get(rid, 0.0)
+        if diag is not None:
+            diag.setdefault("leak", {})[rid] = lk
+        d += (offsets or {}).get(rid, 0.0)
         if r.mass_k:
             mv = (masses or {}).get(rid)
             if mv is not None:
@@ -284,13 +311,18 @@ def fan_factor(u: UnitModel, fan) -> float:
 
 
 def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict, running: dict, dt_h: float,
-         lagged: dict = None, hold: bool = False, fans: dict = None, masses: dict = None):
+         lagged: dict = None, hold: bool = False, fans: dict = None, masses: dict = None, offsets: dict = None,
+         leak_scale: dict = None, contrib: dict = None, effect_scale: dict = None, comp: dict = None):
     """Advance one step: (new temps, new running flags, outputs used). Units decide output from their reading at the
     start of the step (as a real inverter does, with a little lag). `mode` is one mode for every unit, or a dict of
     unit id -> mode (what the units are really set to, which may differ). `lagged` (unit id -> effective output) carries
     the units' lag from step to step and is updated in place; without it a unit's effect follows its output at once.
     `hold`: `running` is what the units really did, not simulated (see unit_output). `fans`: unit id -> fan mode.
-    `masses` (room id -> mass temperature) carries rooms' mass states and is updated in place, like `lagged`."""
+    `masses` (room id -> mass temperature) carries rooms' mass states and is updated in place, like `lagged`.
+    `offsets`, `leak_scale`, `effect_scale`: the observer's corrections (see derivative). `contrib`, if given,
+    accumulates over the step (F, updated in place) what each room's leak term and each unit's effect added:
+    contrib["leak"][room], contrib["unit"][room][unit]. `comp` ({"h": hours the compressor has been running}, updated in
+    place) carries the compressor's run time from step to step for the start-up pulse; None: no pulse."""
     outputs, run2 = {}, {}
     for uid, u in m.units.items():
         md = mode.get(uid, "off") if isinstance(mode, dict) else mode
@@ -307,7 +339,25 @@ def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict,
         for rid, r in m.rooms.items():
             if r.mass_k and masses.get(rid) is None and temps.get(rid) is not None:
                 masses[rid] = temps[rid]
-    d = derivative(m, temps, outdoor, sun, outputs, leak_inputs(modes, run2, outputs, m.units), masses)
+    dg = {} if contrib is not None else None
+    on = any(abs(y) > 1e-9 for y in outputs.values())
+    pulse = None
+    if comp is not None and on:
+        h_mid = comp.get("h", 0.0) + dt_h / 2
+        pulse = {rid: math.exp(-h_mid / r.leak_pulse_tau_h) for rid, r in m.rooms.items()
+                 if r.leak_pulse and r.leak_pulse_tau_h > 0}
+    d = derivative(m, temps, outdoor, sun, outputs, leak_inputs(modes, run2, outputs, m.units), masses, offsets,
+                   leak_scale, dg, effect_scale, pulse)
+    if comp is not None:
+        comp["h"] = comp.get("h", 0.0) + dt_h if on else 0.0
+    if contrib is not None:
+        for rid, v in dg.get("leak", {}).items():
+            c = contrib.setdefault("leak", {})
+            c[rid] = c.get(rid, 0.0) + v * dt_h
+        for rid, by in dg.get("unit", {}).items():
+            c = contrib.setdefault("unit", {}).setdefault(rid, {})
+            for uid, v in by.items():
+                c[uid] = c.get(uid, 0.0) + v * dt_h
     new = dict(temps)
     for rid, v in d.items():
         new[rid] = temps[rid] + v * dt_h
@@ -320,12 +370,13 @@ def step(m: HouseModel, temps: dict, outdoor, sun: float, mode, setpoints: dict,
 
 def rollout(m: HouseModel, temps: dict, mode, setpoints: dict, running: dict, outdoor_seq, sun_seq,
             dt_h: float, substeps: int = 1, lagged: dict = None, control=None, fans: dict = None,
-            masses: dict = None):
+            masses: dict = None, offsets: dict = None, leak_scale: dict = None, effect_scale: dict = None,
+            comp: dict = None):
     """Simulate len(outdoor_seq) steps of dt_h with setpoints held. Returns ([temps after each step], [outputs per step],
     final running flags). `lagged`: see step (updated in place). `control(temps, rates, dt_h)` -> setpoints, when given,
     sets them before every substep instead (an outer loop on the room temperatures; rates are F/h from the last
     substep, None at first). `fans` (unit id -> fan mode) is read every substep, so `control` may change it.
-    `masses`: see step (updated in place)."""
+    `masses`: see step (updated in place). `offsets`, `leak_scale`, `effect_scale`, `comp`: see step."""
     traj, outs = [], []
     run = dict(running)
     h = dt_h / substeps
@@ -336,7 +387,8 @@ def rollout(m: HouseModel, temps: dict, mode, setpoints: dict, running: dict, ou
             sps = control(temps, rates, h) if control is not None else setpoints
             before = temps
             temps, run, y = step(m, temps, outdoor_seq[k], sun_seq[k], mode, sps, run, h, lagged, fans=fans,
-                                 masses=masses)
+                                 masses=masses, offsets=offsets, leak_scale=leak_scale, effect_scale=effect_scale,
+                                 comp=comp)
             rates = {r: (temps[r] - before[r]) / h for r in temps if before.get(r) is not None}
             for uid, v in y.items():
                 acc[uid] = acc.get(uid, 0.0) + v / substeps

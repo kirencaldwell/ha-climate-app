@@ -19,11 +19,15 @@ from datetime import datetime, timedelta
 
 try:
     from . import core
+    from . import mlmodel
     from . import model as hm
+    from . import observer
     from . import optimizer
 except ImportError:  # offline
     import core  # type: ignore
+    import mlmodel  # type: ignore
     import model as hm  # type: ignore
+    import observer  # type: ignore
     import optimizer  # type: ignore
 
 HORIZONS_MIN = (30, 60, 120)
@@ -54,6 +58,11 @@ def along(now: datetime, current, points):
     return f
 
 
+def as_h(sun) -> float:
+    """The overhead sun index (0..1) of a sun vector (or a bare 0..1 value)."""
+    return float(hm.as_sun(sun).get("h", 0.0)) if sun is not None else 0.0
+
+
 def _seq(x, times):
     """Weather over the plan: a function of time (a forecast) or a constant (current conditions held)."""
     return [x(t) for t in times] if callable(x) else [x] * len(times)
@@ -61,7 +70,7 @@ def _seq(x, times):
 
 class ShadowPlanner:
     def __init__(self, ps: optimizer.PlanSettings = None, plan_every_s: int = 300, track_every_s: int = 600,
-                 keep_h: int = 24):
+                 keep_h: int = 24, confirm_plans: int = 1, correct: bool = False):
         self.model: hm.HouseModel = None
         self.ps = ps or optimizer.PlanSettings()
         self.plan_every, self.track_every = timedelta(seconds=plan_every_s), timedelta(seconds=track_every_s)
@@ -82,7 +91,19 @@ class ShadowPlanner:
         self.readings: dict = {}  # room -> deque[(t, F)]
         self.lagged: dict = {}  # unit id -> effective output now (model.step), followed from what the units really do
         self.masses: dict = {}  # room id -> its mass temperature now (rooms with a mass state), followed from readings
+        self.comp: dict = {"h": 0.0}  # hours the shared compressor has been running (any unit running): for the start-up pulse
         self.targets: dict = {}  # unit id -> target last planned (with the outer loop)
+        # Feedback on the model (observer.py): learned corrections the plans use. `correct` False: plans use the raw model.
+        # Off by default (held back for now): plans use the model as fitted and switch modes as soon as another wins.
+        self.correct = correct
+        self.observer = observer.Observer(offsets_on=correct, effect_on=correct)
+        self.confirm_plans = confirm_plans  # plans in a row that must prefer the other mode before the house switches
+        self._switch_votes = 0
+        # The ML correction (mlmodel.py): feature rows logged as predictions complete (out-of-sample: made by whatever
+        # model was live), the daily-trained corrector, and its scores next to the physics model's.
+        self.ml_rows: list = []  # [iso time, room, horizon, real change, features], until drained to the log
+        self.corrector = None
+        self.ml_errors: deque = deque()  # (t_eval, room, horizon_min, corrected err, physics err)
 
     def set_model(self, m: hm.HouseModel):
         """Use a (re)fitted model. Accuracy history is kept: a nightly refit changes the model a little, has passed its
@@ -105,20 +126,27 @@ class ShadowPlanner:
         try:
             self._follow_mass(now, temps)
             self._follow_lag(now, temps, actual)
+            self._follow_comp(now, actual)
             self._advance(now, temps, actual, outdoor, sun)
+            if self.correct:
+                self.observer.update(self.model, now, temps, actual, outdoor, sun, self.lagged, self.masses, self.comp)
             if self.next_track is None or now >= self.next_track:
                 self.next_track = now + self.track_every
                 start = {r: temps[r] for r in self.model.rooms if temps.get(r) is not None}
                 if start:
                     self.records.append({"t0": now, "t": now, "start": start, "temps": dict(start), "done": set(),
                                          "running": {u: bool(a.get("running")) for u, a in actual.items()},
-                                         "lagged": dict(self.lagged), "masses": dict(self.masses)})
+                                         "lagged": dict(self.lagged), "masses": dict(self.masses),
+                                         "comp": dict(self.comp), "ctx": self._ml_context(now, start, outdoor, sun),
+                                         "acc": {"y": {}, "on": 0.0, "heat": 0.0, "o": 0.0, "s": 0.0, "min": 0.0}})
         except Exception as e:  # never let the model take the integration down; show it instead
             self.error = f"{type(e).__name__}: {e}"
         while self.records and now - self.records[0]["t0"] > timedelta(minutes=max(HORIZONS_MIN) + 10):
             self.records.popleft()
         while self.errors and now - self.errors[0][0] > self.keep:
             self.errors.popleft()
+        while self.ml_errors and now - self.ml_errors[0][0] > self.keep:
+            self.ml_errors.popleft()
 
     def _follow_mass(self, now, temps):
         """Each room's mass temperature now, driven by its readings (model.mass_step): the model's second state, which
@@ -134,6 +162,66 @@ class ShadowPlanner:
             t = temps.get(rid)
             if t is not None:
                 self.masses[rid] = hm.mass_step(r, self.masses.get(rid), t, dt_h)
+
+    def _ml_context(self, now, start, outdoor, sun):
+        """What the ML features need at the origin of a prediction: each room's readings 10 and 30 min ago, its two
+        strongest-coupled neighbours' difference from it, the outdoor temperature, the sun, the time of day, how long the
+        compressor has run."""
+        def back(rid, minutes):
+            d = self.readings.get(rid)
+            if not d:
+                return None
+            target = now - timedelta(minutes=minutes)
+            val = None
+            for t, v in d:
+                if t > target:
+                    break
+                val = v
+            return val
+        rooms = {}
+        for rid, T0 in start.items():
+            t10, t30 = back(rid, 10), back(rid, 30)
+            if t10 is None or t30 is None:
+                continue
+            nb = [start[j] - T0 for j in mlmodel.neighbours(self.model, rid) if j in start]
+            rooms[rid] = (t10, t30, (nb + [0.0, 0.0])[:2])
+        return {"rooms": rooms, "out0": outdoor if outdoor is not None else None, "sun0": as_h(sun),
+                "hour": now.hour + now.minute / 60, "t_on0": self.comp.get("h", 0.0) * 60}
+
+    def _ml_log(self, rec, rid, h, pred, real, now):
+        """A prediction just completed: log its features and the real change, and score the ML-corrected prediction."""
+        ctx, acc = rec.get("ctx"), rec.get("acc")
+        if not ctx or not acc or rid not in ctx["rooms"] or acc["min"] <= 0 or ctx["out0"] is None:
+            return
+        T0 = rec["start"][rid]
+        t10, t30, nb = ctx["rooms"][rid]
+        own = mlmodel.own_unit(self.model, rid)
+        ym = {u: v / acc["min"] for u, v in acc["y"].items()}
+        f = mlmodel.make_features(pred - T0, T0, ctx["out0"], acc["o"] / acc["min"], t10, t30, nb[0], nb[1],
+                                  ym.get(own, 0.0) if own else 0.0, sum(v for u, v in ym.items() if u != own),
+                                  acc["on"] / acc["min"], ctx["t_on0"], acc["heat"] / acc["min"], acc["s"] / acc["min"],
+                                  ctx["sun0"], ctx["hour"])
+        f = [round(x, 4) for x in f]
+        self.ml_rows.append([now.isoformat(), rid, h, round(real - T0, 4), f])
+        if self.corrector is not None:
+            corr = pred + self.corrector.correct(rid, h, f)
+            self.ml_errors.append((now, rid, h, corr - real, pred - real))
+        if len(self.ml_rows) > 50000:  # nobody is draining them: keep the newest
+            del self.ml_rows[:10000]
+
+    def drain_ml_rows(self) -> list:
+        out, self.ml_rows = self.ml_rows, []
+        return out
+
+    def set_corrector(self, c):
+        self.corrector = c
+
+    def _follow_comp(self, now, actual):
+        """How long the shared compressor has been running: any unit running counts."""
+        last = getattr(self, "_comp_at", None)
+        dt_h = 0.0 if last is None else max(0.0, min(0.5, (now - last).total_seconds() / 3600))
+        self._comp_at = now
+        self.comp["h"] = self.comp.get("h", 0.0) + dt_h if any(a.get("running") for a in actual.values()) else 0.0
 
     def _follow_lag(self, now, temps, actual):
         """Each unit's effective output now: its estimated output (running or not, and how hard from its setpoint gap)
@@ -166,10 +254,21 @@ class ShadowPlanner:
                 continue
             dt = (now - rec["t"]).total_seconds() / 3600
             n = max(1, int(dt * 60 / 2 + 0.999))  # steps of at most 2 min (ticks can be sparse)
+            acc = rec.get("acc")
             for _ in range(n if dt > 0 else 0):
-                rec["temps"], rec["running"], _ = hm.step(self.model, rec["temps"], outdoor, sun, modes, sps,
+                rec["temps"], rec["running"], y = hm.step(self.model, rec["temps"], outdoor, sun, modes, sps,
                                                           ran, dt / n, rec.setdefault("lagged", {}), hold=True,
-                                                          fans=fans, masses=rec.setdefault("masses", {}))
+                                                          fans=fans, masses=rec.setdefault("masses", {}),
+                                                          comp=rec.setdefault("comp", {"h": 0.0}))
+                if acc is not None:  # what the ML features need: the units' outputs, the compressor, the sun over the horizon
+                    mn = dt * 60 / n
+                    for u, v in y.items():
+                        acc["y"][u] = acc["y"].get(u, 0.0) + v * mn
+                    acc["on"] += mn if any(ran.values()) else 0.0
+                    acc["heat"] += mn if any(md == "heat" for md in modes.values()) else 0.0
+                    acc["o"] += (outdoor if outdoor is not None else 0.0) * mn
+                    acc["s"] += as_h(sun) * mn
+                    acc["min"] += mn
             rec["t"] = now
             age = (now - rec["t0"]).total_seconds() / 60
             for h in HORIZONS_MIN:
@@ -182,6 +281,7 @@ class ShadowPlanner:
                         continue
                     self.errors.append((now, rid, h, pred - real, rec["start"][rid] - real))
                     self.points.append((now, rid, h, round(pred, 2)))
+                    self._ml_log(rec, rid, h, pred, real, now)
         while self.points and now - self.points[0][0] > self.keep:
             self.points.popleft()
 
@@ -213,7 +313,8 @@ class ShadowPlanner:
         traj, _, _ = hm.rollout(self.model, dict(start), modes, {u: a.get("setpoint") for u, a in actual.items()},
                                 {u: bool(a.get("running")) for u, a in actual.items()}, _seq(outdoor, times),
                                 [sun_at(t) for t in times], step_min / 60, substeps=2, lagged=dict(self.lagged),
-                                fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses))
+                                fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses),
+                                comp=dict(self.comp), **self.observer.corrections())
         self.projection = {"at": now.isoformat(), "temps": {
             r: [[t.isoformat(), round(step[r], 2)] for t, step in zip(times, traj)] for r in start}}
 
@@ -231,7 +332,8 @@ class ShadowPlanner:
         p = optimizer.plan(self.model, rooms, units, temps, now, self.house, now_sp, running, _seq(outdoor, times),
                            [sun_at(t) for t in times], settings, ps, ignore=set(ignore), fixed=fixed,
                            drives=drives if settings.drive else None, lagged=dict(self.lagged),
-                           fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses))
+                           fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses),
+                           comp=dict(self.comp), **self.observer.corrections())
         setpoints, first = p.setpoints, p.first
         forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)
         if forced and self.house.mode != forced:
@@ -246,7 +348,16 @@ class ShadowPlanner:
             setpoints = p.by_mode.get(self.house.mode, {}).get("setpoints", {})
             first = p.by_mode.get(self.house.mode, {}).get("first", {})
         elif p.mode != self.house.mode:
-            self.house = core.HouseState(p.mode, now)
+            # Switching heat <-> cool takes the other mode winning several plans in a row (on top of the planner's own
+            # margin and dwell): one plan's blip, e.g. a room's jump the model didn't foresee, doesn't flip the house.
+            self._switch_votes += 1
+            if self._switch_votes >= self.confirm_plans:
+                self.house = core.HouseState(p.mode, now)
+                self._switch_votes = 0
+            elif self.house.mode in p.by_mode:
+                setpoints, first = p.by_mode[self.house.mode]["setpoints"], p.by_mode[self.house.mode]["first"]
+        else:
+            self._switch_votes = 0
         self.decision = {}
         for u in units:
             if u.id in fixed:
@@ -305,7 +416,9 @@ class ShadowPlanner:
         return {"version": 1,
                 "errors": [[iso(t), r, h, round(e, 3), round(b, 3)] for t, r, h, e, b in self.errors],
                 "points": [[iso(t), r, h, v] for t, r, h, v in self.points],
-                "readings": {r: [[iso(t), v] for t, v in d] for r, d in self.readings.items()}}
+                "readings": {r: [[iso(t), v] for t, v in d] for r, d in self.readings.items()},
+                "observer": self.observer.to_state(),
+                "ml_errors": [[iso(t), r, h, round(e, 3), round(p, 3)] for t, r, h, e, p in self.ml_errors]}
 
     def load_state(self, d: dict, now: datetime):
         """Restore what to_state saved, dropping anything older than the windows it's kept for."""
@@ -316,6 +429,8 @@ class ShadowPlanner:
         self.errors = deque((p(t), r, h, e, b) for t, r, h, e, b in d.get("errors", []) if p(t) >= keep_since)
         self.points = deque((p(t), r, h, v) for t, r, h, v in d.get("points", []) if p(t) >= chart_since)
         self.readings = {r: deque((p(t), v) for t, v in pts if p(t) >= keep_since) for r, pts in d.get("readings", {}).items()}
+        self.observer.load_state(d.get("observer"))
+        self.ml_errors = deque((p(t), r, h, e, b) for t, r, h, e, b in d.get("ml_errors", []) if p(t) >= keep_since)
 
     # --- reporting ---
     def log_fields(self) -> dict:
@@ -336,6 +451,14 @@ class ShadowPlanner:
                 res[rid][h] = {"n": n, "rmse": round((sum(e * e for e, _ in pairs) / n) ** 0.5, 2),
                                "bias": round(sum(e for e, _ in pairs) / n, 2),
                                "base_rmse": round((sum(b * b for _, b in pairs) / n) ** 0.5, 2)}
+        mlp = {}
+        for _, rid, h, e, p in self.ml_errors:  # the ML-corrected prediction on the same scale, where there is one
+            mlp.setdefault((rid, str(h)), []).append((e, p))
+        for (rid, h), pairs in mlp.items():
+            if rid in res and h in res[rid]:
+                n = len(pairs)
+                res[rid][h]["ml_rmse"] = round((sum(e * e for e, _ in pairs) / n) ** 0.5, 2)
+                res[rid][h]["ml_n"] = n
         return res
 
     def history(self, now: datetime, hours: float = 6) -> dict:
@@ -373,6 +496,9 @@ class ShadowPlanner:
                 "cost": round(p.cost, 3), "by_mode": p.by_mode, "setpoints": p.setpoints, "later": p.later,
                 "step_min": self.ps.step_min},
             "decision": self.decision,
+            "observer": self.observer.to_state(),
+            "ml": {"corrector": self.corrector is not None, "rows_waiting": len(self.ml_rows),
+                   "enabled": {k: v for k, v in (self.corrector.enabled.items() if self.corrector else [])}},
             "projection": self.projection,
             "accuracy": self.accuracy(),
             "history": self.history(now),

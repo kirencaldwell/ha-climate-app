@@ -28,7 +28,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from . import core, datalog, experiment, fit, mpc
+from . import core, datalog, experiment, fit, mlmodel, mpc
 from . import model as hm
 
 DOMAIN = "room_climate"
@@ -48,6 +48,9 @@ OURS_GRACE_S = 30  # unit state changes this soon after we sent it something are
 BAD_STATES = ("unknown", "unavailable")
 MODEL_FILE = "room_climate_model.json"  # the fitted thermal model (model.py), refitted nightly
 FIT_HISTORY_FILE = "room_climate_model_fits.jsonl"  # one line per fit: when, data span, how well it predicts
+ML_ROWS_FILE = "room_climate_ml_rows.jsonl"  # the ML correction's training rows (mlmodel.py), one per completed prediction
+ML_FILE = "room_climate_ml.json"  # the daily-trained ML correction
+ML_KEEP_DAYS = 14
 BACKTEST_FILE = "room_climate_model_backtest.json"  # the fitted model's predictions over the logged past (charts)
 FIT_DAYS = 14  # fit on this many days of the minute log
 HISTORY_H = 72  # the Model page's charts reach back this far (5-minute samples, rebuilt from the minute log)
@@ -111,6 +114,7 @@ class Manager:
         self._forecast_logged = None
         self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
         self.fit_history: list = []
+        self.ml_state: dict = None  # the ML correction's last training / loading (mlmodel.py)
 
     async def async_load(self):
         loaded = await self.store.async_load()
@@ -144,6 +148,78 @@ class Manager:
             self.shadow.load_state(await self.track_store.async_load(), dt_util.now())
         except (ValueError, TypeError, KeyError) as e:
             _LOGGER.warning("couldn't restore the model's accuracy scores: %s", e)
+        await self._load_ml()
+
+    async def _load_ml(self):
+        """The ML correction trained last night, if there is one (its absence or a bad file changes nothing)."""
+        def read():
+            p = pathlib.Path(self.hass.config.path(ML_FILE))
+            return mlmodel.MLCorrector.from_dict(json.loads(p.read_text())) if p.exists() else None
+        try:
+            c = await self.hass.async_add_executor_job(read)
+        except Exception as e:  # noqa: BLE001 - never let the ML take the integration down
+            _LOGGER.warning("couldn't load the ML correction: %s", e)
+            return
+        if c is not None:
+            self.shadow.set_corrector(c)
+            self.ml_state = {"loaded": dt_util.now().isoformat(), "enabled": sum(c.enabled.values()), "of": len(c.enabled)}
+
+    async def async_flush_ml(self, _now=None):
+        """Append the training rows the shadow planner has logged since the last flush to the ML rows file."""
+        rows = self.shadow.drain_ml_rows()
+        if not rows:
+            return
+        path = self.hass.config.path(ML_ROWS_FILE)
+
+        def write():
+            with open(path, "a") as f:
+                for r in rows:
+                    f.write(json.dumps(r) + "\n")
+        try:
+            await self.hass.async_add_executor_job(write)
+        except OSError as e:
+            _LOGGER.warning("couldn't write the ML rows: %s", e)
+
+    async def async_train_ml(self, _now=None):
+        """Train the ML correction on the last ML_KEEP_DAYS of logged rows (in an executor job), save it, use it. The rows
+        are the physics model's out-of-sample misses (made by whatever model was live), so each night's data is fresh."""
+        await self.async_flush_ml()
+        rows_path, ml_path = self.hass.config.path(ML_ROWS_FILE), self.hass.config.path(ML_FILE)
+        cutoff = (dt_util.now() - timedelta(days=ML_KEEP_DAYS)).isoformat()
+
+        def work():
+            rows = []
+            if os.path.exists(rows_path):
+                with open(rows_path) as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue
+                        if r[0] >= cutoff:
+                            rows.append(r)
+                with open(rows_path + ".tmp", "w") as f:  # keep the file to the window
+                    for r in rows:
+                        f.write(json.dumps(r) + "\n")
+                os.replace(rows_path + ".tmp", rows_path)
+            c = mlmodel.train(rows)
+            if c is not None:
+                with open(ml_path + ".tmp", "w") as f:
+                    json.dump(c.to_dict(), f)
+                os.replace(ml_path + ".tmp", ml_path)
+            return c, len(rows)
+        try:
+            c, n = await self.hass.async_add_executor_job(work)
+            if c is not None:
+                self.shadow.set_corrector(c)
+                self.ml_state = {"trained": dt_util.now().isoformat(), "rows": n, "enabled": sum(c.enabled.values()),
+                                 "of": len(c.enabled), "held_out_rmse_F": c.report}
+                _LOGGER.info("ML correction trained on %s rows; enabled for %s of %s room/horizon pairs", n,
+                             sum(c.enabled.values()), len(c.enabled))
+            else:
+                self.ml_state = {"trained": None, "rows": n, "why": "not enough rows yet"}
+        except Exception as e:  # noqa: BLE001 - a failed training keeps yesterday's correction
+            _LOGGER.warning("ML correction training failed: %s: %s", type(e).__name__, e)
 
     async def async_load_history(self):
         """Rebuild the charts' 5-minute samples from the last HISTORY_H of the minute log (once, at startup)."""
@@ -770,7 +846,7 @@ class Manager:
                 "sunshine": None if self.irradiance_at(now) is None else
                 dict(zip(("ghi", "dni", "dhi"), (round(x) for x in self.irradiance_at(now)))),
                 "ready": {"ok": ok, "why": reasons},
-                "fit": self.fit_state, "fits": self.fit_history[-30:], "shadow": self.shadow.debug(now),
+                "fit": self.fit_state, "fits": self.fit_history[-30:], "shadow": self.shadow.debug(now), "ml": self.ml_state,
                 "targets": targets, "today": today, "house_today": self.house.mode,
                 "comfort": {k: getattr(s, k) for k in ("band_below", "band_above", "warm_weight", "aim_offset")}}
 
@@ -1189,6 +1265,9 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     async_track_time_interval(hass, mgr.async_update_forecast, timedelta(hours=1))
     # Refit the thermal model nightly, and soon after startup if there is none or it's more than a day old.
     async_track_time_change(hass, mgr.async_fit, hour=3, minute=40, second=0)
+    # Then the ML correction, once the physics fit (13 min) is done; its rows are flushed to disk hourly.
+    async_track_time_change(hass, mgr.async_train_ml, hour=3, minute=58, second=0)
+    async_track_time_interval(hass, mgr.async_flush_ml, timedelta(hours=1))
     age = mgr.model_age_h()
     if age is None or age > 26:
         async_call_later(hass, 180, mgr.async_fit)
