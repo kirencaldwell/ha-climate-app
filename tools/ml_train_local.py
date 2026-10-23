@@ -23,6 +23,7 @@ sys.path.append(os.path.join(HERE, "..", "custom_components", "room_climate"))  
 import ha_sync  # noqa: E402
 import local_fit as lf  # noqa: E402
 import ml_benchmark as mb  # noqa: E402
+import ml_pure  # noqa: E402
 import mlmodel  # noqa: E402
 
 MIRROR = os.path.expanduser("~/.local/share/room-climate-watch/ha")
@@ -54,15 +55,16 @@ def rmse(v):
     return (sum(x * x for x in v) / len(v)) ** 0.5 if v else float("nan")
 
 
-def evaluate(rows, eval_days):
-    """Walk-forward: for each of the latest complete days, train on the rows before it, score on it."""
+def evaluate(rows, eval_days, pure=None):
+    """Walk-forward: for each of the latest complete days, train on the rows before it, score on it. `pure`: {day: rows}
+    for every day in the log (ml_pure): "trees (all days)" is trained on those, which need no out-of-sample physics."""
     try:
         import numpy as np
         from sklearn.ensemble import HistGradientBoostingRegressor
     except ImportError:
         np = None
     days = sorted({r[0][:10] for r in rows})[-(eval_days + 1):-1] if len(rows) else []  # latest day may be incomplete
-    err = {k: {h: [] for h in mlmodel.HORIZONS} for k in ("nothing", "physics", "+ ridge", "+ trees", "trees")}
+    err = {k: {h: [] for h in mlmodel.HORIZONS} for k in ("nothing", "physics", "+ ridge", "+ trees", "trees", "trees (all days)", "blend")}
     for day in days:
         tr = [r for r in rows if r[0][:10] < day]
         te = [r for r in rows if r[0][:10] == day]
@@ -79,6 +81,13 @@ def evaluate(rows, eval_days):
                 tpure = HistGradientBoostingRegressor(**gb).fit(Xa[:, 1:], np.array([r[3] for r in tr if r[2] == h]))
             else:
                 tres = tpure = None
+            tall = None
+            if np is not None and pure:
+                prows = [r for d_, v in pure.items() if d_ < day for r in v if r[2] == h]  # every earlier day, no physics needed
+                if len(prows) > 300:
+                    Xp = np.array([r[4] + oh(r[1]) for r in prows])[:, 1:]
+                    gb2 = dict(max_depth=3, max_iter=120, learning_rate=0.05, l2_regularization=5.0, min_samples_leaf=30, random_state=0)
+                    tall = HistGradientBoostingRegressor(**gb2).fit(Xp, np.array([r[3] for r in prows]))
             for r in te:
                 if r[2] != h:
                     continue
@@ -90,6 +99,11 @@ def evaluate(rows, eval_days):
                     x = np.array([f + oh(r[1])])
                     err["+ trees"][h].append(f[0] + float(tres.predict(x)[0]) - y)
                     err["trees"][h].append(float(tpure.predict(x[:, 1:])[0]) - y)
+                if tall is not None:
+                    xa = np.array([f + oh(r[1])])[:, 1:]
+                    pt = float(tall.predict(xa)[0])
+                    err["trees (all days)"][h].append(pt - y)
+                    err["blend"][h].append(0.5 * (f[0] + (c.correct(r[1], h, f) if c else 0.0)) + 0.5 * pt - y)
     return days, {k: {str(h): rmse(v) for h, v in d.items()} for k, d in err.items() if any(d[h] for h in d)}, \
         {str(h): len(err["physics"][h]) for h in mlmodel.HORIZONS}
 
@@ -147,7 +161,14 @@ def main():
         print(f"corrector: enabled for {sum(c.enabled.values())} of {len(c.enabled)} room/horizon pairs", flush=True)
     else:
         print("not enough rows yet for a correction", flush=True)
-    ev_days, rm, n = evaluate(rows, a.eval_days)
+    model_path = os.path.join(MIRROR, "room_climate_model.json")
+    pure = {}
+    if os.path.exists(model_path):
+        pure_days = [d for d in dates if counts[d] >= 1000 and d < today]
+        pure = ml_pure.rows(logs, json.load(open(model_path)), layout, pure_days, a.workers, os.path.join(WORK, "pure"))
+        report["rows_pure"] = sum(len(v) for v in pure.values())
+        print(f"pure rows (no physics prediction needed): {report['rows_pure']} from {len(pure)} day(s)", flush=True)
+    ev_days, rm, n = evaluate(rows, a.eval_days, pure)
     report["walk_forward"] = {"days": ev_days, "rmse_F": rm, "n": n}
     for k, v in rm.items():
         print(f"  {k:10s}" + "".join(f"{v[str(h)]:8.3f}" for h in mlmodel.HORIZONS), flush=True)
