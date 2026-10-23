@@ -64,6 +64,26 @@ def test_shadow_planner_logs_rows_and_scores_the_correction():
     assert len(shadow3.ml_errors) > 0
 
 
+def test_tree_evaluator_and_the_blend():
+    # one tree: feature 0 <= 0.5 -> leaf 1.0, else -> leaf -1.0; baseline 0.25
+    tree = {"f": [0, 0, 0], "t": [0.5, 0.0, 0.0], "l": [1, 0, 0], "r": [2, 0, 0], "leaf": [0, 1, 1], "v": [0.0, 1.0, -1.0]}
+    tr = mlmodel.Trees(0.25, [tree])
+    assert tr.predict([0.2, 9.0]) == 1.25 and tr.predict([0.9, 9.0]) == -0.75
+    assert mlmodel.Trees.from_dict(tr.to_dict()).predict([0.2, 9.0]) == 1.25
+    ridge = mlmodel.train(_rows(random.Random(3)))
+    n = len(mlmodel.FEATURES)
+    blend = mlmodel.MLBlend(ridge.rooms, ridge, {60: mlmodel.Trees(0.0, [{"f": [0], "t": [0.0], "l": [0], "r": [0], "leaf": [1], "v": [0.4]}])})
+    f = [0.0] * n
+    f[0] = 0.1  # the physics model predicts +0.1; the trees say +0.4 (their features are everything after the first)
+    rc = ridge.correct("a", 60, f)
+    # half (physics + ridge) + half trees:  0.5*(0.1 + rc) + 0.5*0.4  ->  correction = 0.5*rc + 0.5*(0.4 - 0.1)
+    assert abs(blend.correct("a", 60, f) - (0.5 * rc + 0.5 * 0.3)) < 1e-9
+    assert blend.correct("a", 30, f) == ridge.correct("a", 30, f)  # no trees for that horizon: the ridge alone
+    again = mlmodel.load(blend.to_dict())
+    assert isinstance(again, mlmodel.MLBlend) and abs(again.correct("a", 60, f) - blend.correct("a", 60, f)) < 1e-9
+    assert isinstance(mlmodel.load(ridge.to_dict()), mlmodel.MLCorrector)
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

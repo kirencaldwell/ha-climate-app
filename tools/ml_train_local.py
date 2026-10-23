@@ -51,6 +51,41 @@ def read_jsonl(p):
     return out
 
 
+def export_hgb(model, X):
+    """A fitted HistGradientBoostingRegressor as mlmodel.Trees (pure Python), checked against scikit-learn on a sample."""
+    import numpy as np
+    trees = []
+    for it in model._predictors:
+        for tp in it:
+            n = tp.nodes
+            trees.append({"f": n["feature_idx"].astype(int).tolist(), "t": [float(x) for x in n["num_threshold"]],
+                          "l": n["left"].astype(int).tolist(), "r": n["right"].astype(int).tolist(),
+                          "leaf": n["is_leaf"].astype(int).tolist(), "v": [float(x) for x in n["value"]]})
+    out = mlmodel.Trees(float(np.ravel(model._baseline_prediction)[0]), trees)
+    idx = np.random.RandomState(0).choice(len(X), min(400, len(X)), replace=False)
+    diff = max(abs(out.predict([float(v) for v in X[i]]) - float(model.predict(X[i:i + 1])[0])) for i in idx)
+    assert diff < 1e-6, f"exported trees differ from scikit-learn by {diff}"
+    return out
+
+
+def build_blend(rows, pure, corrector, weight=0.5):
+    """The deployable blend: the ridge correction + trees fitted on every pure row (all days), half and half."""
+    import numpy as np
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    rooms = sorted({r[1] for r in rows} | {r[1] for v in pure.values() for r in v})
+    oh = {q: [1.0 if q == x else 0.0 for x in rooms] for q in rooms}
+    trees = {}
+    for h in mlmodel.HORIZONS:
+        pr = [r for v in pure.values() for r in v if r[2] == h]
+        if len(pr) < 300:
+            continue
+        X = np.array([r[4][1:] + oh[r[1]] for r in pr])
+        gb = HistGradientBoostingRegressor(max_depth=3, max_iter=120, learning_rate=0.05, l2_regularization=5.0,
+                                           min_samples_leaf=30, random_state=0).fit(X, np.array([r[3] for r in pr]))
+        trees[h] = export_hgb(gb, X)
+    return mlmodel.MLBlend(rooms, corrector, trees, weight) if trees else None
+
+
 def rmse(v):
     return (sum(x * x for x in v) / len(v)) ** 0.5 if v else float("nan")
 
@@ -113,6 +148,8 @@ def main():
     ap.add_argument("--sync", action="store_true")
     ap.add_argument("--eval-days", type=int, default=2)
     ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--push", action="store_true", help="send the blend to the Green if it beats physics at every horizon")
+    ap.add_argument("--push-force", action="store_true", help="send it whatever the walk-forward says")
     a = ap.parse_args()
     t0 = time.time()
     if a.sync:
@@ -173,6 +210,22 @@ def main():
     for k, v in rm.items():
         print(f"  {k:10s}" + "".join(f"{v[str(h)]:8.3f}" for h in mlmodel.HORIZONS), flush=True)
     print(f"  (rmse F at {', '.join(str(h) for h in mlmodel.HORIZONS)} min over {ev_days}, n={n})", flush=True)
+    # the deployable blend (needs the pure rows and the ridge correction), and whether to send it to the Green
+    blend = build_blend(rows, pure, c) if (pure and c is not None) else None
+    if blend is not None:
+        bp = os.path.join(WORK, "blend.json")
+        json.dump(blend.to_dict(), open(bp, "w"))
+        wf = rm.get("blend"), rm.get("physics")
+        better = bool(wf[0] and wf[1] and all(wf[0][str(h)] < 0.97 * wf[1][str(h)] for h in mlmodel.HORIZONS))
+        report["blend"] = {"file": bp, "kb": round(os.path.getsize(bp) / 1024), "beats_physics_by_3pct_everywhere": better}
+        print(f"blend saved ({report['blend']['kb']} KiB); beats physics by 3% at every horizon in the walk-forward: {better}", flush=True)
+        if (a.push and better) or a.push_force:
+            import subprocess
+            r = subprocess.run([sys.executable, os.path.join(HERE, "ml_push.py"), bp], capture_output=True, text=True, timeout=300)
+            report["blend"]["push"] = (r.stdout + r.stderr).strip()[-400:]
+            print("push:", report["blend"]["push"], flush=True)
+        elif a.push:
+            print("not pushed: the walk-forward does not show it clearly better", flush=True)
     json.dump(report, open(os.path.join(WORK, "report.json"), "w"), indent=1)
     with open(os.path.join(WORK, "history.jsonl"), "a") as f:
         f.write(json.dumps({k: report[k] for k in ("at", "rows_rebuilt", "rows_live", "walk_forward")}) + "\n")

@@ -268,3 +268,64 @@ def train(rows: list, lam: float = 20.0, holdout: float = 0.25, min_rows: int = 
             report[f"{room}|{h}"] = [round(r0, 3), round(r1, 3), len(e0)]
         models[h] = Ridge(lam).fit(X, res)
     return MLCorrector(rooms, models, enabled, report) if models else None
+
+
+# ---- trees trained elsewhere (scikit-learn on the Mac), evaluated here in pure Python ----
+class Trees:
+    """A gradient-boosted tree ensemble exported from scikit-learn (tools/ml_train_local.py): the baseline plus, for each
+    tree, the value of the leaf the features fall in (leaf values already include the learning rate)."""
+
+    def __init__(self, base: float, trees: list):
+        self.base, self.trees = base, trees
+
+    def predict(self, x: list) -> float:
+        s = self.base
+        for t in self.trees:
+            f, th, left, right, leaf, v = t["f"], t["t"], t["l"], t["r"], t["leaf"], t["v"]
+            i = 0
+            while not leaf[i]:
+                i = left[i] if x[f[i]] <= th[i] else right[i]
+            s += v[i]
+        return s
+
+    def to_dict(self):
+        return {"base": self.base, "trees": self.trees}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["base"], d["trees"])
+
+
+class MLBlend:
+    """The best walk-forward predictor so far: half the physics model plus the ridge correction, half trees that predict the
+    change directly (from every feature but the physics prediction). Same interface as MLCorrector: correct() is what to
+    add to the physics model's predicted change, so the planner's scoring and the logging need no change."""
+
+    kind = "blend"
+
+    def __init__(self, rooms: list, ridge, trees: dict, weight: float = 0.5, report: dict = None):
+        self.rooms, self.ridge, self.trees, self.weight, self.report = rooms, ridge, trees, weight, report or {}
+        self.enabled = ridge.enabled if ridge is not None else {}
+
+    def correct(self, room: str, h: int, f: list) -> float:
+        rc = self.ridge.correct(room, h, f) if self.ridge is not None else 0.0
+        t = self.trees.get(h)
+        if t is None or room not in self.rooms:
+            return rc
+        pure = t.predict(f[1:] + [1.0 if room == q else 0.0 for q in self.rooms])
+        return (1.0 - self.weight) * rc + self.weight * (pure - f[0])
+
+    def to_dict(self):
+        return {"kind": "blend", "rooms": self.rooms, "weight": self.weight, "report": self.report,
+                "ridge": self.ridge.to_dict() if self.ridge is not None else None,
+                "trees": {str(h): t.to_dict() for h, t in self.trees.items()}}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["rooms"], MLCorrector.from_dict(d["ridge"]) if d.get("ridge") else None,
+                   {int(h): Trees.from_dict(t) for h, t in d["trees"].items()}, d.get("weight", 0.5), d.get("report"))
+
+
+def load(d: dict):
+    """A saved correction of either kind."""
+    return MLBlend.from_dict(d) if d.get("kind") == "blend" else MLCorrector.from_dict(d)

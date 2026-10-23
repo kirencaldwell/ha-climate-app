@@ -49,7 +49,8 @@ BAD_STATES = ("unknown", "unavailable")
 MODEL_FILE = "room_climate_model.json"  # the fitted thermal model (model.py), refitted nightly
 FIT_HISTORY_FILE = "room_climate_model_fits.jsonl"  # one line per fit: when, data span, how well it predicts
 ML_ROWS_FILE = "room_climate_ml_rows.jsonl"  # the ML correction's training rows (mlmodel.py), one per completed prediction
-ML_FILE = "room_climate_ml.json"  # the daily-trained ML correction
+ML_FILE = "room_climate_ml.json"  # the daily-trained ML correction (ridge, trained here)
+ML_EXTERNAL_FILE = "room_climate_ml_external.json"  # a better one trained elsewhere (the Mac: ridge + trees blend); wins if present
 ML_KEEP_DAYS = 14
 BACKTEST_FILE = "room_climate_model_backtest.json"  # the fitted model's predictions over the logged past (charts)
 FIT_DAYS = 14  # fit on this many days of the minute log
@@ -115,6 +116,7 @@ class Manager:
         self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
         self.fit_history: list = []
         self.ml_state: dict = None  # the ML correction's last training / loading (mlmodel.py)
+        self.ml_external = False  # an externally trained correction (ML_EXTERNAL_FILE) is in use
 
     async def async_load(self):
         loaded = await self.store.async_load()
@@ -151,18 +153,28 @@ class Manager:
         await self._load_ml()
 
     async def _load_ml(self):
-        """The ML correction trained last night, if there is one (its absence or a bad file changes nothing)."""
+        """The ML correction to use: one trained elsewhere (ML_EXTERNAL_FILE) if there is one, else the one trained here last
+        night. Absence or a bad file changes nothing. Also what room_climate/reload_ml runs after a new file is copied in."""
         def read():
-            p = pathlib.Path(self.hass.config.path(ML_FILE))
-            return mlmodel.MLCorrector.from_dict(json.loads(p.read_text())) if p.exists() else None
+            for name, external in ((ML_EXTERNAL_FILE, True), (ML_FILE, False)):
+                p = pathlib.Path(self.hass.config.path(name))
+                if p.exists():
+                    try:
+                        return mlmodel.load(json.loads(p.read_text())), external, name
+                    except Exception as e:  # noqa: BLE001 - a bad file: fall back to the next
+                        _LOGGER.warning("couldn't read %s: %s", name, e)
+            return None, False, None
         try:
-            c = await self.hass.async_add_executor_job(read)
+            c, external, name = await self.hass.async_add_executor_job(read)
         except Exception as e:  # noqa: BLE001 - never let the ML take the integration down
             _LOGGER.warning("couldn't load the ML correction: %s", e)
             return
+        self.ml_external = external and c is not None
         if c is not None:
             self.shadow.set_corrector(c)
-            self.ml_state = {"loaded": dt_util.now().isoformat(), "enabled": sum(c.enabled.values()), "of": len(c.enabled)}
+            self.ml_state = {"loaded": dt_util.now().isoformat(), "file": name, "kind": getattr(c, "kind", "ridge"),
+                             "enabled": sum(c.enabled.values()), "of": len(c.enabled)}
+            _LOGGER.info("ML correction loaded from %s (%s)", name, self.ml_state["kind"])
 
     async def async_flush_ml(self, _now=None):
         """Append the training rows the shadow planner has logged since the last flush to the ML rows file."""
@@ -211,9 +223,10 @@ class Manager:
         try:
             c, n = await self.hass.async_add_executor_job(work)
             if c is not None:
-                self.shadow.set_corrector(c)
+                if not self.ml_external:  # a model trained elsewhere stays in use; this one is still saved
+                    self.shadow.set_corrector(c)
                 self.ml_state = {"trained": dt_util.now().isoformat(), "rows": n, "enabled": sum(c.enabled.values()),
-                                 "of": len(c.enabled), "held_out_rmse_F": c.report}
+                                 "of": len(c.enabled), "held_out_rmse_F": c.report, "in_use": "external" if self.ml_external else "ridge"}
                 _LOGGER.info("ML correction trained on %s rows; enabled for %s of %s room/horizon pairs", n,
                              sum(c.enabled.values()), len(c.enabled))
             else:
@@ -1233,13 +1246,20 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     async def ws_model_history(hass, connection, msg):
         connection.send_result(msg["id"], mgr.model_history(msg["hours"]))
 
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/reload_ml"})
+    @websocket_api.async_response
+    async def ws_reload_ml(hass, connection, msg):
+        """Load the ML correction again (after a new room_climate_ml_external.json was copied in)."""
+        await mgr._load_ml()
+        connection.send_result(msg["id"], mgr.ml_state)
+
     @websocket_api.websocket_command({"type": f"{DOMAIN}/fit_model"})
     @websocket_api.async_response
     async def ws_fit_model(hass, connection, msg):
         hass.async_create_task(mgr.async_fit())
         connection.send_result(msg["id"], {"started": True})
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_fit_model,
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_fit_model, ws_reload_ml,
                ws_experiment_start, ws_experiment_stop):
         websocket_api.async_register_command(hass, fn)
 
