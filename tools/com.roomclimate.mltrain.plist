@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Daily: pull the logs and ML rows from the Home Assistant Green and train the ML correction here (tools/ml_train_local.py).
+<!-- Daily: pull the logs and ML rows from the Home Assistant Green, train the ML correction here (tools/ml_train_local.py) and,
+     if the walk-forward shows the blend clearly better than the physics model at every horizon, push it to the Green (--push).
      Runs from the clone outside ~/Documents (macOS blocks launchd jobs there). At 04:15, after the Green's 03:40 physics fit
      and 03:58 ML training; a run missed while the Mac sleeps happens when it wakes. Install:
        cp tools/com.roomclimate.mltrain.plist ~/Library/LaunchAgents/
@@ -14,6 +15,7 @@
     <string>/Users/kirencaldwell/.local/share/room-climate-watch/analysis-venv/bin/python</string>
     <string>/Users/kirencaldwell/.local/share/room-climate-watch/repo/tools/ml_train_local.py</string>
     <string>--sync</string>
+    <string>--push</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/kirencaldwell/.local/share/room-climate-watch/repo</string>
   <key>StartCalendarInterval</key>
