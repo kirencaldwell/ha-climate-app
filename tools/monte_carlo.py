@@ -106,6 +106,9 @@ def run_one(job):
     settings = coupled.settings_from_config(cfg)
     settings.band_by_weight = os.environ.get("BAND_BY_WEIGHT", "1") == "1"  # A/B for the per-room dead zone
     settings.band_min_scale = float(os.environ.get("BAND_MIN", settings.band_min_scale))
+    for kv in filter(None, os.environ.get("SETTINGS", "").split(",")):  # "switch_acc=3,switch_min_s=1800": settings A/B
+        k, v = kv.split("=")
+        setattr(settings, k, type(getattr(settings, k))(float(v)) if not isinstance(getattr(settings, k), bool) else v == "1")
     t0 = datetime.fromisoformat(start)
     w = coupled.Weather(t0, int(hours / 24) + 2, mean=rng.uniform(42, 48) if cycle else rng.uniform(44, 54),
                         seed=seed * 1000 + i)

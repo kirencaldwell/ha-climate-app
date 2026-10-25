@@ -72,7 +72,7 @@ class Settings:
     band_below: float = 1.5
     band_above: float = 1.0
     band_min_scale: float = 0.0  # ...but never below this fraction of the global band (a tight band makes the house flip heat/cool)
-    band_by_weight: bool = False  # scale a room's dead zone by its allowed error (1/sqrt(weight)): a heavy room is held tighter
+    band_by_weight: bool = True  # scale a room's dead zone by its allowed error (1/sqrt(weight)): a heavy room is held tighter
     warm_weight: float = 2.0
     aim_offset: float = 0.5
     # House-wide hard limits: a room past these outweighs any priority.
@@ -94,7 +94,7 @@ class Settings:
     # 3's coasts 0.3-0.4, the midday sun on it 6-7, a cold first floor at 6am 23). "thresholds": the older rules (start_cost, ratio, margin,
     # switch_confirm_s, min_mode_s). Either way the vote reads each room smoothed over vote_smooth_min, not a trend.
     switch_mode: str = "accumulate"
-    switch_acc: float = 1.5  # tuned on the Oct 16-18 logs (44 real switches -> 7 replayed) and the sim
+    switch_acc: float = 5.0  # was 1.5 (tuned on Oct 16-18). 5 with the per-weight dead zone: fewer flips AND tighter tracking in the 10-24 Monte Carlo
     start_acc: float = 0.5
     switch_leak_min: float = 60.0
     switch_min_s: int = 600  # compressor protection: at least this long in a mode before reversing

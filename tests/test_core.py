@@ -154,7 +154,7 @@ def _house_started(bed=67.0, down=67.0, bed_pred=None, down_pred=None, busy=None
 
 
 def test_costs_zero_inside_band_and_floor_beats_priority():
-    s = NEUTRAL
+    s = dataclasses.replace(NEUTRAL, band_by_weight=False)  # the global band, whatever the weight
     hi_pri = Room("a", "A", "u", priority=5, default_temp=67)
     lo_pri = Room("b", "B", "u", priority=1, default_temp=67)
     assert core.room_costs(hi_pri, 66.2, None, MON, s) == (0.0, 0.0)  # inside 66-68.5
@@ -167,8 +167,9 @@ def test_costs_zero_inside_band_and_floor_beats_priority():
 
 def test_prediction_counts_before_it_happens():
     r = Room("a", "A", "u", priority=5, default_temp=67)
-    assert core.room_costs(r, 68.0, None, MON)[1] == 0
-    assert core.room_costs(r, 68.0, 70.0, MON)[1] > 0  # heading over the band -> already hot demand
+    s = Settings(band_by_weight=False)
+    assert core.room_costs(r, 68.0, None, MON, s)[1] == 0
+    assert core.room_costs(r, 68.0, 70.0, MON, s)[1] > 0  # heading over the band -> already hot demand
 
 
 def test_predict_trend():
@@ -596,6 +597,7 @@ def test_rooms_sharing_a_unit_vote_with_their_net_demand():
              Room("lr", "Living", "ah", sensor="s.lr", priority=1, default_temp=67),
              Room("b1", "Bedroom 1", "ah", sensor="s.b1", priority=1, default_temp=67)]
     heating = core.HouseState("heat", MON - timedelta(hours=2))
+    NEUTRAL = dataclasses.replace(globals()["NEUTRAL"], band_by_weight=False)
     readings = {"k": (67.0, MON), "lr": (65.3, MON), "b1": (65.2, MON)}  # kitchen 0.5 over (P2); the others 0.7-0.8 under
     _, h, info = core.control_step(units, rooms, readings, {}, {}, {}, heating, MON, NEUTRAL)
     assert h.mode == "heat" and h.pending is None and info["hot"] == 0
@@ -617,7 +619,7 @@ def test_separate_zones_still_vote_separately():
 
 # --- comfort leans cool (the household prefers a sweater to being too warm) ---
 def test_comfort_band_and_costs_lean_cool():
-    s = Settings()
+    s = Settings(band_by_weight=False)
     r = Room("r", "R", "u", priority=3, default_temp=67)
     assert core.room_costs(r, 65.6, None, MON, s) == (0.0, 0.0)  # 1.4 under: still comfortable
     assert core.room_costs(r, 68.4, None, MON, s)[1] > 0  # 1.4 over: too warm
@@ -856,3 +858,14 @@ def test_house_error_is_weighted_and_shares_add_up():
     by = {r["id"]: r for r in s["rooms"]}
     assert by["a"]["allowable_F"] == 0.33 and by["a"]["within"] is False and by["b"]["allowable_F"] == 1.0
     assert core.house_error([a], {}, now) is None
+
+
+def test_dead_zone_shrinks_with_weight():
+    s = Settings()
+    assert core.room_band(1, s) == (1.5, 1.0)
+    below, above = core.room_band(4, s)
+    assert abs(below - 0.75) < 1e-9 and abs(above - 0.5) < 1e-9
+    r = Room("r", "R", "u", priority=4, default_temp=67)
+    assert core.room_costs(r, 66.4, None, MON, s)[0] == 0  # 0.6 under: inside a weight-4 room's 0.75
+    assert core.room_costs(r, 66.0, None, MON, s)[0] > 0   # 1.0 under: outside it (the global 1.5 band would say fine)
+    assert core.room_costs(r, 66.0, None, MON, dataclasses.replace(s, band_by_weight=False))[0] == 0
