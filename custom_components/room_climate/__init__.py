@@ -493,7 +493,8 @@ class Manager:
         fan_units = {x.strip() for x in settings.fan_units.split(",")}
         m = self.shadow.model
         ours = experiment.order(ours, experiment.leaky_units(m.rooms.values() if m else ()))
-        self.data["experiment"] = experiment.plan(now, hours, ours, fan_units, mode)
+        self.data["experiment"] = experiment.plan(now, hours, ours, fan_units, mode,
+                                                    experiment.leaky_units(m.rooms.values() if m else ()))
         _LOGGER.info("experiment started: %s h in %s mode for %s", hours, mode, ", ".join(ours))
         await self.async_save()
         await self.async_tick()
@@ -934,7 +935,7 @@ class Manager:
         row["mpc"] = self.shadow.log_fields()  # what the model-based controller would do
         if getattr(self, "exp_block", None):
             b = self.exp_block
-            row["exp"] = {"kind": b["kind"], "unit": b.get("unit"), "fan": b.get("fan")}
+            row["exp"] = {"kind": b["kind"], "unit": b.get("unit"), "fan": b.get("fan"), "off": b.get("off") or []}
         f = self.forecast
         if f is not None and f["at"] != self._forecast_logged:  # each fetched forecast, once (next 6 h)
             self._forecast_logged = f["at"]

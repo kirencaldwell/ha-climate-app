@@ -6,6 +6,9 @@ A plan is a list of blocks over the time allotted:
 - "solo": one unit runs at a steady push while the others idle (its effect on every room, and its lag). A unit whose
   fan we control sweeps its fan speeds in 15-minute steps during its run (each speed's share of its output), quiet to
   auto, then the other way round next time, so a speed isn't always at the same point in a run.
+  In the first round (and every second one after) the solos of the units WITHOUT a leak run with the leaky units
+  switched fully OFF (not idling in their mode): against the same solos in the other rounds and everyday running, it shows whether the leak needs the leaky unit to be on
+  (a path through its own coil or refrigerant circuit) or is the room's own response to the compressor/house.
 - "coast": everything idles after a solo (how long its effect lingers).
 - "restore": the last hour is normal control, so the house is back on schedule when the time is up.
 
@@ -55,18 +58,22 @@ def order(unit_ids: list, leaky=()) -> list:
     return sorted(unit_ids, key=lambda u: u not in leaky)
 
 
-def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat") -> dict:
-    """{"start", "end", "mode", "blocks": [{"start", "end", "kind", "unit", "fan"}]} with ISO times."""
+def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat", leaky=()) -> dict:
+    """{"start", "end", "mode", "blocks": [{"start", "end", "kind", "unit", "fan", "off"}]} with ISO times. `off` lists the
+    units held fully off during the block (the leak test: see the module doc)."""
     hours = max(MIN_H, min(MAX_H, hours))
     end = start + timedelta(hours=hours)
     restore = end - timedelta(minutes=RESTORE_MIN)
     blocks, t, rnd = [], start, 0
 
-    def add(kind, minutes, unit=None, fan=None):
+    leaky = [u for u in unit_ids if u in set(leaky)]
+
+    def add(kind, minutes, unit=None, fan=None, off=()):
         nonlocal t
         stop = min(restore, t + timedelta(minutes=minutes))
         if stop - t >= timedelta(minutes=15):
-            blocks.append({"start": t.isoformat(), "end": stop.isoformat(), "kind": kind, "unit": unit, "fan": fan})
+            blocks.append({"start": t.isoformat(), "end": stop.isoformat(), "kind": kind, "unit": unit, "fan": fan,
+                           "off": list(off)})
         t = stop
 
     add("float", FLOAT_MIN)
@@ -74,15 +81,16 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
         for uid in unit_ids:
             if t >= restore - timedelta(minutes=15):
                 break
+            off = leaky if (rnd % 2 == 0 and uid not in leaky) else ()  # the leak test: leaky units fully off
             if uid in fan_units:
                 for fan in (FAN_CYCLE if rnd % 2 == 0 else FAN_CYCLE[::-1]):
-                    add("solo", FAN_STEP_MIN, uid, fan)
+                    add("solo", FAN_STEP_MIN, uid, fan, off)
             else:
-                add("solo", SOLO_MIN, uid)
+                add("solo", SOLO_MIN, uid, None, off)
             add("coast", COAST_MIN)
         rnd += 1
         add("float", FLOAT_MIN // 2)
-    blocks.append({"start": restore.isoformat(), "end": end.isoformat(), "kind": "restore", "unit": None, "fan": None})
+    blocks.append({"start": restore.isoformat(), "end": end.isoformat(), "kind": "restore", "unit": None, "fan": None, "off": []})
     return {"start": start.isoformat(), "end": end.isoformat(), "mode": mode, "blocks": blocks}
 
 
@@ -101,7 +109,8 @@ def describe(b: Optional[dict], names: dict = None) -> str:
     return {"float": "all units idle (the house drifts)",
             "coast": "all units idle (after a run)",
             "restore": "back to normal control before the time is up",
-            "solo": f"{nm} only" + (f", fan {b['fan']}" if b.get("fan") else "")}[b["kind"]]
+            "solo": f"{nm} only" + (f", fan {b['fan']}" if b.get("fan") else "")
+            + (f", {', '.join((names or {}).get(u, u) for u in b['off'])} switched off" if b.get("off") else "")}[b["kind"]]
 
 
 def commands(b: dict, mode: str, cmds: dict, unit_rooms: dict, readings: dict, settings: core.Settings) -> dict:
@@ -117,6 +126,9 @@ def commands(b: dict, mode: str, cmds: dict, unit_rooms: dict, readings: dict, s
         temps = [readings[r] for r in unit_rooms.get(uid, []) if readings.get(r) is not None]
         solo = b["kind"] == "solo" and b.get("unit") == uid
         why = f"experiment: {describe(b)}"
+        if uid in (b.get("off") or ()) and not (mode == "heat" and temps and min(temps) < settings.floor):
+            out[uid] = core.Command("off", None, why)  # the leak test: this unit fully off, not idling in its mode
+            continue
         if mode == "heat" and temps and min(temps) < settings.floor:
             solo, why = True, "experiment: a room is below the floor; heating"  # never let the empty house get cold
         elif solo and temps and (max(temps) >= settings.ceiling + CEILING_EXTRA - 0.5 if mode == "heat" else min(temps) <= settings.floor + 0.5):

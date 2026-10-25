@@ -71,6 +71,30 @@ def test_solo_unit_pushes_and_the_others_idle():
     assert cold["air_handler"].active and not cold["minisplit_1"].active
 
 
+def test_leak_test_runs_the_other_solos_with_the_leaky_unit_fully_off():
+    start = datetime.fromisoformat("2026-10-25T09:00:00-07:00")
+    p = ex.plan(start, 8, ["ms2", "ms1", "ah"], fan_units=("ms1",), mode="heat", leaky=("ms2",))  # an 8 h day covers it
+    offs = [b for b in p["blocks"] if b.get("off")]
+    assert offs and all(b["kind"] == "solo" and b["off"] == ["ms2"] and b["unit"] != "ms2" for b in offs)
+    assert {b["unit"] for b in offs} == {"ms1", "ah"}  # each non-leaky unit's solo is repeated with the leaky unit off
+    longer = ex.plan(start, 14, ["ms2", "ms1", "ah"], fan_units=("ms1",), mode="heat", leaky=("ms2",))
+    assert [b for b in longer["blocks"] if b["kind"] == "solo" and b["unit"] in ("ms1", "ah") and not b["off"]]  # later rounds pair
+    assert not [b for b in p["blocks"] if b["unit"] == "ms2" and b["off"]]  # the leaky unit's own solo is never off
+    assert "switched off" in ex.describe(offs[0])
+    none = ex.plan(start, 10, ["ms2", "ms1"], mode="heat")  # no leaky unit: nothing to switch off
+    assert not any(b.get("off") for b in none["blocks"])
+
+
+def test_leaky_unit_is_commanded_off_in_the_test_block_but_not_below_the_floor():
+    s = core.Settings()
+    b = {"kind": "solo", "unit": "ah", "fan": None, "off": ["ms2"]}
+    cmds = {u: core.Command("heat", 68.0, "x", False, 68.0, 68.0, 68.0, 0.0) for u in ("ah", "ms2")}
+    out = ex.commands(b, "heat", cmds, {"ah": ["k"], "ms2": ["b3"]}, {"k": 66.0, "b3": 67.0}, s)
+    assert out["ms2"].mode == "off" and out["ah"].mode == "heat"
+    cold = ex.commands(b, "heat", cmds, {"ah": ["k"], "ms2": ["b3"]}, {"k": 66.0, "b3": s.floor - 1}, s)
+    assert cold["ms2"].mode == "heat"  # a room under the floor is heated whatever the test says
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
