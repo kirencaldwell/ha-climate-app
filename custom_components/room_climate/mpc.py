@@ -19,12 +19,14 @@ from datetime import datetime, timedelta
 
 try:
     from . import core
+    from . import joint
     from . import mlmodel
     from . import model as hm
     from . import observer
     from . import optimizer
 except ImportError:  # offline
     import core  # type: ignore
+    import joint  # type: ignore
     import mlmodel  # type: ignore
     import model as hm  # type: ignore
     import observer  # type: ignore
@@ -103,6 +105,18 @@ class ShadowPlanner:
         # model was live), the daily-trained corrector, and its scores next to the physics model's.
         self.ml_rows: list = []  # [iso time, room, horizon, real change, features], until drained to the log
         self.corrector = None
+        # The joint run/fan planner (joint.py), shadow only: what it would do if it ran the house, every 15 min, with its own
+        # hypothetical house mode. Slow (pure-Python search), so it backs off if a plan takes too long.
+        self.joint = joint.JointPlanner()
+        self.joint_every = timedelta(minutes=15)
+        self.next_joint: datetime = None
+        self.jhouse = core.HouseState()
+        self.jplan = None
+        self.jplan_at: datetime = None
+        self.jplan_ms: float = None
+        self.jerror: str = None
+        self.jflips: deque = deque()  # when the joint planner would have switched heat <-> cool
+        self.jlast_mode: str = None
         self.ml_errors: deque = deque()  # (t_eval, room, horizon_min, corrected err, physics err)
 
     def set_model(self, m: hm.HouseModel):
@@ -303,6 +317,40 @@ class ShadowPlanner:
             self.error = None
         except Exception as e:  # never let the model take the integration down; show it instead
             self.error = f"{type(e).__name__}: {e}"
+        if settings.joint_shadow and (self.next_joint is None or now >= self.next_joint):
+            slow = self.jplan_ms is not None and self.jplan_ms > 120_000  # a plan over 2 min: try less often
+            self.next_joint = now + self.joint_every * (4 if slow else 1)
+            try:
+                self._joint_plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {})
+                self.jerror = None
+            except Exception as e:
+                self.jerror = f"{type(e).__name__}: {e}"
+
+    def _joint_plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed):
+        """What the joint planner would do now, with its own pretend house mode (never sent anywhere)."""
+        t0 = time.perf_counter()
+        running = {u: bool(a.get("running")) for u, a in actual.items()}
+        p = self.joint.plan(self.model, rooms, units, temps, now, self.jhouse, running, outdoor, sun_at, settings,
+                            ignore=set(ignore), fixed=fixed, lagged=dict(self.lagged),
+                            fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses),
+                            comp=dict(self.comp), **self.observer.corrections())
+        mode = self.jhouse.mode
+        if mode not in ("heat", "cool"):
+            want = p.mode if p.mode != "off" else "heat"
+            benefit = 0.0 if p.mode == "off" else p.by_mode["off"]["cost"] - p.cost
+            self.jhouse, _ = core.choose_mode(benefit if want == "heat" else 0.0, benefit if want == "cool" else 0.0,
+                                              self.jhouse, now, settings)
+        elif p.mode != mode:
+            self.jhouse = core.HouseState(p.mode, now)
+        new = self.jhouse.mode
+        if new in ("heat", "cool"):
+            if self.jlast_mode in ("heat", "cool") and new != self.jlast_mode:
+                self.jflips.append(now)
+            self.jlast_mode = new
+        while self.jflips and now - self.jflips[0] > self.keep:
+            self.jflips.popleft()
+        self.jplan, self.jplan_at = p, now
+        self.jplan_ms = round((time.perf_counter() - t0) * 1000, 1)
 
     def _project(self, now, temps, actual, outdoor, sun_at, horizon_min=120, step_min=10):
         """What the model expects over the next 2 h if every unit keeps its current mode and setpoint."""
@@ -433,10 +481,18 @@ class ShadowPlanner:
         self.ml_errors = deque((p(t), r, h, e, b) for t, r, h, e, b in d.get("ml_errors", []) if p(t) >= keep_since)
 
     # --- reporting ---
+    def joint_fields(self) -> dict:
+        p = self.jplan
+        if p is None:
+            return None
+        return {"house": self.jhouse.mode, "cost": round(p.cost, 3), "comfort": p.comfort, "fans": p.fans,
+                "run": {u: (v[0] if v else "off") for u, v in p.pattern.items()},
+                "next": {u: (v[1] if len(v) > 1 else v[0]) for u, v in p.pattern.items() if v}}
+
     def log_fields(self) -> dict:
         if self.plan is None:
             return None
-        return {"house": self.house.mode, "units": self.decision, "cost": round(self.plan.cost, 3),
+        return {"joint": self.joint_fields(), "house": self.house.mode, "units": self.decision, "cost": round(self.plan.cost, 3),
                 "comfort": self.plan.comfort, "costs": {k: v["cost"] for k, v in self.plan.by_mode.items()}}
 
     def accuracy(self) -> dict:
@@ -496,6 +552,10 @@ class ShadowPlanner:
                 "cost": round(p.cost, 3), "by_mode": p.by_mode, "setpoints": p.setpoints, "later": p.later,
                 "step_min": self.ps.step_min},
             "decision": self.decision,
+            "joint": None if self.jplan is None else {
+                "at": self.jplan_at.isoformat(), "ms": self.jplan_ms, "house": self.jhouse.mode, "mode": self.jplan.mode,
+                "reason": self.jplan.reason, "cost": round(self.jplan.cost, 3), "pattern": self.jplan.pattern,
+                "fans": self.jplan.fans, "flips_24h": len(self.jflips), "error": self.jerror},
             "observer": self.observer.to_state(),
             "ml": {"corrector": self.corrector is not None, "rows_waiting": len(self.ml_rows),
                    "enabled": {k: v for k, v in (self.corrector.enabled.items() if self.corrector else [])}},

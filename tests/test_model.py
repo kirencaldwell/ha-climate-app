@@ -187,7 +187,8 @@ def test_plan_errs_cool_when_it_has_to_miss():
     q = optimizer.plan(m, rooms, units, {"down": 66.5, "up": 66.5}, NIGHT, house, {"ah": 67, "ms": 67}, {},
                        [50.0] * n, [0.0] * n, s, ps)
     assert sum(q.setpoints.values()) < sum(p.setpoints.values())  # the cool-leaning defaults plan lower setpoints
-    assert optimizer.band_cost(68.5, 67, 3, s) == 2 * optimizer.band_cost(65.0, 67, 3, s)  # 0.5 past each edge
+    g = core.Settings(band_by_weight=False)  # the global band, whatever the weight
+    assert optimizer.band_cost(68.5, 67, 3, g) == 2 * optimizer.band_cost(65.0, 67, 3, g)  # 0.5 past each edge
 
 
 def test_units_on_their_thermostat_are_left_alone_and_set_the_mode():

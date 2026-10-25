@@ -1,4 +1,5 @@
 """The "would do" planner and live accuracy tracking, run against the simulated house. Run: python3 tests/test_mpc.py"""
+import dataclasses
 import os
 import sys
 from datetime import datetime, timedelta
@@ -197,6 +198,26 @@ def test_planner_and_projection_use_a_forecast():
     assert cold.error is None and warm.error is None, (cold.error, warm.error)
     c, h = cold.projection["temps"]["kitchen"][-1][1], warm.projection["temps"]["kitchen"][-1][1]
     assert h > c  # a warming forecast makes the house expected warmer in 2 h
+
+
+def test_joint_planner_runs_in_shadow_and_never_touches_the_decision():
+    truth, rooms, units, s = _house()
+    start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
+    w = coupled.Weather(start, 2, mean=50, seed=5)
+    temps = {r.id: 64.0 for r in rooms}
+    actual = {u.id: {"mode": "heat", "setpoint": 66.0, "running": False} for u in units}
+    off = mpc.ShadowPlanner()
+    off.set_model(truth)
+    off.run(start, rooms, units, temps, actual, w.outdoor(start), w.sun, dataclasses.replace(s, joint_shadow=False))
+    on = mpc.ShadowPlanner()
+    on.set_model(truth)
+    on.run(start, rooms, units, temps, actual, w.outdoor(start), w.sun, dataclasses.replace(s, joint_shadow=True))
+    assert off.jplan is None and on.jerror is None and on.jplan is not None
+    assert on.decision == off.decision and on.house.mode == off.house.mode  # the joint plan changes nothing
+    f = on.log_fields()["joint"]
+    assert f["house"] in ("off", "heat", "cool") and set(f["run"]) <= {u.id for u in units}
+    assert on.debug(start)["joint"]["flips_24h"] == 0
+    print("joint plan ms", on.jplan_ms)
 
 
 if __name__ == "__main__":
