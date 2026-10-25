@@ -851,7 +851,8 @@ class Manager:
             if not r.sensor:
                 continue
             t = core.target_temp(r, now)
-            targets[r.id] = {"name": r.name, "unit": r.unit, "target": t, "band": [t - s.band_below, t + s.band_above],
+            bl, ab = core.room_band(core.room_priority(r, now), s)
+            targets[r.id] = {"name": r.name, "unit": r.unit, "target": t, "band": [t - bl, t + ab],
                              "prio": core.room_priority(r, now)}
         today = {}
         for ud in self.data["units"]:

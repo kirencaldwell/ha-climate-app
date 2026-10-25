@@ -60,9 +60,10 @@ class Plan:
 def band_cost(temp: float, target: float, weight: float, settings: core.Settings) -> float:
     """Same cold + hot cost as core.room_costs for a known temperature (no prediction, no free cooling). `weight` is the
     room's weight; the miss is scaled by its allowable error (core.allowable_error), i.e. multiplied by weight / ref^2."""
+    below, above = core.room_band(weight, settings)
     weight = core.error_weight(weight, settings.allowable_ref_f)
-    cold = weight * max(0.0, (target - settings.band_below) - temp) ** 2 + settings.hard_weight * max(0.0, settings.floor - temp) ** 2
-    hot = settings.warm_weight * weight * max(0.0, temp - (target + settings.band_above)) ** 2 + settings.hard_weight * max(0.0, temp - settings.ceiling) ** 2
+    cold = weight * max(0.0, (target - below) - temp) ** 2 + settings.hard_weight * max(0.0, settings.floor - temp) ** 2
+    hot = settings.warm_weight * weight * max(0.0, temp - (target + above)) ** 2 + settings.hard_weight * max(0.0, temp - settings.ceiling) ** 2
     return cold + hot
 
 

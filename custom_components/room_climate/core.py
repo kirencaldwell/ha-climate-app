@@ -71,6 +71,8 @@ class Settings:
     # target, a miss above it costs `warm_weight` times a miss below, and heating aims `aim_offset` under the target.
     band_below: float = 1.5
     band_above: float = 1.0
+    band_min_scale: float = 0.0  # ...but never below this fraction of the global band (a tight band makes the house flip heat/cool)
+    band_by_weight: bool = False  # scale a room's dead zone by its allowed error (1/sqrt(weight)): a heavy room is held tighter
     warm_weight: float = 2.0
     aim_offset: float = 0.5
     # House-wide hard limits: a room past these outweighs any priority.
@@ -259,6 +261,14 @@ def allowable_error(weight: float, ref: float = 1.0) -> float:
     return ref / math.sqrt(max(weight, 1e-9))
 
 
+def room_band(weight: float, settings: "Settings") -> tuple[float, float]:
+    """(below, above): how far under / over target a room may be before it costs anything. The global band_below /
+    band_above at weight 1; scaled by the room's allowed error otherwise (weight 10 -> about a third)."""
+    k = max(settings.band_min_scale, allowable_error(weight, settings.allowable_ref_f) / settings.allowable_ref_f) \
+        if settings.band_by_weight else 1.0
+    return settings.band_below * k, settings.band_above * k
+
+
 def error_weight(weight: float, ref: float = 1.0) -> float:
     """What the planner multiplies a room's squared miss by: 1 / allowable_error(weight)^2, i.e. the miss measured in
     units of the room's allowable error. At the default ref of 1 F this is the weight itself."""
@@ -357,15 +367,17 @@ def room_costs(room: Room, current: float, predicted: Optional[float], now: date
     With `free_delta` set and an outdoor temperature, comfort demand the weather will settle by itself is dropped;
     the hard floor/ceiling always count."""
     t = target_temp(room, now)
-    w = error_weight(room_priority(room, now), settings.allowable_ref_f)
+    raw_w = room_priority(room, now)
+    w = error_weight(raw_w, settings.allowable_ref_f)
+    below, above = room_band(raw_w, settings)
     lo = current if predicted is None else min(current, predicted)
     hi = current if predicted is None else max(current, predicted)
     free = settings.free_delta is not None and outdoor is not None
     free_cool = free and outdoor <= current - settings.free_delta
     free_heat = free and outdoor >= current + settings.free_delta
-    cold = (0.0 if free_heat else w * max(0.0, (t - settings.band_below) - lo) ** 2) \
+    cold = (0.0 if free_heat else w * max(0.0, (t - below) - lo) ** 2) \
         + settings.hard_weight * max(0.0, settings.floor - lo) ** 2
-    hot = (0.0 if free_cool else settings.warm_weight * w * max(0.0, hi - (t + settings.band_above)) ** 2) \
+    hot = (0.0 if free_cool else settings.warm_weight * w * max(0.0, hi - (t + above)) ** 2) \
         + settings.hard_weight * max(0.0, hi - settings.ceiling) ** 2
     return cold, hot
 

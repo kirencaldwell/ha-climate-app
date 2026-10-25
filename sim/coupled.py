@@ -384,7 +384,8 @@ def run(truth: hm.HouseModel, rooms, units, controller, start: datetime, days: f
         for r in scored:
             t, tgt, w = sim.temps[r.id], core.target_temp(r, now), core.room_priority(r, now)
             disc[r.id] += optimizer.band_cost(t, tgt, w, settings) / 60
-            dev = max((tgt - settings.band_below) - t, t - (tgt + settings.band_above), 0.0)
+            bl, ab = core.room_band(w, settings)
+            dev = max((tgt - bl) - t, t - (tgt + ab), 0.0)
             out_min[r.id] += dev > 0
             worst[r.id] = max(worst[r.id], dev)
             signed[r.id] += t - tgt
