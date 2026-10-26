@@ -23,19 +23,31 @@ except ImportError:  # offline
 HORIZONS = (30, 60, 120)
 STEP_MIN = 2  # replay step
 FEATURES = ["ode", "dT_out", "out_h", "trend10", "trend30", "nbr1", "nbr2", "own_y", "oth_y", "comp_frac", "t_on0",
-            "heat_frac", "sun_mean", "sun0", "hsin", "hcos"]
+            "heat_frac", "sun_mean", "sun0", "hsin", "hcos", "inlet_gap", "inlet_d10"]
+NF = len(FEATURES)
+NF_V1 = 16  # models saved before the inlet features have no `nf`: they were trained on the first 16
+
+
+def pad(rows: list) -> list:
+    """Rows logged before a feature existed get 0 for it (rows are [time, room, horizon, change, features])."""
+    for r in rows:
+        if len(r[4]) < NF:
+            r[4] = list(r[4]) + [0.0] * (NF - len(r[4]))
+    return rows
 
 
 def make_features(ode, T0, out0, out_mean, T10, T30, nb1, nb2, own_y, oth_y, comp_frac, t_on0_min, heat_frac, sun_mean,
-                  sun0, hour) -> list:
+                  sun0, hour, inlet_gap=0.0, inlet_d10=0.0) -> list:
     """The feature vector (FEATURES order), shared by the offline benchmark and the live logger so they can't drift:
     ode: the physics model's predicted change over the horizon; dT_out: room minus outdoor now; out_h: mean outdoor over
     the horizon minus the room; trend10/30: the room's change over the last 10/30 min; nbr1/2: its two strongest-coupled
     neighbours minus the room; own_y/oth_y: mean signed output of the room's own unit / of the other units over the
     horizon; comp_frac: share of the horizon the compressor ran; t_on0: hours it had already run (cap 1.5); heat_frac:
-    share of it in heat mode; sun_mean/sun0: overhead sun index over the horizon / now; hsin/hcos: time of day."""
+    share of it in heat mode; sun_mean/sun0: overhead sun index over the horizon / now; hsin/hcos: time of day;
+    inlet_gap: the room's own unit's inlet sensor minus the room (0 while the unit is fed the room sensor, which it then
+    echoes); inlet_d10: that inlet's change over the last 10 min."""
     return [ode, T0 - out0, out_mean - T0, T0 - T10, T0 - T30, nb1, nb2, own_y, oth_y, comp_frac, min(t_on0_min, 90) / 60,
-            heat_frac, sun_mean, sun0, math.sin(2 * math.pi * hour / 24), math.cos(2 * math.pi * hour / 24)]
+            heat_frac, sun_mean, sun0, math.sin(2 * math.pi * hour / 24), math.cos(2 * math.pi * hour / 24), inlet_gap, inlet_d10]
 
 
 class Inputs:
@@ -77,6 +89,7 @@ class Inputs:
             t = t + 1 if any(ran.values()) else 0
             self.t_on.append(t)
         self.exp = [bool(r.get("exp")) for r in rows]
+        self.utemp = [{u: x.get("temp") for u, x in (r.get("units") or {}).items()} for r in rows]  # unit inlet sensors
 
 
 def own_unit(m: hm.HouseModel, rid: str):
@@ -133,6 +146,9 @@ def feature_rows(m: hm.HouseModel, inp: Inputs, i: int, with_target: bool = True
         nb = [inp.T[j][i] - T0 if inp.T[j][i] is not None else 0.0 for j in neighbours(m, rid)]
         nb += [0.0] * (2 - len(nb))
         own = own_unit(m, rid)
+        u0, u10 = (inp.utemp[i].get(own), inp.utemp[i - 10].get(own)) if own else (None, None)
+        gap = (u0 - T0) if u0 is not None else 0.0
+        d10 = (u0 - u10) if (u0 is not None and u10 is not None) else 0.0
         for h in HORIZONS:
             if h not in pred or rid not in pred[h]:
                 continue
@@ -146,7 +162,7 @@ def feature_rows(m: hm.HouseModel, inp: Inputs, i: int, with_target: bool = True
             g = inp.ghi[i:i + h:5]
             f = make_features(pred[h][rid] - T0, T0, inp.out[i] if inp.out[i] is not None else T0, o_mean, inp.T[rid][i - 10],
                               inp.T[rid][i - 30], nb[0], nb[1], own_y, oth_y, onf[h], inp.t_on[i], heatf[h],
-                              sum(g) / len(g), inp.ghi[i], hour)
+                              sum(g) / len(g), inp.ghi[i], hour, gap, d10)
             out.append((rid, h, None if real is None else real - T0, f))
     return out
 
@@ -215,30 +231,31 @@ class MLCorrector:
     """Per horizon, one pooled ridge (rooms as one-hot features) predicting what the physics model gets wrong. A room's
     correction at a horizon is used only if it beat the physics model on that room's most recent held-out rows."""
 
-    def __init__(self, rooms: list, models: dict, enabled: dict, report: dict):
-        self.rooms, self.models, self.enabled, self.report = rooms, models, enabled, report
+    def __init__(self, rooms: list, models: dict, enabled: dict, report: dict, nf: int = NF):
+        self.rooms, self.models, self.enabled, self.report, self.nf = rooms, models, enabled, report, nf
 
     def correct(self, room: str, h: int, f: list) -> float:
         """Add this to the physics model's predicted change (0 when the correction isn't enabled there)."""
         mdl = self.models.get(h)
         if mdl is None or not self.enabled.get(f"{room}|{h}") or room not in self.rooms:
             return 0.0
-        return mdl.predict(f + [1.0 if room == q else 0.0 for q in self.rooms])
+        return mdl.predict(list(f[:self.nf]) + [1.0 if room == q else 0.0 for q in self.rooms])
 
     def to_dict(self):
         return {"rooms": self.rooms, "models": {str(h): m.to_dict() for h, m in self.models.items()},
-                "enabled": self.enabled, "report": self.report}
+                "enabled": self.enabled, "report": self.report, "nf": self.nf}
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["rooms"], {int(h): Ridge.from_dict(m) for h, m in d["models"].items()}, d["enabled"], d.get("report", {}))
+        return cls(d["rooms"], {int(h): Ridge.from_dict(m) for h, m in d["models"].items()}, d["enabled"], d.get("report", {}),
+                   d.get("nf", NF_V1))
 
 
 def train(rows: list, lam: float = 20.0, holdout: float = 0.25, min_rows: int = 150, min_gain: float = 0.03):
     """rows: [[iso time, room, horizon, real change, features]] logged by the live planner (the physics model's predictions
     at the time, so out-of-sample). Time-ordered split: fit on the first 1 - holdout, enable a room's correction at a
     horizon only if it cuts that room's held-out RMSE by `min_gain`; then refit on everything. -> MLCorrector or None."""
-    rows = sorted(rows, key=lambda r: r[0])
+    rows = sorted(pad(rows), key=lambda r: r[0])
     rooms = sorted({r[1] for r in rows})
     if not rooms:
         return None
@@ -303,8 +320,9 @@ class MLBlend:
 
     kind = "blend"
 
-    def __init__(self, rooms: list, ridge, trees: dict, weight: float = 0.5, report: dict = None):
+    def __init__(self, rooms: list, ridge, trees: dict, weight: float = 0.5, report: dict = None, nf: int = NF):
         self.rooms, self.ridge, self.trees, self.weight, self.report = rooms, ridge, trees, weight, report or {}
+        self.nf = nf  # how many features the trees were trained on (the physics prediction + the rest)
         self.enabled = ridge.enabled if ridge is not None else {}
 
     def correct(self, room: str, h: int, f: list) -> float:
@@ -312,18 +330,19 @@ class MLBlend:
         t = self.trees.get(h)
         if t is None or room not in self.rooms:
             return rc
-        pure = t.predict(f[1:] + [1.0 if room == q else 0.0 for q in self.rooms])
+        pure = t.predict(list(f[1:self.nf]) + [1.0 if room == q else 0.0 for q in self.rooms])
         return (1.0 - self.weight) * rc + self.weight * (pure - f[0])
 
     def to_dict(self):
-        return {"kind": "blend", "rooms": self.rooms, "weight": self.weight, "report": self.report,
+        return {"kind": "blend", "rooms": self.rooms, "weight": self.weight, "report": self.report, "nf": self.nf,
                 "ridge": self.ridge.to_dict() if self.ridge is not None else None,
                 "trees": {str(h): t.to_dict() for h, t in self.trees.items()}}
 
     @classmethod
     def from_dict(cls, d):
         return cls(d["rooms"], MLCorrector.from_dict(d["ridge"]) if d.get("ridge") else None,
-                   {int(h): Trees.from_dict(t) for h, t in d["trees"].items()}, d.get("weight", 0.5), d.get("report"))
+                   {int(h): Trees.from_dict(t) for h, t in d["trees"].items()}, d.get("weight", 0.5), d.get("report"),
+                   d.get("nf", NF_V1))
 
 
 def load(d: dict):

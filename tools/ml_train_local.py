@@ -76,14 +76,14 @@ def build_blend(rows, pure, corrector, weight=0.5):
     oh = {q: [1.0 if q == x else 0.0 for x in rooms] for q in rooms}
     trees = {}
     for h in mlmodel.HORIZONS:
-        pr = [r for v in pure.values() for r in v if r[2] == h]
+        pr = [r for v in pure.values() for r in mlmodel.pad(v) if r[2] == h]
         if len(pr) < 300:
             continue
         X = np.array([r[4][1:] + oh[r[1]] for r in pr])
         gb = HistGradientBoostingRegressor(max_depth=3, max_iter=120, learning_rate=0.05, l2_regularization=5.0,
                                            min_samples_leaf=30, random_state=0).fit(X, np.array([r[3] for r in pr]))
         trees[h] = export_hgb(gb, X)
-    return mlmodel.MLBlend(rooms, corrector, trees, weight) if trees else None
+    return mlmodel.MLBlend(rooms, corrector, trees, weight, nf=mlmodel.NF) if trees else None
 
 
 def rmse(v):
@@ -118,7 +118,7 @@ def evaluate(rows, eval_days, pure=None):
                 tres = tpure = None
             tall = None
             if np is not None and pure:
-                prows = [r for d_, v in pure.items() if d_ < day for r in v if r[2] == h]  # every earlier day, no physics needed
+                prows = [r for d_, v in pure.items() if d_ < day for r in mlmodel.pad(v) if r[2] == h]  # every earlier day, no physics needed
                 if len(prows) > 300:
                     Xp = np.array([r[4] + oh(r[1]) for r in prows])[:, 1:]
                     gb2 = dict(max_depth=3, max_iter=120, learning_rate=0.05, l2_regularization=5.0, min_samples_leaf=30, random_state=0)
@@ -187,6 +187,7 @@ def main():
         rows += json.load(open(boot[d]))
     n_boot = len(rows)
     rows += live
+    mlmodel.pad(rows)  # rows from before the inlet features existed get 0 there
     print(f"training rows: {n_boot} rebuilt from {len(days)} day(s) + {len(live)} live", flush=True)
     c = mlmodel.train(rows)
     report = {"at": datetime.now().astimezone().isoformat(timespec="seconds"), "rows_rebuilt": n_boot, "rows_live": len(live),

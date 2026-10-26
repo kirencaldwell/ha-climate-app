@@ -84,6 +84,24 @@ def test_tree_evaluator_and_the_blend():
     assert isinstance(mlmodel.load(ridge.to_dict()), mlmodel.MLCorrector)
 
 
+def test_models_trained_before_the_inlet_features_still_work():
+    rng = random.Random(3)
+    old_n = mlmodel.NF_V1
+    rows = [["2026-10-2%d" % (k % 5), "a", 60, rng.gauss(0, 1), [rng.gauss(0, 1) for _ in range(old_n)]] for k in range(400)]
+    c = mlmodel.train(rows)  # 16-wide rows are padded to the current width
+    assert c is not None and c.nf == mlmodel.NF and all(len(r[4]) == mlmodel.NF for r in rows)
+    f_new = [0.5] * mlmodel.NF
+    d = c.to_dict()
+    d.pop("nf")  # a model saved before `nf` existed was trained on the first NF_V1 features + the room one-hot
+    for m in d["models"].values():
+        m["mu"], m["sd"], m["w"] = m["mu"][:old_n] + m["mu"][-1:], m["sd"][:old_n] + m["sd"][-1:], m["w"][:old_n] + m["w"][-1:]
+    old = mlmodel.load(d)
+    assert old.nf == mlmodel.NF_V1
+    old.enabled = {"a|60": True}
+    assert isinstance(old.correct("a", 60, f_new), float)  # the two extra features are ignored, not shifted into the one-hot
+    assert abs(old.correct("a", 60, f_new) - old.correct("a", 60, f_new[:old_n])) < 1e-12
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

@@ -813,7 +813,7 @@ class Manager:
                 continue
             sp = cur.attributes.get("temperature")
             actual[u.id] = {"mode": cur.state, "running": cur.attributes.get("hvac_action") in ("heating", "cooling"),
-                            "fan": cur.attributes.get("fan_mode"),
+                            "fan": cur.attributes.get("fan_mode"), "temp": self._unit_temp(u.entity),
                             "setpoint": None if sp is None else TemperatureConverter.convert(float(sp), disp, F)}
         outdoor = self._outdoor(settings)
         ent = self._outdoor_entity(settings)

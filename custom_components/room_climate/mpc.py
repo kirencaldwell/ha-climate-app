@@ -91,6 +91,7 @@ class ShadowPlanner:
         self.errors: deque = deque()  # (t_eval, room, horizon_min, model_err, nochange_err)
         self.points: deque = deque()  # (t_eval, room, horizon_min, predicted F): for charts
         self.readings: dict = {}  # room -> deque[(t, F)]
+        self.inlets: dict = {}  # unit id -> deque[(t, F)]: the unit's own (inlet) sensor, for the ML features
         self.lagged: dict = {}  # unit id -> effective output now (model.step), followed from what the units really do
         self.masses: dict = {}  # room id -> its mass temperature now (rooms with a mass state), followed from readings
         self.comp: dict = {"h": 0.0}  # hours the shared compressor has been running (any unit running): for the start-up pulse
@@ -135,6 +136,13 @@ class ShadowPlanner:
                 d.append((now, v))
             while d and now - d[0][0] > self.keep:
                 d.popleft()
+        for uid, a in (actual or {}).items():
+            if a.get("temp") is not None:
+                d = self.inlets.setdefault(uid, deque())
+                if not d or (now - d[-1][0]).total_seconds() >= 55:
+                    d.append((now, a["temp"]))
+                while d and now - d[0][0] > timedelta(minutes=45):
+                    d.popleft()
         if self.model is None or actual is None:
             return
         try:
@@ -198,7 +206,17 @@ class ShadowPlanner:
             if t10 is None or t30 is None:
                 continue
             nb = [start[j] - T0 for j in mlmodel.neighbours(self.model, rid) if j in start]
-            rooms[rid] = (t10, t30, (nb + [0.0, 0.0])[:2])
+            own = mlmodel.own_unit(self.model, rid)
+            d = self.inlets.get(own) if own else None
+            u0 = d[-1][1] if d else None
+            u10 = None
+            for t, v in (d or ()):
+                if t > now - timedelta(minutes=10):
+                    break
+                u10 = v
+            gap = (u0 - T0) if u0 is not None else 0.0
+            d10 = (u0 - u10) if (u0 is not None and u10 is not None) else 0.0
+            rooms[rid] = (t10, t30, (nb + [0.0, 0.0])[:2], gap, d10)
         return {"rooms": rooms, "out0": outdoor if outdoor is not None else None, "sun0": as_h(sun),
                 "hour": now.hour + now.minute / 60, "t_on0": self.comp.get("h", 0.0) * 60}
 
@@ -208,13 +226,13 @@ class ShadowPlanner:
         if not ctx or not acc or rid not in ctx["rooms"] or acc["min"] <= 0 or ctx["out0"] is None:
             return
         T0 = rec["start"][rid]
-        t10, t30, nb = ctx["rooms"][rid]
+        t10, t30, nb, gap, d10 = ctx["rooms"][rid]
         own = mlmodel.own_unit(self.model, rid)
         ym = {u: v / acc["min"] for u, v in acc["y"].items()}
         f = mlmodel.make_features(pred - T0, T0, ctx["out0"], acc["o"] / acc["min"], t10, t30, nb[0], nb[1],
                                   ym.get(own, 0.0) if own else 0.0, sum(v for u, v in ym.items() if u != own),
                                   acc["on"] / acc["min"], ctx["t_on0"], acc["heat"] / acc["min"], acc["s"] / acc["min"],
-                                  ctx["sun0"], ctx["hour"])
+                                  ctx["sun0"], ctx["hour"], gap, d10)
         f = [round(x, 4) for x in f]
         self.ml_rows.append([now.isoformat(), rid, h, round(real - T0, 4), f])
         if self.corrector is not None:
