@@ -44,6 +44,8 @@ CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({vol.Optional("enabled"): bool})}
 ROOM_CLIMATE, THERMOSTAT, MODEL = "room_climate", "thermostat", "model"
 OURS = (ROOM_CLIMATE, MODEL)
 SIGNAL_CONTROL = f"{DOMAIN}_control"  # dispatched (unit id) when a unit's control changes
+RECONNECT_GRACE_S = 300  # a unit that just came back (reboot, firmware install, wifi) reports its own mode and setpoint
+#                          for a while: that is not someone using the thermostat, and the next ticks re-send ours
 OURS_GRACE_S = 30  # unit state changes this soon after we sent it something are its echo of our command
 BAD_STATES = ("unknown", "unavailable")
 MODEL_FILE = "room_climate_model.json"  # the fitted thermal model (model.py), refitted nightly
@@ -104,6 +106,7 @@ class Manager:
         self._coast: dict = {}  # unit id -> {"until", "room"}: its rooms coasting on the run that just ended
         self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
         self.zone_hist: dict[str, deque] = {}  # unit id -> [(time, its rooms' weighted reading)] for the loop's rate
+        self._back_at: dict[str, datetime] = {}  # unit id -> when it last came back from unavailable
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
         self._ours: list[str] = []  # context ids of our recent service calls
         self._audit_seen: dict[str, tuple] = {}
@@ -579,7 +582,14 @@ class Manager:
         if ud is None or ud.get("control") not in OURS or old is None or new is None:
             return
         if old.state in BAD_STATES or new.state in BAD_STATES:
+            if new.state not in BAD_STATES:
+                self._back_at[ud["id"]] = dt_util.utcnow()
             return  # dropping off and reconnecting is not a change of mind
+        back = self._back_at.get(ud["id"])
+        if back and core.elapsed(dt_util.utcnow(), back) < RECONNECT_GRACE_S:
+            _LOGGER.info("%s came back %s: keeping it under %s (its reported %s/%s is not a change of mind)", ud["id"],
+                         "just now", ud["control"], new.state, new.attributes.get("temperature"))
+            return  # (2026-10-25: firmware installs handed two units to their thermostats and the house sat in cool all day)
         sp_old, sp_new = old.attributes.get("temperature"), new.attributes.get("temperature")
         fan_old, fan_new = old.attributes.get("fan_mode"), new.attributes.get("fan_mode")
         if old.state == new.state and sp_old == sp_new and fan_old == fan_new:
