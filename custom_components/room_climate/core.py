@@ -95,7 +95,7 @@ class Settings:
     # 3's coasts 0.3-0.4, the midday sun on it 6-7, a cold first floor at 6am 23). "thresholds": the older rules (start_cost, ratio, margin,
     # switch_confirm_s, min_mode_s). Either way the vote reads each room smoothed over vote_smooth_min, not a trend.
     switch_mode: str = "accumulate"
-    switch_acc: float = 5.0  # was 1.5 (tuned on Oct 16-18). 5 with the per-weight dead zone: fewer flips AND tighter tracking in the 10-24 Monte Carlo
+    switch_acc: float = 3.0  # was 1.5 (Oct 16-18); 5 (10-26) held the house in cool 2 h with a weight-2 room 2.4 F under, so 3
     start_acc: float = 0.5
     switch_leak_min: float = 60.0
     switch_min_s: int = 600  # compressor protection: at least this long in a mode before reversing
