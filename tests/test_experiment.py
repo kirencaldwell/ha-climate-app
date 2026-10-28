@@ -76,7 +76,7 @@ def test_leak_test_runs_the_other_solos_with_the_leaky_unit_fully_off():
     p = ex.plan(start, 8, ["ms2", "ms1", "ah"], fan_units=("ms1",), mode="heat", leaky=("ms2",))  # an 8 h day covers it
     offs = [b for b in p["blocks"] if b.get("off")]
     assert offs and all(b["kind"] == "solo" and b["off"] == ["ms2"] and b["unit"] != "ms2" for b in offs)
-    assert {b["unit"] for b in offs} == {"ms1", "ah"}  # each non-leaky unit's solo is repeated with the leaky unit off
+    assert {b["unit"] for b in offs} == {"ms1", "ah"}  # each other unit's solo runs with the leaky unit off
     longer = ex.plan(start, 14, ["ms2", "ms1", "ah"], fan_units=("ms1",), mode="heat", leaky=("ms2",))
     assert [b for b in longer["blocks"] if b["kind"] == "solo" and b["unit"] in ("ms1", "ah") and not b["off"]]  # later rounds pair
     assert not [b for b in p["blocks"] if b["unit"] == "ms2" and b["off"]]  # the leaky unit's own solo is never off

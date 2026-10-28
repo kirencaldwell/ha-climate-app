@@ -6,8 +6,7 @@ A plan is a list of blocks over the time allotted:
 - "solo": one unit runs at a steady push while the others idle (its effect on every room, and its lag). A unit whose
   fan we control sweeps its fan speeds in 15-minute steps during its run (each speed's share of its output), quiet to
   auto, then the other way round next time, so a speed isn't always at the same point in a run.
-  In the first round (and every second one after) the solos of the units WITHOUT a leak run with the leaky units
-  switched fully OFF (not idling in their mode): against the same solos in the other rounds and everyday running, it shows whether the leak needs the leaky unit to be on
+  In the first round (and every second one after) every solo runs with the OTHER leaky units switched fully OFF (not idling in their mode): against the same solos in the other rounds and everyday running, it shows whether the leak needs the leaky unit to be on
   (a path through its own coil or refrigerant circuit) or is the room's own response to the compressor/house.
 - "coast": everything idles after a solo (how long its effect lingers).
 - "restore": the last hour is normal control, so the house is back on schedule when the time is up.
@@ -81,7 +80,7 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
         for uid in unit_ids:
             if t >= restore - timedelta(minutes=15):
                 break
-            off = leaky if (rnd % 2 == 0 and uid not in leaky) else ()  # the leak test: leaky units fully off
+            off = tuple(l for l in leaky if l != uid) if rnd % 2 == 0 else ()  # the leak test: the other leaky units fully off
             if uid in fan_units:
                 for fan in (FAN_CYCLE if rnd % 2 == 0 else FAN_CYCLE[::-1]):
                     add("solo", FAN_STEP_MIN, uid, fan, off)
