@@ -56,6 +56,9 @@ class JointSettings:
     terminal_h: float = 0.5
     switch_cost: float = 3.0
     switch_margin: float = 0.15
+    sleep_option: bool = True  # a unit that isn't needed may be switched fully OFF for a block, not just idle in the house mode:
+    #                            the 10-27/28 experiment showed an idle-in-heat unit passes the other compressor's heat to its room
+    #                            (Bedroom 3 +2 F in an hour of the Primary's run; fully off: +0.5, about the sun)
     max_fans: int = 3  # run options per fan-controlled unit besides "off": auto plus the lowest and a middle fan
     seed: int = 1
 
@@ -76,6 +79,7 @@ class JointPlan:
     pattern: dict = field(default_factory=dict)  # unit id -> ["off" | "run:<fan>"] per block
     step_min: int = 5
     evals: int = 0
+    sleep: dict = field(default_factory=dict)  # unit id -> True when its first block is "fully off" (mode off, no leak)
 
 
 class JointPlanner:
@@ -92,7 +96,7 @@ class JointPlanner:
             rest = sorted((f for f in sc if f != "auto"), key=lambda f: sc[f])  # weakest first
             pick = [rest[0]] + ([rest[len(rest) // 2]] if len(rest) > 2 else []) if rest else []
             fans = ["auto"] + [f for f in pick if f][:max(0, self.js.max_fans - 1)]
-        return [(False, None)] + [(True, f) for f in fans]
+        return [(False, None)] + [(True, f) for f in fans] + ([(False, "sleep")] if self.js.sleep_option else [])
 
     def plan(self, m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime, house: core.HouseState,
              running: dict, outdoor, sun_at, settings: core.Settings = core.Settings(), ignore=(), fixed=None,
@@ -117,7 +121,7 @@ class JointPlanner:
         known = [u for u in units if u.id in m.units and u.id not in fixed]
         fan_units = {x.strip() for x in settings.fan_units.split(",")}
         opts = {u.id: self._options(m, u, fan_units) for u in known}
-        label = {u.id: [("off" if not r else f"run:{f or '-'}") for r, f in opts[u.id]] for u in known}
+        label = {u.id: [("sleep" if f == "sleep" else "off" if not r else f"run:{f or '-'}") for r, f in opts[u.id]] for u in known}
         nb = len(blocks)
         zone = {u.id: [r for r in scored if r.unit == u.id] for u in known}
         evals = [0]
@@ -142,9 +146,14 @@ class JointPlanner:
             run = dict(run_now)
             traj, outs, first_sp, first_fan = [], [], {}, {}
             for bi, (a, b) in enumerate(blocks):
-                sps, fan_now = {}, dict(fans or {})
+                sps, fan_now, bmodes = {}, dict(fans or {}), dict(modes_by_unit)
                 for u in known:
                     runb, fan = opts[u.id][pattern[u.id][bi]]
+                    if fan == "sleep":  # fully off for this block: no setpoint, no leak
+                        bmodes[u.id], sps[u.id] = "off", None
+                        if bi == 0:
+                            first_sp[u.id], first_fan[u.id] = None, "sleep"
+                        continue
                     rd = unit_temps.get(u.id) if (bi == 0 and unit_temps and unit_temps.get(u.id) is not None) \
                         else hm.unit_reading(m, u.id, cur)
                     sps[u.id] = sp_for(u, mode, rd, runb)
@@ -153,7 +162,7 @@ class JointPlanner:
                     if bi == 0:
                         first_sp[u.id], first_fan[u.id] = sps[u.id], (fan if runb else None)
                 sps.update({uid: f[1] for uid, f in fixed.items()})
-                tr, ou, run = hm.rollout(m, cur, modes_by_unit, sps, run, outdoor_seq[a:b], sun_seq[a:b], dt_h, 1, lag,
+                tr, ou, run = hm.rollout(m, cur, bmodes, sps, run, outdoor_seq[a:b], sun_seq[a:b], dt_h, 1, lag,
                                          None, fans=fan_now, masses=mass, offsets=offsets, leak_scale=leak_scale,
                                          effect_scale=effect_scale, comp=comp_state)
                 traj += tr
@@ -226,7 +235,8 @@ class JointPlanner:
         others = ", ".join(f"{md} {v['cost']:.2f}" for md, v in by_mode.items() if md != best)
         return JointPlan(best, dict(fsp), c, by_mode, {r.id: [round(t[r.id], 2) for t in traj] for r in scored},
                          f"{best}: cost {c:.2f}" + (f" (vs {others})" if others else ""), {}, round(comfort, 3), dict(fsp),
-                         dict(ffan), pattern, js.step_min, evals[0])
+                         {u: (None if f == "sleep" else f) for u, f in ffan.items()}, pattern, js.step_min, evals[0],
+                         {u: f == "sleep" for u, f in ffan.items() if f == "sleep"})
 
     def _search(self, mode, known, opts, nb, evaluate, zone, tw, rng, house, now, label, temps):
         js = self.js

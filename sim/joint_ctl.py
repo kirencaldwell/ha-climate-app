@@ -86,6 +86,9 @@ class JointController:
         elif p.mode != self.house.mode:
             self.house = core.HouseState(p.mode, now)
         for u in self.units:
+            if getattr(p, "sleep", {}).get(u.id) and self.house.mode in ("heat", "cool"):
+                sim.command(u.id, "off", None)  # fully off: no leak
+                continue
             sim.command(u.id, self.house.mode, setpoints.get(u.id))
             if fans.get(u.id):
                 sim.set_fan(u.id, fans[u.id])

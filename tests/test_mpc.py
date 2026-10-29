@@ -220,6 +220,22 @@ def test_joint_planner_runs_in_shadow_and_never_touches_the_decision():
     print("joint plan ms", on.jplan_ms)
 
 
+def test_joint_planner_can_switch_a_leaky_idle_unit_fully_off():
+    import joint
+    truth, rooms, units, s = _house()
+    start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
+    w = coupled.Weather(start, 2, mean=50, seed=5)
+    temps = {r.id: 64.0 for r in rooms}
+    temps["bedroom_3"] = 67.5  # warm, on a unit that leaks heat while idle in heat; the other rooms need heat
+    house = core.HouseState("heat", start - timedelta(hours=3))
+    running = {u.id: False for u in units}
+    on = joint.JointPlanner(joint.JointSettings(sleep_option=True)).plan(truth, rooms, units, temps, start, house, running, w.outdoor, w.sun, s)
+    off = joint.JointPlanner(joint.JointSettings(sleep_option=False)).plan(truth, rooms, units, temps, start, house, running, w.outdoor, w.sun, s)
+    assert "sleep" in on.pattern["minisplit_2"] and not any("sleep" in p for p in off.pattern.values())
+    assert on.cost < off.cost  # switching it off avoids the leak: a cheaper plan
+    assert set(on.sleep) <= {u.id for u in units}
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
