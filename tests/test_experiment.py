@@ -109,6 +109,19 @@ def test_focus_unit_goes_first_with_longer_fan_steps_and_a_longer_coast():
     assert [b["unit"] for b in none["blocks"] if b["kind"] == "solo"][0] == "ms2"
 
 
+def test_vane_day_sweeps_the_vane_at_fan_auto_instead_of_the_fan():
+    start = datetime.fromisoformat("2026-10-30T09:00:00-07:00")
+    p = ex.plan(start, 9, ["ms2", "ms1", "ah"], fan_units=("ms1", "ms2"), mode="heat", leaky=("ms2",), vane_units=("ms1", "ms2"))
+    ms1 = [b for b in p["blocks"] if b["kind"] == "solo" and b["unit"] == "ms1"]
+    assert [b["vane"] for b in ms1[:4]] == list(ex.VANE_CYCLE) and {b["fan"] for b in ms1[:4]} == {"auto"}
+    ah = [b for b in p["blocks"] if b["kind"] == "solo" and b["unit"] == "ah"]
+    assert all(b["vane"] is None for b in ah)
+    cmds = {u: core.Command("heat", 68.0, "x", False, 68.0, 68.0, 68.0, 0.0) for u in ("ms1", "ah")}
+    out = ex.commands(ms1[2], "heat", cmds, {"ms1": ["p"], "ah": ["k"]}, {"p": 66.0, "k": 66.0}, core.Settings())
+    assert out["ms1"].vane == ms1[2]["vane"] and out["ah"].vane is None
+    assert "vane" in ex.describe(ms1[0])
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

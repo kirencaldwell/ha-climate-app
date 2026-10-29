@@ -464,6 +464,8 @@ class Manager:
         if not exp:
             return None
         if now >= datetime.fromisoformat(exp["end"]):
+            if exp.get("vane0") and not exp.get("vane_back"):
+                await self._restore_vanes(exp)
             _LOGGER.info("experiment finished (%s to %s)", exp["start"], exp["end"])
             self.data.pop("experiment", None)
             self.drives.clear()
@@ -471,6 +473,9 @@ class Manager:
             return None
         b = self.exp_block = experiment.current(exp, now)
         if b is None or b["kind"] == "restore":
+            if exp.get("vane0") and not exp.get("vane_back"):
+                await self._restore_vanes(exp)
+                exp["vane_back"] = True
             return None
         mode = exp["mode"]
         if self.house.mode != mode:
@@ -498,12 +503,18 @@ class Manager:
         ours = experiment.order(ours, experiment.leaky_units(m.rooms.values() if m else ()))
         self.data["experiment"] = experiment.plan(now, hours, ours, fan_units, mode,
                                                     experiment.leaky_units(m.rooms.values() if m else ()),
-                                                    settings.experiment_focus)
+                                                    settings.experiment_focus,
+                                                    [x.strip() for x in settings.experiment_vane_units.split(",") if x.strip()])
+        self.data["experiment"]["vane0"] = {u["id"]: self._vane(u["entity"]) for u in self.data["units"]
+                                            if self._vane(u["entity"]) is not None}  # to put the vanes back afterwards
         _LOGGER.info("experiment started: %s h in %s mode for %s", hours, mode, ", ".join(ours))
         await self.async_save()
         await self.async_tick()
 
     async def async_stop_experiment(self):
+        exp = self.data.get("experiment")
+        if exp and exp.get("vane0"):
+            await self._restore_vanes(exp)
         if self.data.pop("experiment", None) is not None:
             _LOGGER.info("experiment stopped from the card")
             self.drives.clear()
@@ -941,7 +952,7 @@ class Manager:
             a = cur.attributes if cur is not None else {}
             row["units"][u.id] = {"entity": u.entity, "control": self.control(u.id),
                                   "state": cur.state if cur is not None else None, "sp": num(a.get("temperature")),
-                                  "action": a.get("hvac_action"), "fan": a.get("fan_mode"), "temp": num(self._unit_temp(u.entity)),
+                                  "action": a.get("hvac_action"), "fan": a.get("fan_mode"), "vane": self._vane(u.entity), "temp": num(self._unit_temp(u.entity)),
                                   "cmd": cmd.mode if cmd else None, "cmd_sp": cmd.setpoint if cmd else None,
                                   "cmd_fan": cmd.fan if cmd else None,
                                   "why": cmd.reason if cmd else None}
@@ -1037,6 +1048,30 @@ class Manager:
             _LOGGER.info("SEND %s fan_mode %s -> %s (%s)", unit.entity, fan_now, cmd.fan, cmd.reason)
             await self._call(unit, SERVICE_SET_FAN_MODE, {ATTR_FAN_MODE: cmd.fan})
             self._fan_set.add(unit.id)
+        if cmd.vane is not None:
+            await self._set_vane(unit.entity, cmd.vane)
+
+    @staticmethod
+    def _vane_entity(climate_entity: str) -> str:
+        return "select." + climate_entity.split(".", 1)[1] + "_vertical_vane"
+
+    def _vane(self, climate_entity: str):
+        st = self.hass.states.get(self._vane_entity(climate_entity))
+        return None if st is None or st.state in BAD_STATES else st.state
+
+    async def _set_vane(self, unit_entity: str, position: str):
+        ent = self._vane_entity(unit_entity)
+        st = self.hass.states.get(ent)
+        if st is None or st.state == position or position not in (st.attributes.get("options") or []):
+            return
+        _LOGGER.info("SEND %s vane %s -> %s", ent, st.state, position)
+        await self.hass.services.async_call("select", "select_option", {"entity_id": ent, "option": position}, blocking=True)
+
+    async def _restore_vanes(self, exp: dict):
+        for uid, pos in (exp.get("vane0") or {}).items():
+            ud = next((u for u in self.data["units"] if u["id"] == uid), None)
+            if ud is not None:
+                await self._set_vane(ud["entity"], pos)
 
     def _stored(self, setpoint_f: float) -> float:
         """`setpoint_f` as the unit will store and report it, in HA's temperature unit."""

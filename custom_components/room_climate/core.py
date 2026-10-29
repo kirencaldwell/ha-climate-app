@@ -71,6 +71,7 @@ class Settings:
     # target, a miss above it costs `warm_weight` times a miss below, and heating aims `aim_offset` under the target.
     band_below: float = 1.5
     band_above: float = 1.0
+    experiment_vane_units: str = ""  # comma-separated unit ids whose solos sweep the vertical vane (at fan auto) instead of the fan
     experiment_focus: str = "air_handler"  # the unit an experiment spends the most time on (experiment.py): the weakest model
     model_gate_skip_fit: bool = False  # the owner's call (2026-10-28 trial of the joint planner): hand units to the model although
     #                                    the latest fit doesn't beat 'nothing changes' on every room (the live per-room scores still count)
@@ -204,6 +205,7 @@ class Command:
     room: Optional[float] = None  # the rooms' priority-weighted reading now
     offset: float = 0.0  # the unit's own reading minus `room`
     fan: Optional[str] = None  # fan mode to set (None: leave the unit's fan as it is)
+    vane: Optional[str] = None  # vertical vane position to set (experiments only; None: leave it)
 
 
 @dataclass

@@ -33,6 +33,8 @@ except ImportError:  # offline
 
 FLOAT_MIN, SOLO_MIN, FAN_STEP_MIN, COAST_MIN, RESTORE_MIN = 90, 45, 15, 30, 60
 FAN_CYCLE = ("quiet", "low", "medium", "auto")
+VANE_CYCLE = ("↑", "—", "↓", "↓↓")  # the units' vertical vane positions swept (AUTO and SWING are left out; ↑↑ is the first one seen in use)
+VANE_STEP_MIN = 15
 FOCUS_FAN_STEP_MIN, FOCUS_COAST_MIN = 20, 45  # the focus unit (the one whose model is weakest) gets longer steps and a longer coast
 PUSH = 2.0  # F past the room for a solo unit (the outer loop's largest push)
 MIN_H, MAX_H = 2, 24
@@ -58,7 +60,7 @@ def order(unit_ids: list, leaky=()) -> list:
     return sorted(unit_ids, key=lambda u: u not in leaky)
 
 
-def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat", leaky=(), focus=None) -> dict:
+def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat", leaky=(), focus=None, vane_units=()) -> dict:
     """{"start", "end", "mode", "blocks": [{"start", "end", "kind", "unit", "fan", "off"}]} with ISO times. `off` lists the
     units held fully off during the block (the leak test: see the module doc)."""
     hours = max(MIN_H, min(MAX_H, hours))
@@ -71,12 +73,14 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
         unit_ids = [focus] + [u for u in unit_ids if u != focus]
         fan_units = set(fan_units) | {focus}
 
-    def add(kind, minutes, unit=None, fan=None, off=()):
+    vane_units = set(vane_units)
+
+    def add(kind, minutes, unit=None, fan=None, off=(), vane=None):
         nonlocal t
         stop = min(restore, t + timedelta(minutes=minutes))
         if stop - t >= timedelta(minutes=15):
             blocks.append({"start": t.isoformat(), "end": stop.isoformat(), "kind": kind, "unit": unit, "fan": fan,
-                           "off": list(off)})
+                           "off": list(off), "vane": vane})
         t = stop
 
     add("float", FLOAT_MIN)
@@ -86,7 +90,10 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
                 break
             off = tuple(l for l in leaky if l != uid) if rnd % 2 == 0 else ()  # the leak test: the other leaky units fully off
             step, coast = (FOCUS_FAN_STEP_MIN, FOCUS_COAST_MIN) if uid == focus else (FAN_STEP_MIN, COAST_MIN)
-            if uid in fan_units:
+            if uid in vane_units:  # a vane day: the vane is swept (at fan auto) where the fan usually is
+                for pos in (VANE_CYCLE if rnd % 2 == 0 else VANE_CYCLE[::-1]):
+                    add("solo", VANE_STEP_MIN, uid, "auto", off, pos)
+            elif uid in fan_units:
                 for fan in (FAN_CYCLE if rnd % 2 == 0 else FAN_CYCLE[::-1]):
                     add("solo", step, uid, fan, off)
             else:
@@ -94,7 +101,7 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
             add("coast", coast)
         rnd += 1
         add("float", FLOAT_MIN // 2)
-    blocks.append({"start": restore.isoformat(), "end": end.isoformat(), "kind": "restore", "unit": None, "fan": None, "off": []})
+    blocks.append({"start": restore.isoformat(), "end": end.isoformat(), "kind": "restore", "unit": None, "fan": None, "off": [], "vane": None})
     return {"start": start.isoformat(), "end": end.isoformat(), "mode": mode, "blocks": blocks}
 
 
@@ -113,7 +120,7 @@ def describe(b: Optional[dict], names: dict = None) -> str:
     return {"float": "all units idle (the house drifts)",
             "coast": "all units idle (after a run)",
             "restore": "back to normal control before the time is up",
-            "solo": f"{nm} only" + (f", fan {b['fan']}" if b.get("fan") else "")
+            "solo": f"{nm} only" + (f", fan {b['fan']}" if b.get("fan") else "") + (f", vane {b['vane']}" if b.get("vane") else "")
             + (f", {', '.join((names or {}).get(u, u) for u in b['off'])} switched off" if b.get("off") else "")}[b["kind"]]
 
 
@@ -139,5 +146,6 @@ def commands(b: dict, mode: str, cmds: dict, unit_rooms: dict, readings: dict, s
             solo, why = False, "experiment: at the house limit; idling"
         push = PUSH if solo else -settings.drive_stop_push
         sp = core.to_grid(c.room + c.offset + s * push)
-        out[uid] = core.Command(mode, sp, why, solo, sp, c.target, c.room, c.offset, b.get("fan") if solo else None)
+        out[uid] = core.Command(mode, sp, why, solo, sp, c.target, c.room, c.offset, b.get("fan") if solo else None,
+                                b.get("vane") if solo else None)
     return out
