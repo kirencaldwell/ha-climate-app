@@ -497,7 +497,8 @@ class Manager:
         m = self.shadow.model
         ours = experiment.order(ours, experiment.leaky_units(m.rooms.values() if m else ()))
         self.data["experiment"] = experiment.plan(now, hours, ours, fan_units, mode,
-                                                    experiment.leaky_units(m.rooms.values() if m else ()))
+                                                    experiment.leaky_units(m.rooms.values() if m else ()),
+                                                    settings.experiment_focus)
         _LOGGER.info("experiment started: %s h in %s mode for %s", hours, mode, ", ".join(ours))
         await self.async_save()
         await self.async_tick()

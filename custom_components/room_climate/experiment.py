@@ -33,6 +33,7 @@ except ImportError:  # offline
 
 FLOAT_MIN, SOLO_MIN, FAN_STEP_MIN, COAST_MIN, RESTORE_MIN = 90, 45, 15, 30, 60
 FAN_CYCLE = ("quiet", "low", "medium", "auto")
+FOCUS_FAN_STEP_MIN, FOCUS_COAST_MIN = 20, 45  # the focus unit (the one whose model is weakest) gets longer steps and a longer coast
 PUSH = 2.0  # F past the room for a solo unit (the outer loop's largest push)
 MIN_H, MAX_H = 2, 24
 LEAK_MIN = 0.5  # F/h of leak (per unit of the compressor's drive) that counts: the fit lists every unit, most at 0
@@ -57,7 +58,7 @@ def order(unit_ids: list, leaky=()) -> list:
     return sorted(unit_ids, key=lambda u: u not in leaky)
 
 
-def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat", leaky=()) -> dict:
+def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat", leaky=(), focus=None) -> dict:
     """{"start", "end", "mode", "blocks": [{"start", "end", "kind", "unit", "fan", "off"}]} with ISO times. `off` lists the
     units held fully off during the block (the leak test: see the module doc)."""
     hours = max(MIN_H, min(MAX_H, hours))
@@ -66,6 +67,9 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
     blocks, t, rnd = [], start, 0
 
     leaky = [u for u in unit_ids if u in set(leaky)]
+    if focus in unit_ids:  # the focus unit goes first in each round (so it surely runs), with its fan swept like the others'
+        unit_ids = [focus] + [u for u in unit_ids if u != focus]
+        fan_units = set(fan_units) | {focus}
 
     def add(kind, minutes, unit=None, fan=None, off=()):
         nonlocal t
@@ -81,12 +85,13 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
             if t >= restore - timedelta(minutes=15):
                 break
             off = tuple(l for l in leaky if l != uid) if rnd % 2 == 0 else ()  # the leak test: the other leaky units fully off
+            step, coast = (FOCUS_FAN_STEP_MIN, FOCUS_COAST_MIN) if uid == focus else (FAN_STEP_MIN, COAST_MIN)
             if uid in fan_units:
                 for fan in (FAN_CYCLE if rnd % 2 == 0 else FAN_CYCLE[::-1]):
-                    add("solo", FAN_STEP_MIN, uid, fan, off)
+                    add("solo", step, uid, fan, off)
             else:
                 add("solo", SOLO_MIN, uid, None, off)
-            add("coast", COAST_MIN)
+            add("coast", coast)
         rnd += 1
         add("float", FLOAT_MIN // 2)
     blocks.append({"start": restore.isoformat(), "end": end.isoformat(), "kind": "restore", "unit": None, "fan": None, "off": []})

@@ -95,6 +95,20 @@ def test_leaky_unit_is_commanded_off_in_the_test_block_but_not_below_the_floor()
     assert cold["ms2"].mode == "heat"  # a room under the floor is heated whatever the test says
 
 
+def test_focus_unit_goes_first_with_longer_fan_steps_and_a_longer_coast():
+    start = datetime.fromisoformat("2026-10-29T09:00:00-07:00")
+    p = ex.plan(start, 9, ["ms2", "ms1", "ah"], fan_units=("ms1", "ms2"), mode="heat", leaky=("ms1", "ms2"), focus="ah")
+    solos = [b for b in p["blocks"] if b["kind"] == "solo"]
+    assert solos[0]["unit"] == "ah" and [b["fan"] for b in solos[:4]] == list(ex.FAN_CYCLE)  # its fan is swept although not a fan unit
+    assert all((datetime.fromisoformat(b["end"]) - datetime.fromisoformat(b["start"])).seconds == 20 * 60 for b in solos[:4])
+    assert solos[0]["off"] == ["ms2", "ms1"] or set(solos[0]["off"]) == {"ms1", "ms2"}  # the others fully off: a clean read of the focus unit
+    coast = next(b for b in p["blocks"] if b["kind"] == "coast")
+    assert (datetime.fromisoformat(coast["end"]) - datetime.fromisoformat(coast["start"])).seconds == 45 * 60
+    assert {b["unit"] for b in solos} == {"ah", "ms1", "ms2"}  # a 9 h day reaches everyone
+    none = ex.plan(start, 9, ["ms2", "ms1", "ah"], fan_units=("ms1",), mode="heat")  # no focus: unchanged order
+    assert [b["unit"] for b in none["blocks"] if b["kind"] == "solo"][0] == "ms2"
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
