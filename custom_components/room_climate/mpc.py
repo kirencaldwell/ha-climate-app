@@ -121,6 +121,13 @@ class ShadowPlanner:
         self.jlast_mode: str = None
         self.ml_errors: deque = deque()  # (t_eval, room, horizon_min, corrected err, physics err)
 
+    def set_correct(self, on: bool):
+        """Switch the observer's feedback on or off (a setting, so it can be tried and reverted without a restart)."""
+        if bool(on) == self.correct:
+            return
+        self.correct = bool(on)
+        self.observer.offsets_on = self.observer.effect_on = self.correct
+
     def set_model(self, m: hm.HouseModel):
         """Use a (re)fitted model. Accuracy history is kept: a nightly refit changes the model a little, has passed its
         own held-out check, and wiping the scores would knock any unit under model control back out every night."""

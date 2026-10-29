@@ -152,6 +152,16 @@ def test_no_limit_cycle_when_the_leak_is_much_bigger_than_modelled():
                for by in ctl.observer.effect_scale.values() for x in by.values())
 
 
+def test_the_observer_feedback_can_be_switched_with_a_setting():
+    import mpc
+    sh = mpc.ShadowPlanner()
+    assert not sh.correct and sh.observer.corrections() == {} or not sh.observer.offsets_on
+    sh.set_correct(True)
+    assert sh.correct and sh.observer.offsets_on and sh.observer.effect_on and not sh.observer.leak_on
+    sh.set_correct(False)
+    assert not sh.correct and not sh.observer.offsets_on and not sh.observer.effect_on
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

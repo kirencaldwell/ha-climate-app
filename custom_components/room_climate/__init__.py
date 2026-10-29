@@ -859,6 +859,7 @@ class Manager:
                 return hm.sun_from_irradiance(hm.sun_elevation(t, lat, lon), hm.sun_azimuth(t, lat, lon), *irr)
             return hm.sun_at(t, lat, lon, cloud_ahead(t))
 
+        self.shadow.set_correct(settings.observer_on)
         self.shadow.observe(now, temps, actual, outdoor, sun_at(now))
         if self.shadow.due(now) and not self._shadow_busy:
             unit_entity = {u.id: u.entity for u in units}

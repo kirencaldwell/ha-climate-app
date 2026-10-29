@@ -71,6 +71,8 @@ class Settings:
     # target, a miss above it costs `warm_weight` times a miss below, and heating aims `aim_offset` under the target.
     band_below: float = 1.5
     band_above: float = 1.0
+    observer_on: bool = False  # the planner's feedback (observer.py): per-room drift and per-unit gain corrections learned online
+    #                            (offset-free MPC); 2026-10-29 simulator: joint planner discomfort 32.8 -> 25.8
     experiment_vane_units: str = ""  # comma-separated unit ids whose solos sweep the vertical vane (at fan auto) instead of the fan
     experiment_focus: str = "air_handler"  # the unit an experiment spends the most time on (experiment.py): the weakest model
     model_gate_skip_fit: bool = False  # the owner's call (2026-10-28 trial of the joint planner): hand units to the model although
