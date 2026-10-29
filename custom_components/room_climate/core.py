@@ -71,6 +71,8 @@ class Settings:
     # target, a miss above it costs `warm_weight` times a miss below, and heating aims `aim_offset` under the target.
     band_below: float = 1.5
     band_above: float = 1.0
+    model_gate_skip_fit: bool = False  # the owner's call (2026-10-28 trial of the joint planner): hand units to the model although
+    #                                    the latest fit doesn't beat 'nothing changes' on every room (the live per-room scores still count)
     model_planner: str = "optimizer"  # what units under "model" control follow: "optimizer" (setpoint targets + the outer loop) or
     #                                   "joint" (joint.py: run / fan / fully off per unit, no outer loop; replans every 5 min)
     joint_shadow: bool = True  # also run the joint run/fan planner beside the planner, shadow only (nothing sent): mpc.py

@@ -475,7 +475,7 @@ class ShadowPlanner:
         self.plan, self.plan_at = p, now
         self.plan_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-    def readiness(self, now: datetime, rooms_needed, strict: bool = True, min_n: int = 36):
+    def readiness(self, now: datetime, rooms_needed, strict: bool = True, min_n: int = 36, skip_fit: bool = False):
         """(ready to control units?, reasons it isn't). Strict, for handing a unit over: a usable fit, a fresh plan,
         and for every room it scores, 60- and 120-min predictions (at least `min_n` each, about 6 h) beating "nothing
         changes" (to within READY_TOL_F). Not strict, for staying in control: 10% slack on top and fewer scores, so it doesn't
@@ -484,7 +484,7 @@ class ShadowPlanner:
         m = self.model
         if m is None:
             return False, ["no model yet"]
-        if not (m.meta or {}).get("usable"):
+        if not (m.meta or {}).get("usable") and not skip_fit:
             why.append("the latest fit doesn't beat 'nothing changes' on held-out data")
         if self.error:
             why.append(f"planner error: {self.error}")

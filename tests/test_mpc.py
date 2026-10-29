@@ -260,6 +260,17 @@ def test_joint_planner_as_the_live_decision():
     assert sh2.live_reason is None
 
 
+def test_readiness_can_skip_only_the_fit_check():
+    truth, rooms, units, s = _house()
+    sh = mpc.ShadowPlanner()
+    sh.set_model(truth)
+    truth.meta = {"usable": False}
+    ok, why = sh.readiness(datetime.fromisoformat("2026-10-16T03:00:00-07:00"), [])
+    assert not ok and any("doesn't beat" in x for x in why)
+    ok2, why2 = sh.readiness(datetime.fromisoformat("2026-10-16T03:00:00-07:00"), [], skip_fit=True)
+    assert not any("doesn't beat" in x for x in why2) and any("no fresh plan" in x for x in why2)  # every other check still counts
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

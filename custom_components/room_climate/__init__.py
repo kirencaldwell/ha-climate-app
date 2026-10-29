@@ -549,7 +549,8 @@ class Manager:
         return {r["id"] for r in self.data["rooms"] if r.get("unit") and r.get("sensor")}
 
     def model_ready(self, strict: bool = True):
-        return self.shadow.readiness(dt_util.now(), self.model_rooms(), strict=strict)
+        return self.shadow.readiness(dt_util.now(), self.model_rooms(), strict=strict,
+                                     skip_fit=core.settings_from(self.data.get("settings")).model_gate_skip_fit)
 
     async def async_set_control(self, unit_id: str, control: str, why: str):
         """Raises ValueError (with the reasons) when asked to hand a unit to a model that isn't ready."""
