@@ -236,6 +236,30 @@ def test_joint_planner_can_switch_a_leaky_idle_unit_fully_off():
     assert set(on.sleep) <= {u.id for u in units}
 
 
+def test_joint_planner_as_the_live_decision():
+    truth, rooms, units, s = _house()
+    start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
+    w = coupled.Weather(start, 2, mean=50, seed=5)
+    temps = {r.id: 64.0 for r in rooms}
+    temps["bedroom_3"] = 67.5
+    actual = {u.id: {"mode": "heat", "setpoint": 66.0, "running": False} for u in units}
+    live = dataclasses.replace(s, model_planner="joint")
+    sh = mpc.ShadowPlanner()
+    sh.set_model(truth)
+    sh.house = core.HouseState("heat", start - timedelta(hours=3))
+    sh.jhouse = core.HouseState("heat", start - timedelta(hours=3))
+    sh.run(start, rooms, units, temps, actual, w.outdoor(start), w.sun, live)
+    assert sh.error is None and sh.jerror is None, (sh.error, sh.jerror)
+    assert set(sh.decision) == {u.id for u in units} and sh.house is sh.jhouse and sh.live_reason.startswith("joint")
+    modes = {d["mode"] for d in sh.decision.values()}
+    assert modes <= {"heat", "off"} and any(d.get("run") for d in sh.decision.values())
+    assert all(d.get("setpoint") is not None for d in sh.decision.values() if d["mode"] == "heat")
+    sh2 = mpc.ShadowPlanner()  # the default planner leaves the decision to the optimizer
+    sh2.set_model(truth)
+    sh2.run(start, rooms, units, temps, actual, w.outdoor(start), w.sun, s)
+    assert sh2.live_reason is None
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

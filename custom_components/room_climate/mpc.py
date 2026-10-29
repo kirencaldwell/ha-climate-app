@@ -116,6 +116,7 @@ class ShadowPlanner:
         self.jplan_at: datetime = None
         self.jplan_ms: float = None
         self.jerror: str = None
+        self.live_reason: str = None  # the joint planner's reason, while it is the one deciding (model_planner "joint")
         self.jflips: deque = deque()  # when the joint planner would have switched heat <-> cool
         self.jlast_mode: str = None
         self.ml_errors: deque = deque()  # (t_eval, room, horizon_min, corrected err, physics err)
@@ -335,17 +336,19 @@ class ShadowPlanner:
             self.error = None
         except Exception as e:  # never let the model take the integration down; show it instead
             self.error = f"{type(e).__name__}: {e}"
-        if settings.joint_shadow and (self.next_joint is None or now >= self.next_joint):
+        live = settings.model_planner == "joint"
+        if (settings.joint_shadow or live) and (live or self.next_joint is None or now >= self.next_joint):
             slow = self.jplan_ms is not None and self.jplan_ms > 120_000  # a plan over 2 min: try less often
-            self.next_joint = now + self.joint_every * (4 if slow else 1)
+            self.next_joint = now + (self.plan_every if live else self.joint_every) * (4 if slow else 1)
             try:
-                self._joint_plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {})
+                self._joint_plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {}, live)
                 self.jerror = None
             except Exception as e:
                 self.jerror = f"{type(e).__name__}: {e}"
 
-    def _joint_plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed):
-        """What the joint planner would do now, with its own pretend house mode (never sent anywhere)."""
+    def _joint_plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed, live=False):
+        """What the joint planner would do now, with its own house mode. Shadow: never sent anywhere. `live`
+        (model_planner "joint"): it becomes the model's decision for the units under model control."""
         t0 = time.perf_counter()
         running = {u: bool(a.get("running")) for u, a in actual.items()}
         p = self.joint.plan(self.model, rooms, units, temps, now, self.jhouse, running, outdoor, sun_at, settings,
@@ -353,7 +356,8 @@ class ShadowPlanner:
                             fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses),
                             comp=dict(self.comp), **self.observer.corrections())
         mode = self.jhouse.mode
-        if mode not in ("heat", "cool"):
+        from_off = mode not in ("heat", "cool")
+        if from_off:
             want = p.mode if p.mode != "off" else "heat"
             benefit = 0.0 if p.mode == "off" else p.by_mode["off"]["cost"] - p.cost
             self.jhouse, _ = core.choose_mode(benefit if want == "heat" else 0.0, benefit if want == "cool" else 0.0,
@@ -369,6 +373,30 @@ class ShadowPlanner:
             self.jflips.popleft()
         self.jplan, self.jplan_at = p, now
         self.jplan_ms = round((time.perf_counter() - t0) * 1000, 1)
+        if live:
+            self._joint_decide(p, units, fixed, from_off)
+
+    def _joint_decide(self, p, units, fixed, from_off):
+        """The joint plan as the model's decision (same shape the integration reads), as sim/joint_ctl.py does it."""
+        self.house = self.jhouse
+        mode = self.jhouse.mode
+        setpoints, fans, sleep = p.setpoints, p.fans, p.sleep
+        if mode in ("heat", "cool") and (from_off or p.mode != mode):
+            # not (yet) the plan's own mode: its setpoints for the mode the house is in, nothing fancier
+            setpoints, fans, sleep = p.by_mode.get(mode, {}).get("setpoints", {}), {}, {}
+        self.decision = {}
+        for u in units:
+            if u.id in fixed:
+                self.decision[u.id] = {"mode": "thermostat", "setpoint": None}
+            elif mode not in ("heat", "cool"):
+                self.decision[u.id] = {"mode": "off", "setpoint": None}
+            elif sleep.get(u.id):
+                self.decision[u.id] = {"mode": "off", "setpoint": None, "sleep": True}
+            else:
+                lab = (p.pattern.get(u.id) or ["off"])[0]
+                self.decision[u.id] = {"mode": mode, "setpoint": setpoints.get(u.id), "fan": fans.get(u.id),
+                                       "run": lab.startswith("run")}
+        self.live_reason = f"joint: {p.reason}"
 
     def _project(self, now, temps, actual, outdoor, sun_at, horizon_min=120, step_min=10):
         """What the model expects over the next 2 h if every unit keeps its current mode and setpoint."""

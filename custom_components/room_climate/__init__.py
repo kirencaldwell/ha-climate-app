@@ -763,8 +763,15 @@ class Manager:
             c = cmds[u.id]
             if ctl == MODEL:
                 d = self.shadow.decision.get(u.id) or {}
-                reason = "model: " + (self.shadow.plan.reason if self.shadow.plan else "")
-                if d.get("mode") in ("heat", "cool") and settings.drive and d.get("target") is not None:
+                reason = "model: " + ((self.shadow.live_reason if settings.model_planner == "joint" else None)
+                                      or (self.shadow.plan.reason if self.shadow.plan else ""))
+                if d.get("sleep"):
+                    c = core.Command("off", None, reason + " (this unit fully off: no leak)")
+                elif settings.model_planner == "joint" and d.get("mode") in ("heat", "cool"):
+                    # the joint planner picks run / fan / setpoint itself: no outer loop
+                    c = core.Command(d["mode"], d.get("setpoint"), reason, bool(d.get("run")), d.get("setpoint"), None,
+                                     c.room, c.offset, d.get("fan"))
+                elif d.get("mode") in ("heat", "cool") and settings.drive and d.get("target") is not None:
                     # the model picks the target; the same outer loop as today's controller sets the setpoint
                     c = core.Command(d["mode"], None, reason, True, None, d["target"], c.room, c.offset)
                 elif d.get("mode") in ("heat", "cool"):

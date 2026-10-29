@@ -71,6 +71,8 @@ class Settings:
     # target, a miss above it costs `warm_weight` times a miss below, and heating aims `aim_offset` under the target.
     band_below: float = 1.5
     band_above: float = 1.0
+    model_planner: str = "optimizer"  # what units under "model" control follow: "optimizer" (setpoint targets + the outer loop) or
+    #                                   "joint" (joint.py: run / fan / fully off per unit, no outer loop; replans every 5 min)
     joint_shadow: bool = True  # also run the joint run/fan planner beside the planner, shadow only (nothing sent): mpc.py
     band_min_scale: float = 0.0  # ...but never below this fraction of the global band (a tight band makes the house flip heat/cool)
     band_by_weight: bool = True  # scale a room's dead zone by its allowed error (1/sqrt(weight)): a heavy room is held tighter
