@@ -92,7 +92,7 @@
    "state": "unset"
   },
   {
-   "id": "doo-hall-door-(north)",
+   "id": "doo-hall-door-north",
    "kind": "door",
    "name": "Hall door (north)",
    "floor": 2,

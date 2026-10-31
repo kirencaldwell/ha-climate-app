@@ -332,6 +332,9 @@ class RoomMapCard extends HTMLElement {
                   door: { closed: "Closed", cracked: "Cracked", open: "Open", wide: "Wide open" } };
     const col = l => l == null ? "#8a94a6" : l < .1 ? "#ff7a45" : l < .8 ? "#ffd166" : "#3de0a5";
     const lvl = o => LV[o.kind][o.state];
+    const rec = d.openings_rec || {};
+    const want = o => (rec[o.id] && !rec[o.id].match) ? rec[o.id] : null;  // a suggestion that differs from how it is set now
+    const esc = t => String(t).replace(/[<&]/g, "");
     const roomName = id => (d.rooms.find(r => r.id === id) || {}).name || "";
     const short = o => o.name.replace(/ (register|door)\b/i, "").replace(/ · .*/, "");
     const roomSvg = rooms.map(r => { const s = r.shape || {};
@@ -341,6 +344,8 @@ class RoomMapCard extends HTMLElement {
       const l0 = lvl(o), l = l0 == null ? .5 : l0, c = col(l0), on = o.id === this._opSel, z = 6.4 * k;
       const hit = `<circle cx="${o.x}" cy="${o.y}" r="${6.5 * k}" fill="#000" fill-opacity="0.001"/>`;  // a finger-sized target around the icon
       const ring = on ? `<circle cx="${o.x}" cy="${o.y}" r="${6 * k}" fill="none" stroke="#fff" stroke-width="${.8 * k}"><animate attributeName="r" values="${5.4 * k};${6.8 * k};${5.4 * k}" dur="1.6s" repeatCount="indefinite"/></circle>` : "";
+      const w = want(o);
+      const sug = w ? `<circle cx="${o.x}" cy="${o.y}" r="${8.2 * k}" fill="none" stroke="${col(LV[o.kind][w.rec])}" stroke-width="${1.1 * k}" stroke-dasharray="${2 * k} ${1.4 * k}"/>` : "";
       const lab = on ? `<text x="${o.x}" y="${o.y - 7.4 * k}" text-anchor="middle" font-size="${3.6 * k}" font-weight="700" fill="#fff" stroke="#0a111d" stroke-width="${.8 * k}" paint-order="stroke">${short(o)}</text>` : "";
       let icon;
       if (o.kind === "register") {
@@ -352,15 +357,17 @@ class RoomMapCard extends HTMLElement {
           <line x1="${o.x}" y1="${o.y}" x2="${o.x + L * Math.cos(a)}" y2="${o.y - L * Math.sin(a)}" stroke="${c}" stroke-width="${1.8 * k}" stroke-linecap="round"/>
           <path d="M${o.x + L} ${o.y}A${L} ${L} 0 0 0 ${o.x + L * Math.cos(a)} ${o.y - L * Math.sin(a)}" fill="none" stroke="${c}" stroke-opacity=".5" stroke-width="${.6 * k}" stroke-dasharray="${k} ${k}"/>`;
       }
-      return `<g data-opsel="${o.id}" style="cursor:pointer">${hit}${ring}${icon}${lab}</g>`;
+      return `<g data-opsel="${o.id}" style="cursor:pointer">${hit}${sug}${ring}${icon}${lab}</g>`;
     };
-    const pill = o => `<button data-opsel="${o.id}" class="rc-pill ${o.id === this._opSel ? "on" : ""}"><i style="background:${col(lvl(o))}"></i>${short(o)}</button>`;
+    const pill = o => { const w = want(o);
+      return `<button data-opsel="${o.id}" class="rc-pill ${o.id === this._opSel ? "on" : ""}"><i style="background:${col(lvl(o))}"></i>${short(o)}${w ? ` <em style="font-style:normal;color:${col(LV[o.kind][w.rec])}">→ ${LBL[o.kind][w.rec]}</em>` : ""}</button>`; };
     const states = o => Object.keys(LV[o.kind]);
     const big = o => `<div class="rc-big" style="grid-template-columns:repeat(${o.kind === "door" ? 2 : 3},1fr)">${states(o).map(st =>
-      `<button data-opset="${o.id}" data-st="${st}" class="${o.state === st ? "on" : ""}" style="${o.state === st ? "" : `border-bottom:4px solid ${col(LV[o.kind][st])}`}">${LBL[o.kind][st]}</button>`).join("")}</div>`;
+      `<button data-opset="${o.id}" data-st="${st}" class="${o.state === st ? "on" : ""}" style="${o.state === st ? "" : `border-bottom:4px solid ${col(LV[o.kind][st])};`}${rec[o.id] && rec[o.id].rec === st ? "outline:2px dashed " + col(LV[o.kind][st]) + ";outline-offset:2px" : ""}">${rec[o.id] && rec[o.id].rec === st ? "★ " : ""}${LBL[o.kind][st]}</button>`).join("")}</div>`;
     const ago = iso => { if (!iso) return ""; const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
       return m < 1 ? "just now" : m < 90 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
     const idx = sel ? items.indexOf(sel) : -1;
+    const err = this._opErr ? `<div class="rc-banner" style="background:#ff7a4522;color:#ff8a5c">${this._opErr.replace(/[<&]/g, "")}<button data-opdismiss="1">OK</button></div>` : "";
     const place = this._opPlace
       ? `<div class="rc-banner">${this._opPlace.move ? "Tap the new spot on the map" : `Tap the map where the ${this._opPlace.kind} is`}<button data-opcancel="1">Cancel</button></div>` : "";
     const edit = sel && this._opEdit ? `<div class="rc-row" style="margin:8px 0 4px">
@@ -371,22 +378,31 @@ class RoomMapCard extends HTMLElement {
         <div class="rc-nav"><button data-opnav="-1" aria-label="previous">‹</button>
           <div class="rc-navt"><b>${sel.name}</b><small>${sel.kind === "register" ? "Register" : "Door"}${sel.room ? " · " + roomName(sel.room) : ""} · ${sel.state && lvl(sel) != null ? "changed " + ago(sel.changed) : "not set yet"} · ${idx + 1} of ${items.length}</small></div>
           <button data-opnav="1" aria-label="next">›</button></div>
+        ${rec[sel.id] ? `<p class="rc-sub" style="margin:8px 0 0;color:${rec[sel.id].match ? "#3de0a5" : "#ffd166"}">${rec[sel.id].match ? "✓ " : "★ Suggested: " + LBL[sel.kind][rec[sel.id].rec] + ". "}${esc(rec[sel.id].why)}</p>` : ""}
         ${big(sel)}
         <div class="rc-chips" style="margin-top:8px"><button data-opedit="1" class="rc-mid ${this._opEdit ? "on" : ""}">${this._opEdit ? "Done" : "Edit name / room / position"}</button></div>${edit}</div>`
       : `<p class="rc-sub">No registers or doors on this floor yet. Add one, then tap the map where it is.</p>`;
+    const todo = (d.openings || []).filter(o => want(o)).sort((a, b) => a.floor - b.floor || a.y - b.y);
+    const mode = (d.house || {}).mode;
+    const sugBox = todo.length
+      ? `<div class="rc-banner" style="flex-direction:column;align-items:stretch;gap:6px;background:#ffd16618"><div>Suggested changes now</div>${todo.map(o =>
+          `<button data-opsel="${o.id}" data-opfl="${o.floor}" style="min-height:44px;text-align:left;justify-content:flex-start">${o.kind === "register" ? "▦" : "◔"} ${esc(o.name)} <b style="margin-left:8px;color:${col(LV[o.kind][rec[o.id].rec])}">→ ${LBL[o.kind][rec[o.id].rec]}</b></button>`).join("")}</div>`
+      : Object.keys(rec).length ? `<p class="rc-sub" style="margin:0 0 8px;color:#3de0a5">✓ Everything matches the suggestions right now</p>`
+      : (mode === "heat" || mode === "cool") ? "" : `<p class="rc-sub" style="margin:0 0 8px">Suggestions appear while the house is heating or cooling.</p>`;
     const tabs = floors.length > 1 ? `<div class="rc-seg">${floors.map(f => `<button data-opfloor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
     const counts = a => ["register", "door"].map(kd => `${a.filter(o => o.kind === kd).length} ${kd}${a.filter(o => o.kind === kd).length === 1 ? "" : "s"}`).join(" · ");
     this._wrap.innerHTML = `${tabs}<div class="rc-main"><div class="rc-map"><svg viewBox="${vb.join(" ")}" data-opmap="1" style="border-radius:10px;${this._opPlace ? "cursor:crosshair" : ""}">
         <rect x="${vb[0]}" y="${vb[1]}" width="${vb[2]}" height="${vb[3]}" fill="#0a111d"/>${roomSvg}${items.map(marker).join("")}</svg>
         <div class="rc-pills">${items.map(pill).join("")}</div></div>
-      <div class="rc-panel">${place}${ctl}
+      <div class="rc-panel">${err}${place}${sugBox}${ctl}
         <div class="rc-chips" style="margin:10px 0"><button data-opadd="register" class="rc-mid">+ Register</button><button data-opadd="door" class="rc-mid">+ Door</button></div>
         <p class="rc-sub" style="margin:0">${this._floorName(this._floor)}: ${counts(items)}</p></div></div>`;
     const cur = this._wrap.querySelector(".rc-pill.on"); if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "nearest", inline: "center" });
   }
 
   async _opSave(item) {
-    try { this._data = await this._hass.callWS({ type: "room_climate/opening_save", item }); this._render(); } catch (e) { this._fail("opening_save", e); }
+    try { this._data = await this._hass.callWS({ type: "room_climate/opening_save", item }); this._opErr = null; this._render(); }
+    catch (e) { this._opErr = `Couldn't save "${item.name}": ${(e && e.message) || (e && e.code) || "error"}`; this._fail("opening_save", e); this._render(); }
   }
   _opChange(e) {
     if (this._config.page !== "openings" || !this._data) return;
@@ -399,7 +415,7 @@ class RoomMapCard extends HTMLElement {
   }
   _opClick(e) {
     const d = this._data; if (!d) return;
-    const t = e.target.closest("[data-opfloor],[data-opsel],[data-opset],[data-opadd],[data-opmove],[data-opdel],[data-opcancel],[data-opedit],[data-opnav]");
+    const t = e.target.closest("[data-opfloor],[data-opsel],[data-opset],[data-opadd],[data-opmove],[data-opdel],[data-opcancel],[data-opedit],[data-opnav],[data-opdismiss]");
     const items = d.openings || [];
     if (this._opPlace && (!t || !t.dataset.opcancel) && e.target.closest("svg[data-opmap]")) {  // a tap on the map places it
       const svg = this._wrap.querySelector("svg[data-opmap]"), pt = svg.createSVGPoint();
@@ -426,7 +442,8 @@ class RoomMapCard extends HTMLElement {
       if (o && confirm(`Delete "${o.name}"?`)) { this._opSel = null; this._hass.callWS({ type: "room_climate/opening_delete", id: o.id }).then(r => { this._data = r; this._render(); }).catch(err => this._fail("opening_delete", err)); }
     }
     else if (ds.opset) { const o = items.find(i => i.id === ds.opset); if (o) { const { changed, ...rest } = o; this._opSave({ ...rest, state: ds.st }); } }
-    else if (ds.opsel) { this._opSel = ds.opsel; this._opPlace = null; this._render(); }
+    else if (ds.opsel) { if (ds.opfl) this._floor = +ds.opfl; this._opSel = ds.opsel; this._opPlace = null; this._render(); }
+    else if (ds.opdismiss) { this._opErr = null; this._render(); }
     else if (ds.opedit) { this._opEdit = !this._opEdit; this._render(); }
     else if (ds.opnav) {
       const fl = items.filter(i => i.floor === this._floor).sort((a, b) => a.y - b.y || a.x - b.x);

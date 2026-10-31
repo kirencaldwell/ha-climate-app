@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import math
 import logging
 import os
@@ -28,7 +29,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from . import core, datalog, experiment, fit, mlmodel, mpc
+from . import core, datalog, experiment, fit, mlmodel, mpc, openings
 from . import model as hm
 
 DOMAIN = "room_climate"
@@ -144,6 +145,11 @@ class Manager:
         for ud in loaded.get("units", []):
             ud.setdefault("control", THERMOSTAT)
         loaded.setdefault("openings", [])
+        for o in loaded["openings"]:  # ids must match the websocket schema (the seeded "(north)" door's id had parentheses)
+            clean = re.sub(r"[^a-z0-9_-]", "", str(o.get("id", "")).lower())[:40] or f"{o.get('kind', 'op')[:3]}-{id(o) % 10000}"
+            if clean != o.get("id"):
+                _LOGGER.info("opening id %s -> %s", o.get("id"), clean)
+                o["id"] = clean
         if not loaded["openings"] and not loaded.get("openings_seeded"):  # first time: the registers and doors found in floorplan.jpg
             seed = pathlib.Path(__file__).parent / "default_openings.json"
             try:
@@ -1214,6 +1220,11 @@ class Manager:
                                             core.settings_from(self.data.get("settings")))
         except Exception:  # noqa: BLE001 - a display extra must never break the snapshot
             out["score"] = None
+        try:  # suggested register / door positions (openings.py)
+            out["openings_rec"] = openings.recommend(self.data.get("openings", []), self.data["rooms"], out["live"],
+                                                     (self.house_info or {}).get("mode") or self.house.mode, settings)
+        except Exception:  # noqa: BLE001
+            out["openings_rec"] = {}
         return out
 
 
