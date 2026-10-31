@@ -48,10 +48,13 @@ def recommend(openings: list, rooms: list, live: dict, mode: Optional[str], sett
             else:
                 rec, why = "open", f"{name} is near its target: leave it open"
         else:
-            if z >= DOOR_Z:
-                rec, why = "cracked", f"{head}: crack the door, less of the hall's air flows in"
+            cur = o.get("state")
+            if z >= DOOR_Z:  # never suggest opening a door further for a room that is already too warm
+                rec, why = (cur, f"{head}: keep the door {cur}") if cur in ("closed", "cracked") else \
+                    ("cracked", f"{head}: crack the door, less of the hall's air flows in")
             elif z <= -DOOR_Z:
-                rec, why = "open", f"{head}: open the door so the hall's air reaches it"
+                rec, why = (cur, f"{head}: keep the door {'wide ' if cur == 'wide' else ''}open") if cur in ("open", "wide") else \
+                    ("open", f"{head}: open the door so the hall's air reaches it")
             else:
                 continue  # no reason to change a door
         out[o["id"]] = {"rec": rec, "why": why, "match": o.get("state") == rec}

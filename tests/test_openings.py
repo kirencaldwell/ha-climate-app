@@ -19,6 +19,13 @@ def test_heating_closes_the_overheated_room_and_keeps_the_cold_one_open():
     assert r["d1"]["rec"] == "cracked" and r["d2"]["rec"] == "open" and not r["d2"]["match"]
 
 
+def test_a_door_is_never_suggested_further_open_for_a_room_that_is_too_warm():
+    ops = [{"id": "d", "kind": "door", "room": "b2", "state": "closed"}, {"id": "e", "kind": "door", "room": "k", "state": "wide"}]
+    r = openings.recommend(ops, ROOMS, LIVE, "heat")
+    assert r["d"]["rec"] == "closed" and r["d"]["match"]  # closed already: nothing to do
+    assert r["e"]["rec"] == "wide" and r["e"]["match"]  # a cold room's door that is wide open already is fine
+
+
 def test_nothing_for_rooms_without_a_unit_or_reading_and_nothing_when_the_house_is_off():
     r = openings.recommend(OPS, ROOMS, LIVE, "heat")
     assert "r3" not in r and "r4" not in r
