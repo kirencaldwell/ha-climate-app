@@ -121,6 +121,21 @@ const CSS = `
 .rc-chips2 button { min-height: 36px; padding: 0 10px; font-size: .9em; }
 .rc-chips2 b { margin-left: 6px; color: #5db3ff; }
 .rc-legend { display: flex; justify-content: space-between; font-size: .7em; color: var(--secondary-text-color, #9aa7b8); padding: 0 8px; margin-top: 2px; }
+.rc-pills { display: flex; gap: 8px; overflow-x: auto; padding: 10px 2px 4px; scroll-snap-type: x proximity; -webkit-overflow-scrolling: touch; }
+.rc-pill { flex: 0 0 auto; scroll-snap-align: center; min-height: 44px; padding: 0 14px; border-radius: 22px; display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.rc-pill i { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.rc-ctl2 { margin-top: 4px; }
+.rc-nav { display: flex; align-items: center; gap: 8px; }
+.rc-nav button { flex: 0 0 52px; min-height: 56px; font-size: 1.9em; line-height: 1; padding: 0; }
+.rc-navt { flex: 1 1 auto; min-width: 0; text-align: center; display: flex; flex-direction: column; gap: 2px; }
+.rc-navt b { font-size: 1.15em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rc-navt small { color: var(--secondary-text-color, #9aa7b8); }
+.rc-big { display: grid; gap: 8px; margin-top: 10px; }
+.rc-big button { min-height: 64px; font-size: 1.05em; font-weight: 600; border-radius: 12px; }
+.rc-mid { min-height: 48px; padding: 0 16px; }
+.rc-in { min-height: 48px; border-radius: 10px; border: 1px solid var(--divider-color, #ffffff30); background: transparent; color: inherit; padding: 0 12px; font: inherit; }
+.rc-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: #ffd16622; color: #ffd166; border-radius: 12px; padding: 8px 8px 8px 14px; margin-bottom: 8px; font-weight: 600; }
+.rc-banner button { min-height: 44px; }
 @media (max-width: 600px) {
   .rc-modal { align-items: flex-end; }
   .rc-sheet { border-radius: 16px 16px 0 0; height: 100%; max-height: 100%; }
@@ -308,49 +323,66 @@ class RoomMapCard extends HTMLElement {
     if (!floors.includes(this._floor)) this._floor = floors[0];
     const rooms = d.rooms.filter(r => (r.floor || 1) === this._floor);
     const v = this._fit(rooms) || { x: 0, y: 0, w: 100, h: 100 }, vb = [v.x, v.y, v.w, v.h], k = vb[2] / 100;
-    const all = d.openings || [], items = all.filter(o => o.floor === this._floor);
-    const sel = all.find(o => o.id === this._opSel && o.floor === this._floor);
+    const all = d.openings || [];
+    const items = all.filter(o => o.floor === this._floor).sort((a, b) => a.y - b.y || a.x - b.x);  // top to bottom: the order ‹ › steps through
+    if (!items.some(o => o.id === this._opSel)) this._opSel = items.length ? items[0].id : null;
+    const sel = items.find(o => o.id === this._opSel);
     const LV = { register: { closed: 0, partial: .5, open: 1 }, door: { closed: 0, cracked: .15, open: .6, wide: 1 } };
     const LBL = { register: { closed: "Closed", partial: "Half open", open: "Fully open" },
                   door: { closed: "Closed", cracked: "Cracked", open: "Open", wide: "Wide open" } };
-    const col = l => l == null ? "#667085" : l < .1 ? "#ff7a45" : l < .8 ? "#ffd166" : "#3de0a5";
-    const roomSvg = rooms.map(r => { const s = r.shape || {};
-      return `<g data-oproom="${r.id}"><rect x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" rx="${k}" fill="#3fa9ff" fill-opacity=".07" stroke="#3fa9ff" stroke-opacity=".5" stroke-width="${.5 * k}"/>
-        <text x="${s.x + s.w / 2}" y="${s.y + 4 * k}" text-anchor="middle" font-size="${2.8 * k}" fill="#cfe8ff" fill-opacity=".6" letter-spacing="${.3 * k}">${r.name.toUpperCase()}</text></g>`; }).join("");
-    const marker = o => {
-      const l0 = LV[o.kind][o.state], l = l0 == null ? .5 : l0, c = col(l0), on = o.id === this._opSel, z = 3.4 * k;  // unset: grey, drawn half open
-      const ring = on ? `<circle cx="${o.x}" cy="${o.y}" r="${3.6 * k}" fill="none" stroke="#fff" stroke-width="${.5 * k}" stroke-dasharray="${k} ${k}"/>` : "";
-      if (o.kind === "register") {
-        const slats = [-1, 0, 1].map(i => `<line x1="${o.x - z / 2 + .5 * k}" x2="${o.x + z / 2 - .5 * k}" y1="${o.y + i * z / 4}" y2="${o.y + i * z / 4 + (1 - l) * 0}" stroke="${c}" stroke-width="${(.35 + .5 * (1 - l)) * k}"/>`).join("");
-        return `<g data-opsel="${o.id}" style="cursor:pointer">${ring}<rect x="${o.x - z / 2}" y="${o.y - z / 2}" width="${z}" height="${z}" rx="${.4 * k}" fill="${c}" fill-opacity="${.12 + .25 * (1 - l)}" stroke="${c}" stroke-width="${.5 * k}"/>${slats}</g>`;
-      }
-      const a = (l * 80) * Math.PI / 180, L = 3.8 * k;  // a door leaf swung open by l*80 degrees from its closed position
-      return `<g data-opsel="${o.id}" style="cursor:pointer">${ring}<circle cx="${o.x}" cy="${o.y}" r="${.7 * k}" fill="${c}"/>
-        <line x1="${o.x}" y1="${o.y}" x2="${o.x + L * Math.cos(a)}" y2="${o.y - L * Math.sin(a)}" stroke="${c}" stroke-width="${.9 * k}" stroke-linecap="round"/>
-        <path d="M${o.x + L} ${o.y}A${L} ${L} 0 0 0 ${o.x + L * Math.cos(a)} ${o.y - L * Math.sin(a)}" fill="none" stroke="${c}" stroke-opacity=".45" stroke-width="${.3 * k}" stroke-dasharray="${.6 * k} ${.6 * k}"/></g>`;
-    };
-    const states = o => Object.keys(LV[o.kind]).map(st => [st, LBL[o.kind][st]]);
-    const chips = o => `${LV[o.kind][o.state] == null ? `<p class="rc-sub" style="margin:2px 0;color:#ffd166">not set yet: pick its position</p>` : ""}<div class="rc-chips">${states(o).map(([st, lb]) => `<button data-opset="${o.id}" data-st="${st}" class="${o.state === st ? "on" : ""}">${lb}</button>`).join("")}</div>`;
+    const col = l => l == null ? "#8a94a6" : l < .1 ? "#ff7a45" : l < .8 ? "#ffd166" : "#3de0a5";
+    const lvl = o => LV[o.kind][o.state];
     const roomName = id => (d.rooms.find(r => r.id === id) || {}).name || "";
+    const short = o => o.name.replace(/ (register|door)\b/i, "").replace(/ · .*/, "");
+    const roomSvg = rooms.map(r => { const s = r.shape || {};
+      return `<g><rect x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" rx="${k}" fill="#3fa9ff" fill-opacity=".07" stroke="#3fa9ff" stroke-opacity=".5" stroke-width="${.5 * k}"/>
+        <text x="${s.x + s.w / 2}" y="${s.y + 4.5 * k}" text-anchor="middle" font-size="${3.2 * k}" fill="#cfe8ff" fill-opacity=".6" letter-spacing="${.3 * k}">${r.name.toUpperCase()}</text></g>`; }).join("");
+    const marker = o => {
+      const l0 = lvl(o), l = l0 == null ? .5 : l0, c = col(l0), on = o.id === this._opSel, z = 6.4 * k;
+      const hit = `<circle cx="${o.x}" cy="${o.y}" r="${6.5 * k}" fill="#000" fill-opacity="0.001"/>`;  // a finger-sized target around the icon
+      const ring = on ? `<circle cx="${o.x}" cy="${o.y}" r="${6 * k}" fill="none" stroke="#fff" stroke-width="${.8 * k}"><animate attributeName="r" values="${5.4 * k};${6.8 * k};${5.4 * k}" dur="1.6s" repeatCount="indefinite"/></circle>` : "";
+      const lab = on ? `<text x="${o.x}" y="${o.y - 7.4 * k}" text-anchor="middle" font-size="${3.6 * k}" font-weight="700" fill="#fff" stroke="#0a111d" stroke-width="${.8 * k}" paint-order="stroke">${short(o)}</text>` : "";
+      let icon;
+      if (o.kind === "register") {
+        const slats = [-1, 0, 1].map(i => `<line x1="${o.x - z / 2 + k}" x2="${o.x + z / 2 - k}" y1="${o.y + i * z / 3.2}" y2="${o.y + i * z / 3.2}" stroke="${c}" stroke-width="${(.5 + 1.1 * (1 - l)) * k}"/>`).join("");
+        icon = `<rect x="${o.x - z / 2}" y="${o.y - z / 2}" width="${z}" height="${z}" rx="${.9 * k}" fill="${c}" fill-opacity="${.16 + .3 * (1 - l)}" stroke="${c}" stroke-width="${.9 * k}"/>${slats}`;
+      } else {
+        const a = (l * 80) * Math.PI / 180, L = 7.2 * k;  // a door leaf swung open by l*80 degrees from its closed position
+        icon = `<circle cx="${o.x}" cy="${o.y}" r="${1.3 * k}" fill="${c}"/>
+          <line x1="${o.x}" y1="${o.y}" x2="${o.x + L * Math.cos(a)}" y2="${o.y - L * Math.sin(a)}" stroke="${c}" stroke-width="${1.8 * k}" stroke-linecap="round"/>
+          <path d="M${o.x + L} ${o.y}A${L} ${L} 0 0 0 ${o.x + L * Math.cos(a)} ${o.y - L * Math.sin(a)}" fill="none" stroke="${c}" stroke-opacity=".5" stroke-width="${.6 * k}" stroke-dasharray="${k} ${k}"/>`;
+      }
+      return `<g data-opsel="${o.id}" style="cursor:pointer">${hit}${ring}${icon}${lab}</g>`;
+    };
+    const pill = o => `<button data-opsel="${o.id}" class="rc-pill ${o.id === this._opSel ? "on" : ""}"><i style="background:${col(lvl(o))}"></i>${short(o)}</button>`;
+    const states = o => Object.keys(LV[o.kind]);
+    const big = o => `<div class="rc-big" style="grid-template-columns:repeat(${o.kind === "door" ? 2 : 3},1fr)">${states(o).map(st =>
+      `<button data-opset="${o.id}" data-st="${st}" class="${o.state === st ? "on" : ""}" style="${o.state === st ? "" : `border-bottom:4px solid ${col(LV[o.kind][st])}`}">${LBL[o.kind][st]}</button>`).join("")}</div>`;
     const ago = iso => { if (!iso) return ""; const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
       return m < 1 ? "just now" : m < 90 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+    const idx = sel ? items.indexOf(sel) : -1;
     const place = this._opPlace
-      ? `<p class="rc-sub" style="color:#ffd166;margin:6px 0">${this._opPlace.move ? "Tap the new spot for it" : `Tap the map where the ${this._opPlace.kind} is`} · <a data-opcancel="1" style="cursor:pointer;text-decoration:underline">cancel</a></p>` : "";
-    const detail = sel ? `<div class="rc-sect"><h4>${sel.kind === "register" ? "Register" : "Door"}</h4>
-        <div class="rc-row"><input data-opname="${sel.id}" value="${sel.name.replace(/"/g, "&quot;")}" maxlength="40" style="flex:1 1 140px;min-height:40px;border-radius:8px;border:1px solid var(--divider-color,#ffffff30);background:transparent;color:inherit;padding:0 10px;font:inherit"/>
-          <select data-oproomsel="${sel.id}" style="min-height:40px;border-radius:8px;border:1px solid var(--divider-color,#ffffff30);background:transparent;color:inherit;padding:0 8px;font:inherit">
-            <option value="">no room</option>${rooms.map(r => `<option value="${r.id}" ${sel.room === r.id ? "selected" : ""}>${r.name}</option>`).join("")}</select></div>
-        ${chips(sel)}<p class="rc-sub" style="margin:4px 0">changed ${ago(sel.changed)}</p>
-        <div class="rc-chips"><button data-opmove="${sel.id}">Move</button><button data-opdel="${sel.id}">Delete</button></div></div>` : "";
-    const list = items.length ? items.slice().sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name)).map(o =>
-      `<div class="rc-sect"><div class="rc-row" style="margin:4px 0"><b style="cursor:pointer" data-opsel="${o.id}">${o.kind === "register" ? "▦" : "◔"} ${o.name}</b>
-        <small class="rc-sub" style="margin:0">${roomName(o.room)}</small></div>${chips(o)}</div>`).join("")
+      ? `<div class="rc-banner">${this._opPlace.move ? "Tap the new spot on the map" : `Tap the map where the ${this._opPlace.kind} is`}<button data-opcancel="1">Cancel</button></div>` : "";
+    const edit = sel && this._opEdit ? `<div class="rc-row" style="margin:8px 0 4px">
+        <input data-opname="${sel.id}" value="${sel.name.replace(/"/g, "&quot;")}" maxlength="40" class="rc-in" style="flex:1 1 150px"/>
+        <select data-oproomsel="${sel.id}" class="rc-in"><option value="">no room</option>${rooms.map(r => `<option value="${r.id}" ${sel.room === r.id ? "selected" : ""}>${r.name}</option>`).join("")}</select></div>
+        <div class="rc-chips"><button data-opmove="${sel.id}" class="rc-mid">Move on map</button><button data-opdel="${sel.id}" class="rc-mid">Delete</button></div>` : "";
+    const ctl = sel ? `<div class="rc-ctl2">
+        <div class="rc-nav"><button data-opnav="-1" aria-label="previous">‹</button>
+          <div class="rc-navt"><b>${sel.name}</b><small>${sel.kind === "register" ? "Register" : "Door"}${sel.room ? " · " + roomName(sel.room) : ""} · ${sel.state && lvl(sel) != null ? "changed " + ago(sel.changed) : "not set yet"} · ${idx + 1} of ${items.length}</small></div>
+          <button data-opnav="1" aria-label="next">›</button></div>
+        ${big(sel)}
+        <div class="rc-chips" style="margin-top:8px"><button data-opedit="1" class="rc-mid ${this._opEdit ? "on" : ""}">${this._opEdit ? "Done" : "Edit name / room / position"}</button></div>${edit}</div>`
       : `<p class="rc-sub">No registers or doors on this floor yet. Add one, then tap the map where it is.</p>`;
     const tabs = floors.length > 1 ? `<div class="rc-seg">${floors.map(f => `<button data-opfloor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
+    const counts = a => ["register", "door"].map(kd => `${a.filter(o => o.kind === kd).length} ${kd}${a.filter(o => o.kind === kd).length === 1 ? "" : "s"}`).join(" · ");
     this._wrap.innerHTML = `${tabs}<div class="rc-main"><div class="rc-map"><svg viewBox="${vb.join(" ")}" data-opmap="1" style="border-radius:10px;${this._opPlace ? "cursor:crosshair" : ""}">
-        <rect x="${vb[0]}" y="${vb[1]}" width="${vb[2]}" height="${vb[3]}" fill="#0a111d" data-opbg="1"/>${roomSvg}${items.map(marker).join("")}</svg></div>
-      <div class="rc-panel"><div class="rc-chips" style="margin-bottom:6px"><button data-opadd="register">+ Register</button><button data-opadd="door">+ Door</button></div>
-        ${place}${detail}<div class="rc-sect"><h4>${this._floorName(this._floor)} · ${items.length} openings</h4>${list}</div></div></div>`;
+        <rect x="${vb[0]}" y="${vb[1]}" width="${vb[2]}" height="${vb[3]}" fill="#0a111d"/>${roomSvg}${items.map(marker).join("")}</svg>
+        <div class="rc-pills">${items.map(pill).join("")}</div></div>
+      <div class="rc-panel">${place}${ctl}
+        <div class="rc-chips" style="margin:10px 0"><button data-opadd="register" class="rc-mid">+ Register</button><button data-opadd="door" class="rc-mid">+ Door</button></div>
+        <p class="rc-sub" style="margin:0">${this._floorName(this._floor)}: ${counts(items)}</p></div></div>`;
+    const cur = this._wrap.querySelector(".rc-pill.on"); if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "nearest", inline: "center" });
   }
 
   async _opSave(item) {
@@ -367,7 +399,7 @@ class RoomMapCard extends HTMLElement {
   }
   _opClick(e) {
     const d = this._data; if (!d) return;
-    const t = e.target.closest("[data-opfloor],[data-opsel],[data-opset],[data-opadd],[data-opmove],[data-opdel],[data-opcancel]");
+    const t = e.target.closest("[data-opfloor],[data-opsel],[data-opset],[data-opadd],[data-opmove],[data-opdel],[data-opcancel],[data-opedit],[data-opnav]");
     const items = d.openings || [];
     if (this._opPlace && (!t || !t.dataset.opcancel) && e.target.closest("svg[data-opmap]")) {  // a tap on the map places it
       const svg = this._wrap.querySelector("svg[data-opmap]"), pt = svg.createSVGPoint();
@@ -395,6 +427,11 @@ class RoomMapCard extends HTMLElement {
     }
     else if (ds.opset) { const o = items.find(i => i.id === ds.opset); if (o) { const { changed, ...rest } = o; this._opSave({ ...rest, state: ds.st }); } }
     else if (ds.opsel) { this._opSel = ds.opsel; this._opPlace = null; this._render(); }
+    else if (ds.opedit) { this._opEdit = !this._opEdit; this._render(); }
+    else if (ds.opnav) {
+      const fl = items.filter(i => i.floor === this._floor).sort((a, b) => a.y - b.y || a.x - b.x);
+      if (fl.length) { const at = Math.max(0, fl.findIndex(i => i.id === this._opSel)); this._opSel = fl[(at + +ds.opnav + fl.length) % fl.length].id; this._opPlace = null; this._render(); }
+    }
   }
 
   // Bounding box of a floor's room shapes plus margin (extra on top for the north arrow).
