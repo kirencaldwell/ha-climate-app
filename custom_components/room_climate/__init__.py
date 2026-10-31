@@ -1286,8 +1286,7 @@ class Manager:
         except Exception:  # noqa: BLE001
             out["openings_conf"] = {}
         try:  # suggested register / door positions (openings.py)
-            rec = openings.recommend(self.data.get("openings", []), self.data["rooms"], out["live"],
-                                     (self.house_info or {}).get("mode") or self.house.mode, settings)
+            rec = {}  # only the model's view of the registers (mpc.advise_openings): no rule-based suggestions
             adv, at = self.shadow.opening_advice, self.shadow.opening_advice_at
             if adv and at is not None and core.elapsed(now, at) < 1800:  # the model's view of the registers replaces the rule's
                 cur = {o["id"]: o.get("state") for o in self.data.get("openings", [])}

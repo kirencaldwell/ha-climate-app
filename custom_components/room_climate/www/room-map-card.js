@@ -401,7 +401,7 @@ class RoomMapCard extends HTMLElement {
       ? `<div class="rc-banner" style="flex-direction:column;align-items:stretch;gap:6px;background:#ffd16618"><div>Suggested changes now</div>${todo.map(o =>
           `<button data-opsel="${o.id}" data-opfl="${o.floor}" style="min-height:44px;text-align:left;justify-content:flex-start">${o.kind === "register" ? "▦" : "◔"} ${esc(o.name)} <b style="margin-left:8px;color:${col(LV[o.kind][rec[o.id].rec])}">→ ${LBL[o.kind][rec[o.id].rec]}</b></button>`).join("")}</div>`
       : Object.keys(rec).length ? `<p class="rc-sub" style="margin:0 0 8px;color:#3de0a5">✓ Everything matches the suggestions right now</p>`
-      : (mode === "heat" || mode === "cool") ? "" : `<p class="rc-sub" style="margin:0 0 8px">Suggestions appear while the house is heating or cooling.</p>`;
+      : (mode === "heat" || mode === "cool") ? "" : `<p class="rc-sub" style="margin:0 0 8px">No register suggestions right now (they come from the planner's own model; doors have none yet).</p>`;
     const tabs = floors.length > 1 ? `<div class="rc-seg">${floors.map(f => `<button data-opfloor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
     const counts = a => ["register", "door"].map(kd => `${a.filter(o => o.kind === kd).length} ${kd}${a.filter(o => o.kind === kd).length === 1 ? "" : "s"}`).join(" · ");
     this._wrap.innerHTML = `${tabs}<div class="rc-main"><div class="rc-map"><svg viewBox="${vb.join(" ")}" data-opmap="1" style="border-radius:10px;${this._opPlace ? "cursor:crosshair" : ""}">

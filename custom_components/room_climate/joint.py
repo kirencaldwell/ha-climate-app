@@ -42,8 +42,11 @@ except ImportError:  # offline (sim, tests, tools)
 class JointSettings:
     block_min: tuple = (15, 15, 15, 15, 30, 30)
     step_min: int = 5  # model step; the units' on/off decisions are made at this rate
-    push_run: float = 3.0  # F past the unit's reading: starts it and keeps it running through the block
-    push_stop: float = 2.0  # F behind the reading: makes it stop (it idles ~1 F past its setpoint)
+    # How hard a unit is driven is a DECISION, not a rule: a running unit's setpoint sits `gap` F past its reading in the direction
+    # it works, and the search picks the gap per unit and block from these levels (the model's output rises with the gap, the
+    # cost charges the energy). Nothing says which gap a situation calls for: the cost does.
+    gaps: tuple = (2.0, 4.0, 7.0)
+    push_stop: float = 2.0  # F behind the reading: makes a unit stop (mechanical: any value that far behind does it; it idles ~1 F past its setpoint)
     population: int = 60
     elite: int = 8
     iters: int = 5
@@ -96,7 +99,8 @@ class JointPlanner:
             rest = sorted((f for f in sc if f != "auto"), key=lambda f: sc[f])  # weakest first
             pick = [rest[0]] + ([rest[len(rest) // 2]] if len(rest) > 2 else []) if rest else []
             fans = ["auto"] + [f for f in pick if f][:max(0, self.js.max_fans - 1)]
-        return [(False, None)] + [(True, f) for f in fans] + ([(False, "sleep")] if self.js.sleep_option else [])
+        return ([(False, None, None)] + [(True, f, g) for f in fans for g in self.js.gaps]
+                + ([(False, "sleep", None)] if self.js.sleep_option else []))
 
     def plan(self, m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime, house: core.HouseState,
              running: dict, outdoor, sun_at, settings: core.Settings = core.Settings(), ignore=(), fixed=None,
@@ -124,17 +128,17 @@ class JointPlanner:
         known = [u for u in units if u.id in m.units and u.id not in fixed]
         fan_units = {x.strip() for x in settings.fan_units.split(",")}
         opts = {u.id: self._options(m, u, fan_units) for u in known}
-        label = {u.id: [("sleep" if f == "sleep" else "off" if not r else f"run:{f or '-'}") for r, f in opts[u.id]] for u in known}
+        label = {u.id: [("sleep" if f == "sleep" else "off" if not r else f"run:{f or '-'}@{g:g}") for r, f, g in opts[u.id]] for u in known}
         nb = len(blocks)
         zone = {u.id: [r for r in scored if r.unit == u.id] for u in known}
         evals = [0]
         cache = {}
 
-        def sp_for(u, mode, reading, run):
+        def sp_for(u, mode, reading, run, gap=None):
             if reading is None:
                 return None
             s = 1.0 if mode == "heat" else -1.0
-            v = reading + s * (js.push_run if run else -js.push_stop)
+            v = reading + s * (gap if run else -js.push_stop)
             return core.to_grid(max(u.min_setpoint, min(u.max_setpoint, v)))
 
         def evaluate(mode, pattern):
@@ -151,7 +155,7 @@ class JointPlanner:
             for bi, (a, b) in enumerate(blocks):
                 sps, fan_now, bmodes = {}, dict(fans or {}), dict(modes_by_unit)
                 for u in known:
-                    runb, fan = opts[u.id][pattern[u.id][bi]]
+                    runb, fan, gap = opts[u.id][pattern[u.id][bi]]
                     if fan == "sleep":  # fully off for this block: no setpoint, no leak
                         bmodes[u.id], sps[u.id] = "off", None
                         if bi == 0:
@@ -159,7 +163,7 @@ class JointPlanner:
                         continue
                     rd = unit_temps.get(u.id) if (bi == 0 and unit_temps and unit_temps.get(u.id) is not None) \
                         else hm.unit_reading(m, u.id, cur)
-                    sps[u.id] = sp_for(u, mode, rd, runb)
+                    sps[u.id] = sp_for(u, mode, rd, runb, gap)
                     if runb and fan:
                         fan_now[u.id] = fan
                     if bi == 0:
@@ -213,7 +217,8 @@ class JointPlanner:
             pat = {}
             for u in known:
                 lab = fixed_pattern.get(u.id) or []
-                pat[u.id] = [(1 if lab[i] == "run1" and len(label[u.id]) > 1 else label[u.id].index(lab[i]) if lab[i] in label[u.id] else 0)
+                mid = next((k for k, (r_, f_, g_) in enumerate(opts[u.id]) if r_ and g_ == js.gaps[len(js.gaps) // 2]), 0)  # "run1": a run at the middle gap
+                pat[u.id] = [(mid if lab[i] == "run1" else label[u.id].index(lab[i]) if lab[i] in label[u.id] else 0)
                              if i < len(lab) else 0 for i in range(nb)]
             c, traj, _, _ = evaluate(md, pat)
             return JointPlan(md, {}, c, {}, {r.id: [round(t[r.id], 2) for t in traj] for r in scored}, "fixed pattern", {}, 0.0, {}, {}, fixed_pattern,
@@ -257,15 +262,10 @@ class JointPlanner:
         # sampling distribution: probability of each option per unit and block
         prob = {uid: [[1.0 / len(opts[uid])] * len(opts[uid]) for _ in range(nb)] for uid in uids}
         seeds = [{uid: [0] * nb for uid in uids}]
-        # greedy seed: a unit runs while its rooms sit below (heat) / above (cool) their targets
+        # a second generic starting point (the search is free to move away from it): every unit running at the middle gap
         g = {}
         for u in known:
-            rs = [r for r in zone[u.id] if temps.get(r.id) is not None]
-            gap = 0.0
-            if rs:
-                gap = sum((tw[r.id][0][0] - temps[r.id]) * tw[r.id][0][1] for r in rs) / sum(tw[r.id][0][1] for r in rs)
-            need = gap > 0.7 if mode == "heat" else gap < -0.7
-            g[u.id] = [1 if need else 0] * nb  # option 1 is "run" at the first fan option (auto)
+            g[u.id] = [next((k for k, (r_, f_, g_) in enumerate(opts[u.id]) if r_ and g_ == js.gaps[len(js.gaps) // 2]), 0)] * nb
         seeds.append(g)
         # previous plan, shifted by the time elapsed
         if self.prev and self.prev[1] == mode:
