@@ -71,6 +71,11 @@ class Settings:
     # target, a miss above it costs `warm_weight` times a miss below, and heating aims `aim_offset` under the target.
     band_below: float = 1.5
     band_above: float = 1.0
+    # How far to trust a register's or door's reported state (the owner says about half of them are right at any time):
+    # right after the owner sets or confirms one it is `fresh`, and decays towards `floor` with time constant `tau_h`.
+    opening_conf_floor: float = 0.5
+    opening_conf_fresh: float = 0.95
+    opening_conf_tau_h: float = 24.0
     observer_on: bool = False  # the planner's feedback (observer.py): per-room drift and per-unit gain corrections learned online
     #                            (offset-free MPC); 2026-10-29 simulator: joint planner discomfort 32.8 -> 25.8
     experiment_vane_units: str = ""  # comma-separated unit ids whose solos sweep the vertical vane (at fan auto) instead of the fan

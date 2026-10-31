@@ -8,6 +8,8 @@ room far short, open. Pure Python, no Home Assistant imports.
 """
 from __future__ import annotations
 
+import math
+from datetime import datetime
 from typing import Optional
 
 try:
@@ -74,7 +76,31 @@ def register_gain(state) -> float:
     return REGISTER_GAIN.get(state, 1.0)  # an unset register counts as open
 
 
-def register_multipliers(openings: list, room_unit: dict, model_rooms: dict, states: dict = None) -> dict:
+def confidence(item: dict, now: Optional[datetime], conf: tuple = (0.5, 0.95, 24.0)) -> float:
+    """How likely the item really is in its reported state, 0..1. `conf` = (floor, fresh, tau_h): `fresh` right after the owner
+    set or confirmed it, decaying to `floor` (the owner's own estimate: about half) over `tau_h` hours. Not set yet: 0."""
+    levels = REGISTER_GAIN if item.get("kind") == "register" else DOOR_LEVEL
+    if item.get("state") not in levels:
+        return 0.0
+    floor, fresh, tau_h = conf
+    t = max(item.get("confirmed") or "", item.get("changed") or "")
+    if not t or now is None:
+        return floor
+    try:
+        age_h = max(0.0, (now - datetime.fromisoformat(t)).total_seconds() / 3600)
+    except (TypeError, ValueError):
+        return floor
+    return floor + (fresh - floor) * math.exp(-age_h / max(tau_h, 1e-6))
+
+
+def _blend(levels: dict, state, r: float) -> float:
+    """The expected level: `r` on the reported state's, the rest spread evenly over the other states."""
+    others = [v for k, v in levels.items() if k != state]
+    mean_other = sum(others) / len(others)
+    return r * levels[state] + (1 - r) * mean_other if state in levels else sum(levels.values()) / len(levels)
+
+
+def register_multipliers(openings: list, room_unit: dict, model_rooms: dict, states: dict = None, now=None, conf=None) -> dict:
     """{room id: multiplier on its unit's effect there} from the registers' states (`states`: id -> state overrides, for
     trying alternatives). Per unit, the rooms that have registers share its output in proportion to their fitted gains times
     their register's opening (rooms with no register count as fully open), renormalized so the unit's total stays what it was
@@ -83,7 +109,13 @@ def register_multipliers(openings: list, room_unit: dict, model_rooms: dict, sta
     by_room = {}
     for o in openings:
         if o.get("kind") == "register" and o.get("room"):
-            by_room.setdefault(o["room"], []).append(register_gain(states.get(o["id"], o.get("state"))))
+            if now is None:
+                gval = register_gain(states.get(o["id"], o.get("state")))  # taken at face value
+            elif o["id"] in states:  # a state being tried: as if the owner had just set it
+                gval = _blend(REGISTER_GAIN, states[o["id"]], (conf or (0.5, 0.95, 24.0))[1])
+            else:
+                gval = _blend(REGISTER_GAIN, o.get("state"), confidence(o, now, conf or (0.5, 0.95, 24.0)))
+            by_room.setdefault(o["room"], []).append(gval)
     out = {}
     for unit in {room_unit.get(r) for r in by_room} - {None}:
         base = {r: (model_rooms[r].heat.get(unit, 0.0) if r in model_rooms else 0.0)
@@ -98,7 +130,11 @@ def register_multipliers(openings: list, room_unit: dict, model_rooms: dict, sta
     return out
 
 
-def door_level(openings: list, room_id: str) -> float:
+def door_level(openings: list, room_id: str, now=None, conf=None) -> float:
     """How open the room's door(s) are, 0..1 (mean of its doors; DOOR_DEFAULT if it has none or they are unset)."""
-    lv = [DOOR_LEVEL[o["state"]] for o in openings if o.get("kind") == "door" and o.get("room") == room_id and o.get("state") in DOOR_LEVEL]
+    mine = [o for o in openings if o.get("kind") == "door" and o.get("room") == room_id and o.get("state") in DOOR_LEVEL]
+    if now is None:
+        lv = [DOOR_LEVEL[o["state"]] for o in mine]
+    else:
+        lv = [_blend(DOOR_LEVEL, o["state"], confidence(o, now, conf or (0.5, 0.95, 24.0))) for o in mine]
     return sum(lv) / len(lv) if lv else DOOR_DEFAULT

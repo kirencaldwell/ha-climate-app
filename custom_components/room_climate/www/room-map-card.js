@@ -343,6 +343,8 @@ class RoomMapCard extends HTMLElement {
     const col = l => l == null ? "#8a94a6" : l < .1 ? "#ff7a45" : l < .8 ? "#ffd166" : "#3de0a5";
     const lvl = o => LV[o.kind][o.state];
     const rec = d.openings_rec || {};
+    const conf = d.openings_conf || {};
+    const sure = o => conf[o.id] == null ? 1 : conf[o.id];  // how far its reported state is trusted
     const want = o => (rec[o.id] && !rec[o.id].match) ? rec[o.id] : null;  // a suggestion that differs from how it is set now
     const esc = t => String(t).replace(/[<&]/g, "");
     const roomName = id => (d.rooms.find(r => r.id === id) || {}).name || "";
@@ -367,10 +369,10 @@ class RoomMapCard extends HTMLElement {
           <line x1="${o.x}" y1="${o.y}" x2="${o.x + L * Math.cos(a)}" y2="${o.y - L * Math.sin(a)}" stroke="${c}" stroke-width="${1.8 * k}" stroke-linecap="round"/>
           <path d="M${o.x + L} ${o.y}A${L} ${L} 0 0 0 ${o.x + L * Math.cos(a)} ${o.y - L * Math.sin(a)}" fill="none" stroke="${c}" stroke-opacity=".5" stroke-width="${.6 * k}" stroke-dasharray="${k} ${k}"/>`;
       }
-      return `<g data-opsel="${o.id}" style="cursor:pointer">${hit}${sug}${ring}${icon}${lab}</g>`;
+      return `<g data-opsel="${o.id}" style="cursor:pointer">${hit}${sug}${ring}<g opacity="${(.38 + .62 * sure(o)).toFixed(2)}">${icon}</g>${lab}</g>`;
     };
     const pill = o => { const w = want(o);
-      return `<button data-opsel="${o.id}" class="rc-pill ${o.id === this._opSel ? "on" : ""}"><i style="background:${col(lvl(o))}"></i>${short(o)}${w ? ` <em style="font-style:normal;color:${col(LV[o.kind][w.rec])}">→ ${LBL[o.kind][w.rec]}</em>` : ""}</button>`; };
+      return `<button data-opsel="${o.id}" class="rc-pill ${o.id === this._opSel ? "on" : ""}"><i style="background:${col(lvl(o))};opacity:${(.4 + .6 * sure(o)).toFixed(2)}"></i>${short(o)}${sure(o) < .7 ? ` <small style="opacity:.6">?</small>` : ""}${w ? ` <em style="font-style:normal;color:${col(LV[o.kind][w.rec])}">→ ${LBL[o.kind][w.rec]}</em>` : ""}</button>`; };
     const states = o => Object.keys(LV[o.kind]);
     const big = o => `<div class="rc-big" style="grid-template-columns:repeat(${o.kind === "door" ? 2 : 3},1fr)">${states(o).map(st =>
       `<button data-opset="${o.id}" data-st="${st}" class="${o.state === st ? "on" : ""}" style="${o.state === st ? "" : `border-bottom:4px solid ${col(LV[o.kind][st])};`}${rec[o.id] && rec[o.id].rec === st ? "outline:2px dashed " + col(LV[o.kind][st]) + ";outline-offset:2px" : ""}">${rec[o.id] && rec[o.id].rec === st ? "★ " : ""}${LBL[o.kind][st]}</button>`).join("")}</div>`;
@@ -386,10 +388,11 @@ class RoomMapCard extends HTMLElement {
         <div class="rc-chips"><button data-opmove="${sel.id}" class="rc-mid">Move on map</button><button data-opdel="${sel.id}" class="rc-mid">Delete</button></div>` : "";
     const ctl = sel ? `<div class="rc-ctl2">
         <div class="rc-nav"><button data-opnav="-1" aria-label="previous">‹</button>
-          <div class="rc-navt"><b>${sel.name}</b><small>${sel.kind === "register" ? "Register" : "Door"}${sel.room ? " · " + roomName(sel.room) : ""} · ${sel.state && lvl(sel) != null ? "changed " + ago(sel.changed) : "not set yet"} · ${idx + 1} of ${items.length}</small></div>
+          <div class="rc-navt"><b>${sel.name}</b><small>${sel.kind === "register" ? "Register" : "Door"}${sel.room ? " · " + roomName(sel.room) : ""} · ${sel.state && lvl(sel) != null ? `~${Math.round(100 * sure(sel))}% sure it is ${(LBL[sel.kind][sel.state] || "").toLowerCase()} · last touched ${ago(sel.confirmed && Date.parse(sel.confirmed) > Date.parse(sel.changed || 0) ? sel.confirmed : sel.changed)}` : "not set yet"} · ${idx + 1} of ${items.length}</small></div>
           <button data-opnav="1" aria-label="next">›</button></div>
         ${rec[sel.id] ? `<p class="rc-sub" style="margin:8px 0 0;color:${rec[sel.id].match ? "#3de0a5" : "#ffd166"}">${rec[sel.id].match ? "✓ " : "★ Suggested: " + LBL[sel.kind][rec[sel.id].rec] + ". "}${esc(rec[sel.id].why)}</p>` : ""}
         ${big(sel)}
+        ${lvl(sel) != null ? `<div class="rc-chips" style="margin-top:8px"><button data-opconfirm="${sel.id}" class="rc-mid">✓ Still correct (I just checked)</button></div>` : ""}
         <div class="rc-chips" style="margin-top:8px"><button data-opedit="1" class="rc-mid ${this._opEdit ? "on" : ""}">${this._opEdit ? "Done" : "Edit name / room / position"}</button></div>${edit}</div>`
       : `<p class="rc-sub">No registers or doors on this floor yet. Add one, then tap the map where it is.</p>`;
     const todo = (d.openings || []).filter(o => want(o)).sort((a, b) => a.floor - b.floor || a.y - b.y);
@@ -405,6 +408,7 @@ class RoomMapCard extends HTMLElement {
         <rect x="${vb[0]}" y="${vb[1]}" width="${vb[2]}" height="${vb[3]}" fill="#0a111d"/>${roomSvg}${items.map(marker).join("")}</svg>
         <div class="rc-pills">${items.map(pill).join("")}</div></div>
       <div class="rc-panel">${err}${place}${sugBox}${ctl}
+        <div class="rc-chips" style="margin:10px 0 0"><button data-opconfirm="floor" class="rc-mid">✓ Everything on this floor is as shown</button></div>
         <div class="rc-chips" style="margin:10px 0"><button data-opadd="register" class="rc-mid">+ Register</button><button data-opadd="door" class="rc-mid">+ Door</button></div>
         <p class="rc-sub" style="margin:0">${this._floorName(this._floor)}: ${counts(items)}</p></div></div>`;
     const cur = this._wrap.querySelector(".rc-pill.on"); if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "nearest", inline: "center" });
@@ -425,7 +429,7 @@ class RoomMapCard extends HTMLElement {
   }
   _opClick(e) {
     const d = this._data; if (!d) return;
-    const t = e.target.closest("[data-opfloor],[data-opsel],[data-opset],[data-opadd],[data-opmove],[data-opdel],[data-opcancel],[data-opedit],[data-opnav],[data-opdismiss]");
+    const t = e.target.closest("[data-opfloor],[data-opsel],[data-opset],[data-opadd],[data-opmove],[data-opdel],[data-opcancel],[data-opedit],[data-opnav],[data-opdismiss],[data-opconfirm]");
     const items = d.openings || [];
     if (this._opPlace && (!t || !t.dataset.opcancel) && e.target.closest("svg[data-opmap]")) {  // a tap on the map places it
       const svg = this._wrap.querySelector("svg[data-opmap]"), pt = svg.createSVGPoint();
@@ -454,6 +458,10 @@ class RoomMapCard extends HTMLElement {
     else if (ds.opset) { const o = items.find(i => i.id === ds.opset); if (o) { const { changed, ...rest } = o; this._opSave({ ...rest, state: ds.st }); } }
     else if (ds.opsel) { if (ds.opfl) this._floor = +ds.opfl; this._opSel = ds.opsel; this._opPlace = null; this._render(); }
     else if (ds.opdismiss) { this._opErr = null; this._render(); }
+    else if (ds.opconfirm) {
+      const ids = ds.opconfirm === "floor" ? items.filter(i => i.floor === this._floor && i.state && i.state !== "unset").map(i => i.id) : [ds.opconfirm];
+      if (ids.length) this._hass.callWS({ type: "room_climate/opening_confirm", ids }).then(r => { this._data = r; this._render(); }).catch(err => { this._opErr = "Couldn't confirm: " + ((err && err.message) || "error"); this._render(); });
+    }
     else if (ds.opedit) { this._opEdit = !this._opEdit; this._render(); }
     else if (ds.opnav) {
       const fl = items.filter(i => i.floor === this._floor).sort((a, b) => a.y - b.y || a.x - b.x);

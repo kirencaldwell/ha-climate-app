@@ -118,7 +118,9 @@ class ShadowPlanner:
         self.jplan_at: datetime = None
         self.jplan_ms: float = None
         self.jerror: str = None
-        self.openings: list = []  # registers and doors as the owner set them (set_openings)
+        self.openings: list = []  # registers and doors as the owner reported them (set_openings)
+        self.open_now = None
+        self.open_conf = None
         self.room_unit: dict = {}
         self.opening_advice: dict = None  # advise_openings' last answer, and when
         self.opening_advice_at: datetime = None
@@ -128,16 +130,19 @@ class ShadowPlanner:
         self.ml_errors: deque = deque()  # (t_eval, room, horizon_min, corrected err, physics err)
 
     # --- registers and doors ---
-    def set_openings(self, items: list, room_unit: dict):
-        """The registers and doors as the owner set them (the integration calls this every tick), and which unit serves each room."""
-        self.openings, self.room_unit = items or [], room_unit or {}
+    def set_openings(self, items: list, room_unit: dict, now=None, conf=None):
+        """The registers and doors as the owner reported them (the integration calls this every tick), which unit serves each room,
+        and how far to trust the reported states (`conf` = (floor, fresh, tau_h); openings.confidence): the model works with the
+        expected opening, not the reported one."""
+        self.openings, self.room_unit, self.open_now, self.open_conf = items or [], room_unit or {}, now, conf
 
     def corrections(self) -> dict:
         """The observer's corrections with the registers' effect folded into `effect_scale` (room -> {unit: multiplier})."""
         c = dict(self.observer.corrections())
         if not getattr(self, "openings", None) or self.model is None:
             return c
-        mult = openings.register_multipliers(self.openings, self.room_unit, self.model.rooms)
+        mult = openings.register_multipliers(self.openings, self.room_unit, self.model.rooms, now=getattr(self, "open_now", None),
+                                             conf=getattr(self, "open_conf", None))
         if mult:
             eff = {r: dict(v) for r, v in (c.get("effect_scale") or {}).items()}
             for rid, mval in mult.items():
@@ -153,13 +158,24 @@ class ShadowPlanner:
         regs = [o for o in getattr(self, "openings", []) if o.get("kind") == "register" and o.get("room")
                 and self.room_unit.get(o["room"]) and o["room"] in (self.model.rooms if self.model else {})]
         p = self.jplan
-        if not regs or p is None or not p.pattern or self.jhouse.mode not in ("heat", "cool"):
+        if not regs or p is None or not p.pattern:
             return None
+        mode, pattern = self.jhouse.mode, p.pattern
+        if mode not in ("heat", "cool") or p.mode == "off":
+            # Nothing is planned to run, so the registers would not matter: judge them for the plan "the units serving these
+            # rooms run for the next hour and a half" in whichever mode is cheaper, which is what they matter for when heat is needed.
+            costs = {md: v["cost"] for md, v in (p.by_mode or {}).items() if md in ("heat", "cool")}
+            if not costs:
+                return None
+            mode = min(costs, key=costs.get)
+            serving = {self.room_unit[o["room"]] for o in regs}
+            pattern = {u: (["run1"] * 4 + ["off"] * 2) if u in serving else ["off"] * 6 for u in p.pattern}
         running = {u: bool(a.get("running")) for u, a in actual.items()}
         state = {o["id"]: (o.get("state") if o.get("state") in openings.REGISTER_GAIN else "open") for o in regs}
 
         def cost(st):
-            mult = openings.register_multipliers(regs, self.room_unit, self.model.rooms, st)
+            mult = openings.register_multipliers(regs, self.room_unit, self.model.rooms, {k: v for k, v in st.items() if v != state[k]},
+                                                 now=self.open_now or now, conf=self.open_conf)
             obs = self.observer.corrections()
             eff = {r: dict(v) for r, v in (obs.get("effect_scale") or {}).items()}
             for rid, mval in mult.items():
@@ -168,8 +184,10 @@ class ShadowPlanner:
             return self.joint.plan(self.model, rooms, units, temps, now, self.jhouse, running, outdoor, sun_at, settings,
                                    ignore=set(ignore), fixed=fixed, lagged=dict(self.lagged),
                                    fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses),
-                                   comp=dict(self.comp), fixed_pattern=p.pattern, **kw).cost
+                                   comp=dict(self.comp), fixed_pattern=pattern, fixed_mode=mode, **kw).cost
         now_cost = base = cost(state)
+        if base <= 0:
+            return None
         best = dict(state)
         for _ in range(2):
             changed = False
@@ -190,8 +208,10 @@ class ShadowPlanner:
             if rec == state[o["id"]]:
                 out[o["id"]] = {"rec": rec, "why": f"{name}: no change helps the next 2 h plan", "match": True, "src": "model"}
             else:
+                sure = openings.confidence(o, self.open_now, self.open_conf or (0.5, 0.95, 24.0))
                 out[o["id"]] = {"rec": rec, "match": False, "src": "model",
-                                "why": f"model: {name} → {rec}; the next 2 h plan's cost {base:.0f} → {now_cost:.0f} ({100 * (1 - now_cost / base):.0f}% less)"}
+                                "why": f"model: {name} → {rec}; the next 2 h plan's cost {base:.0f} → {now_cost:.0f} ({100 * (1 - now_cost / base):.0f}% less)"
+                                       + (f" (its reported state is only ~{100 * sure:.0f}% sure: check it)" if sure < 0.7 else "")}
         return out
 
     def set_correct(self, on: bool):
@@ -297,8 +317,10 @@ class ShadowPlanner:
                 u10 = v
             gap = (u0 - T0) if u0 is not None else 0.0
             d10 = (u0 - u10) if (u0 is not None and u10 is not None) else 0.0
-            rm = openings.register_multipliers(self.openings, self.room_unit, self.model.rooms).get(rid, 1.0) if self.openings else 1.0
-            rooms[rid] = (t10, t30, (nb + [0.0, 0.0])[:2], gap, d10, rm, openings.door_level(self.openings, rid))
+            rm = (openings.register_multipliers(self.openings, self.room_unit, self.model.rooms, now=self.open_now, conf=self.open_conf)
+                  .get(rid, 1.0) if self.openings else 1.0)
+            rooms[rid] = (t10, t30, (nb + [0.0, 0.0])[:2], gap, d10, rm,
+                          openings.door_level(self.openings, rid, self.open_now, self.open_conf))
         return {"rooms": rooms, "out0": outdoor if outdoor is not None else None, "sun0": as_h(sun),
                 "hour": now.hour + now.minute / 60, "t_on0": self.comp.get("h", 0.0) * 60}
 

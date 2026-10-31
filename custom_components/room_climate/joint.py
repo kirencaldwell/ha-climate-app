@@ -101,9 +101,10 @@ class JointPlanner:
     def plan(self, m: hm.HouseModel, rooms: list, units: list, temps: dict, now: datetime, house: core.HouseState,
              running: dict, outdoor, sun_at, settings: core.Settings = core.Settings(), ignore=(), fixed=None,
              lagged=None, fans=None, masses=None, offsets=None, leak_scale=None, effect_scale=None,
-             unit_temps=None, comp=None, fixed_pattern=None) -> JointPlan:
+             unit_temps=None, comp=None, fixed_pattern=None, fixed_mode=None) -> JointPlan:
         """`fixed_pattern` (unit id -> option labels per block, e.g. a previous plan's `pattern`): evaluate just that pattern in
-        the house's mode and return its cost, with no search (to compare register / door configurations cheaply)."""
+        `fixed_mode` (default the house's mode) and return its cost, with no search (to compare register / door configurations
+        cheaply). A label "run1" means a unit's first run option."""
         js = self.js
         fixed = fixed or {}
         blocks, k = [], 0
@@ -208,11 +209,12 @@ class JointPlanner:
             modes = ["off"] + [md for md, ok in (("heat", settings.allow_heat), ("cool", settings.allow_cool)) if ok]
 
         if fixed_pattern is not None:
-            md = forced or (house.mode if house.mode in ("heat", "cool") else "off")
+            md = fixed_mode or forced or (house.mode if house.mode in ("heat", "cool") else "off")
             pat = {}
             for u in known:
                 lab = fixed_pattern.get(u.id) or []
-                pat[u.id] = [label[u.id].index(lab[i]) if i < len(lab) and lab[i] in label[u.id] else 0 for i in range(nb)]
+                pat[u.id] = [(1 if lab[i] == "run1" and len(label[u.id]) > 1 else label[u.id].index(lab[i]) if lab[i] in label[u.id] else 0)
+                             if i < len(lab) else 0 for i in range(nb)]
             c, traj, _, _ = evaluate(md, pat)
             return JointPlan(md, {}, c, {}, {r.id: [round(t[r.id], 2) for t in traj] for r in scored}, "fixed pattern", {}, 0.0, {}, {}, fixed_pattern,
                              js.step_min, evals[0])

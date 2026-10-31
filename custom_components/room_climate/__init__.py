@@ -890,7 +890,8 @@ class Manager:
                 return hm.sun_from_irradiance(hm.sun_elevation(t, lat, lon), hm.sun_azimuth(t, lat, lon), *irr)
             return hm.sun_at(t, lat, lon, cloud_ahead(t))
 
-        self.shadow.set_openings(self.data.get("openings", []), {r.id: r.unit for r in rooms})
+        self.shadow.set_openings(self.data.get("openings", []), {r.id: r.unit for r in rooms}, now,
+                                 (settings.opening_conf_floor, settings.opening_conf_fresh, settings.opening_conf_tau_h))
         self.shadow.set_correct(settings.observer_on)
         self.shadow.observe(now, temps, actual, outdoor, sun_at(now))
         if self.shadow.due(now) and not self._shadow_busy:
@@ -1001,6 +1002,9 @@ class Manager:
         if ops and (ops != self._op_logged or self._op_logged_at is None
                     or core.elapsed(now, self._op_logged_at) >= OP_HEARTBEAT_MIN * 60):
             row["op"] = ops  # register / door positions (0 closed .. 1 fully open), on change and hourly
+            s_ = core.settings_from(self.data.get("settings"))
+            cf = (s_.opening_conf_floor, s_.opening_conf_fresh, s_.opening_conf_tau_h)
+            row["opc"] = {o["id"]: round(openings.confidence(o, now, cf), 2) for o in self.data.get("openings", []) if o["id"] in ops}  # how far to trust them
             self._op_logged, self._op_logged_at = ops, now
         if getattr(self, "exp_block", None):
             b = self.exp_block
@@ -1276,6 +1280,11 @@ class Manager:
             out["unit_diag"] = self.unit_diag()
         except Exception:  # noqa: BLE001 - a display extra must never break the snapshot
             out["unit_diag"] = {}
+        try:  # how far each reported register / door state is trusted (openings.confidence), and when it was last touched
+            cf = (settings.opening_conf_floor, settings.opening_conf_fresh, settings.opening_conf_tau_h)
+            out["openings_conf"] = {o["id"]: round(openings.confidence(o, now, cf), 2) for o in self.data.get("openings", [])}
+        except Exception:  # noqa: BLE001
+            out["openings_conf"] = {}
         try:  # suggested register / door positions (openings.py)
             rec = openings.recommend(self.data.get("openings", []), self.data["rooms"], out["live"],
                                      (self.house_info or {}).get("mode") or self.house.mode, settings)
@@ -1385,6 +1394,20 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         await mgr.async_save()
         connection.send_result(msg["id"], mgr.snapshot())
 
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/opening_confirm", vol.Required("ids"): [str]})
+    @websocket_api.async_response
+    async def ws_opening_confirm(hass, connection, msg):
+        """The owner checked these in person: their reported states are right as of now (confidence back to fresh)."""
+        now = dt_util.now().isoformat()
+        n = 0
+        for o in mgr.data.get("openings", []):
+            if o["id"] in msg["ids"]:
+                o["confirmed"] = now
+                n += 1
+        _LOGGER.info("confirmed %d opening state(s)", n)
+        await mgr.async_save()
+        connection.send_result(msg["id"], mgr.snapshot())
+
     @websocket_api.websocket_command({"type": f"{DOMAIN}/opening_delete", vol.Required("id"): str})
     @websocket_api.async_response
     async def ws_opening_delete(hass, connection, msg):
@@ -1481,7 +1504,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         hass.async_create_task(mgr.async_fit())
         connection.send_result(msg["id"], {"started": True})
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_opening_save, ws_opening_delete, ws_fit_model, ws_reload_ml,
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_opening_save, ws_opening_confirm, ws_opening_delete, ws_fit_model, ws_reload_ml,
                ws_experiment_start, ws_experiment_stop):
         websocket_api.async_register_command(hass, fn)
 
