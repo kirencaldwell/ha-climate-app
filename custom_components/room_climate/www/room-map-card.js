@@ -150,7 +150,7 @@ class RoomMapCard extends HTMLElement {
     try {
       this._data = await this._hass.callWS({ type: "room_climate/get" });
       this._failed = null;
-      if (!this._modal) this._render();  // don't rebuild the page under an open editor
+      if (!this._modal && !this._opEditing) this._render();  // don't rebuild the page under an open editor (or a field being typed in)
       else if (this._diag) this._diagUpdate();  // diagnostics stay live
     } catch (e) { this._fail("refresh", e); }
     finally { this._loading = false; }
@@ -201,9 +201,13 @@ class RoomMapCard extends HTMLElement {
     this.innerHTML = `<style>${CSS}</style><ha-card header="Room climate"><div class="rc"></div></ha-card>`;
     this._wrap = this.querySelector(".rc");
     this._wrap.addEventListener("click", e => this._click(e));
+    this._wrap.addEventListener("change", e => this._opChange(e));
+    this._wrap.addEventListener("focusin", e => { if (e.target.matches && e.target.matches("input,select")) this._opEditing = true; });
+    this._wrap.addEventListener("focusout", () => { this._opEditing = false; });
   }
 
   _click(e) {
+    if (this._config.page === "openings") { this._opClick(e); return; }
     const t = e.target.closest("[data-act],[data-room],[data-floor]");
     if (!t || !this._data) return;
     if (["diag", "model", "ctl", "exp-start", "exp-stop"].includes(t.dataset.act) && !this._admin) return;  // admin view only
@@ -235,6 +239,7 @@ class RoomMapCard extends HTMLElement {
 
   _render() {
     const d = this._data; if (!d) return;
+    if (this._config.page === "openings") { this._renderOpenings(); return; }
     const floors = [...new Set(d.rooms.map(r => r.floor || 1))].sort();
     if (!floors.includes(this._floor)) this._floor = floors[0];
     const rooms = d.rooms.filter(r => (r.floor || 1) === this._floor);
@@ -294,6 +299,102 @@ class RoomMapCard extends HTMLElement {
       <div class="rc-map"><svg viewBox="${vb.join(" ")}" style="${tech ? "border-radius:10px" : ""}">${bg}${shapes}${compass}</svg></div>
       <div class="rc-panel"></div></div>`;
     this._panel();
+  }
+
+  // ---- Openings page (card config `page: openings`): the registers and doors, their positions and how open each one is ----
+  _renderOpenings() {
+    const d = this._data;
+    const floors = [...new Set(d.rooms.map(r => r.floor || 1))].sort();
+    if (!floors.includes(this._floor)) this._floor = floors[0];
+    const rooms = d.rooms.filter(r => (r.floor || 1) === this._floor);
+    const v = this._fit(rooms) || { x: 0, y: 0, w: 100, h: 100 }, vb = [v.x, v.y, v.w, v.h], k = vb[2] / 100;
+    const all = d.openings || [], items = all.filter(o => o.floor === this._floor);
+    const sel = all.find(o => o.id === this._opSel && o.floor === this._floor);
+    const LV = { register: { closed: 0, partial: .5, open: 1 }, door: { closed: 0, cracked: .15, open: .6, wide: 1 } };
+    const LBL = { register: { closed: "Closed", partial: "Half open", open: "Fully open" },
+                  door: { closed: "Closed", cracked: "Cracked", open: "Open", wide: "Wide open" } };
+    const col = l => l == null ? "#667085" : l < .1 ? "#ff7a45" : l < .8 ? "#ffd166" : "#3de0a5";
+    const roomSvg = rooms.map(r => { const s = r.shape || {};
+      return `<g data-oproom="${r.id}"><rect x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" rx="${k}" fill="#3fa9ff" fill-opacity=".07" stroke="#3fa9ff" stroke-opacity=".5" stroke-width="${.5 * k}"/>
+        <text x="${s.x + s.w / 2}" y="${s.y + 4 * k}" text-anchor="middle" font-size="${2.8 * k}" fill="#cfe8ff" fill-opacity=".6" letter-spacing="${.3 * k}">${r.name.toUpperCase()}</text></g>`; }).join("");
+    const marker = o => {
+      const l0 = LV[o.kind][o.state], l = l0 == null ? .5 : l0, c = col(l0), on = o.id === this._opSel, z = 3.4 * k;  // unset: grey, drawn half open
+      const ring = on ? `<circle cx="${o.x}" cy="${o.y}" r="${3.6 * k}" fill="none" stroke="#fff" stroke-width="${.5 * k}" stroke-dasharray="${k} ${k}"/>` : "";
+      if (o.kind === "register") {
+        const slats = [-1, 0, 1].map(i => `<line x1="${o.x - z / 2 + .5 * k}" x2="${o.x + z / 2 - .5 * k}" y1="${o.y + i * z / 4}" y2="${o.y + i * z / 4 + (1 - l) * 0}" stroke="${c}" stroke-width="${(.35 + .5 * (1 - l)) * k}"/>`).join("");
+        return `<g data-opsel="${o.id}" style="cursor:pointer">${ring}<rect x="${o.x - z / 2}" y="${o.y - z / 2}" width="${z}" height="${z}" rx="${.4 * k}" fill="${c}" fill-opacity="${.12 + .25 * (1 - l)}" stroke="${c}" stroke-width="${.5 * k}"/>${slats}</g>`;
+      }
+      const a = (l * 80) * Math.PI / 180, L = 3.8 * k;  // a door leaf swung open by l*80 degrees from its closed position
+      return `<g data-opsel="${o.id}" style="cursor:pointer">${ring}<circle cx="${o.x}" cy="${o.y}" r="${.7 * k}" fill="${c}"/>
+        <line x1="${o.x}" y1="${o.y}" x2="${o.x + L * Math.cos(a)}" y2="${o.y - L * Math.sin(a)}" stroke="${c}" stroke-width="${.9 * k}" stroke-linecap="round"/>
+        <path d="M${o.x + L} ${o.y}A${L} ${L} 0 0 0 ${o.x + L * Math.cos(a)} ${o.y - L * Math.sin(a)}" fill="none" stroke="${c}" stroke-opacity=".45" stroke-width="${.3 * k}" stroke-dasharray="${.6 * k} ${.6 * k}"/></g>`;
+    };
+    const states = o => Object.keys(LV[o.kind]).map(st => [st, LBL[o.kind][st]]);
+    const chips = o => `${LV[o.kind][o.state] == null ? `<p class="rc-sub" style="margin:2px 0;color:#ffd166">not set yet: pick its position</p>` : ""}<div class="rc-chips">${states(o).map(([st, lb]) => `<button data-opset="${o.id}" data-st="${st}" class="${o.state === st ? "on" : ""}">${lb}</button>`).join("")}</div>`;
+    const roomName = id => (d.rooms.find(r => r.id === id) || {}).name || "";
+    const ago = iso => { if (!iso) return ""; const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
+      return m < 1 ? "just now" : m < 90 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+    const place = this._opPlace
+      ? `<p class="rc-sub" style="color:#ffd166;margin:6px 0">${this._opPlace.move ? "Tap the new spot for it" : `Tap the map where the ${this._opPlace.kind} is`} · <a data-opcancel="1" style="cursor:pointer;text-decoration:underline">cancel</a></p>` : "";
+    const detail = sel ? `<div class="rc-sect"><h4>${sel.kind === "register" ? "Register" : "Door"}</h4>
+        <div class="rc-row"><input data-opname="${sel.id}" value="${sel.name.replace(/"/g, "&quot;")}" maxlength="40" style="flex:1 1 140px;min-height:40px;border-radius:8px;border:1px solid var(--divider-color,#ffffff30);background:transparent;color:inherit;padding:0 10px;font:inherit"/>
+          <select data-oproomsel="${sel.id}" style="min-height:40px;border-radius:8px;border:1px solid var(--divider-color,#ffffff30);background:transparent;color:inherit;padding:0 8px;font:inherit">
+            <option value="">no room</option>${rooms.map(r => `<option value="${r.id}" ${sel.room === r.id ? "selected" : ""}>${r.name}</option>`).join("")}</select></div>
+        ${chips(sel)}<p class="rc-sub" style="margin:4px 0">changed ${ago(sel.changed)}</p>
+        <div class="rc-chips"><button data-opmove="${sel.id}">Move</button><button data-opdel="${sel.id}">Delete</button></div></div>` : "";
+    const list = items.length ? items.slice().sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name)).map(o =>
+      `<div class="rc-sect"><div class="rc-row" style="margin:4px 0"><b style="cursor:pointer" data-opsel="${o.id}">${o.kind === "register" ? "▦" : "◔"} ${o.name}</b>
+        <small class="rc-sub" style="margin:0">${roomName(o.room)}</small></div>${chips(o)}</div>`).join("")
+      : `<p class="rc-sub">No registers or doors on this floor yet. Add one, then tap the map where it is.</p>`;
+    const tabs = floors.length > 1 ? `<div class="rc-seg">${floors.map(f => `<button data-opfloor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
+    this._wrap.innerHTML = `${tabs}<div class="rc-main"><div class="rc-map"><svg viewBox="${vb.join(" ")}" data-opmap="1" style="border-radius:10px;${this._opPlace ? "cursor:crosshair" : ""}">
+        <rect x="${vb[0]}" y="${vb[1]}" width="${vb[2]}" height="${vb[3]}" fill="#0a111d" data-opbg="1"/>${roomSvg}${items.map(marker).join("")}</svg></div>
+      <div class="rc-panel"><div class="rc-chips" style="margin-bottom:6px"><button data-opadd="register">+ Register</button><button data-opadd="door">+ Door</button></div>
+        ${place}${detail}<div class="rc-sect"><h4>${this._floorName(this._floor)} · ${items.length} openings</h4>${list}</div></div></div>`;
+  }
+
+  async _opSave(item) {
+    try { this._data = await this._hass.callWS({ type: "room_climate/opening_save", item }); this._render(); } catch (e) { this._fail("opening_save", e); }
+  }
+  _opChange(e) {
+    if (this._config.page !== "openings" || !this._data) return;
+    const t = e.target, id = t.dataset.opname || t.dataset.oproomsel;
+    const o = (this._data.openings || []).find(x => x.id === id);
+    if (!o) return;
+    const { changed, ...rest } = o;
+    if (t.dataset.opname) { const nm = t.value.trim(); if (nm) this._opSave({ ...rest, name: nm }); }
+    else this._opSave({ ...rest, room: t.value || null });
+  }
+  _opClick(e) {
+    const d = this._data; if (!d) return;
+    const t = e.target.closest("[data-opfloor],[data-opsel],[data-opset],[data-opadd],[data-opmove],[data-opdel],[data-opcancel]");
+    const items = d.openings || [];
+    if (this._opPlace && (!t || !t.dataset.opcancel) && e.target.closest("svg[data-opmap]")) {  // a tap on the map places it
+      const svg = this._wrap.querySelector("svg[data-opmap]"), pt = svg.createSVGPoint();
+      pt.x = e.clientX; pt.y = e.clientY;
+      const p = pt.matrixTransform(svg.getScreenCTM().inverse()), x = +p.x.toFixed(1), y = +p.y.toFixed(1);
+      const rm = d.rooms.find(r => (r.floor || 1) === this._floor && r.shape && x >= r.shape.x && x <= r.shape.x + r.shape.w && y >= r.shape.y && y <= r.shape.y + r.shape.h);
+      const pl = this._opPlace; this._opPlace = null;
+      if (pl.move) { const o = items.find(i => i.id === pl.move); if (o) { const { changed, ...rest } = o; this._opSave({ ...rest, x, y, floor: this._floor, room: rm ? rm.id : rest.room }); } }
+      else {
+        const n = items.filter(i => i.kind === pl.kind).length + 1, id = `${pl.kind.slice(0, 3)}-${Date.now().toString(36)}`;
+        this._opSel = id;
+        this._opSave({ id, kind: pl.kind, name: `${pl.kind === "register" ? "Register" : "Door"} ${n}${rm ? " · " + rm.name : ""}`.slice(0, 40), floor: this._floor, x, y, room: rm ? rm.id : null, state: "open" });
+      }
+      return;
+    }
+    if (!t) return;
+    const ds = t.dataset;
+    if (ds.opfloor) { this._floor = +ds.opfloor; this._opSel = null; this._opPlace = null; this._render(); }
+    else if (ds.opcancel) { this._opPlace = null; this._render(); }
+    else if (ds.opadd) { this._opPlace = { kind: ds.opadd }; this._render(); }
+    else if (ds.opmove) { this._opPlace = { move: ds.opmove }; this._render(); }
+    else if (ds.opdel) {
+      const o = items.find(i => i.id === ds.opdel);
+      if (o && confirm(`Delete "${o.name}"?`)) { this._opSel = null; this._hass.callWS({ type: "room_climate/opening_delete", id: o.id }).then(r => { this._data = r; this._render(); }).catch(err => this._fail("opening_delete", err)); }
+    }
+    else if (ds.opset) { const o = items.find(i => i.id === ds.opset); if (o) { const { changed, ...rest } = o; this._opSave({ ...rest, state: ds.st }); } }
+    else if (ds.opsel) { this._opSel = ds.opsel; this._opPlace = null; this._render(); }
   }
 
   // Bounding box of a floor's room shapes plus margin (extra on top for the north arrow).

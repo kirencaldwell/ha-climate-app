@@ -46,6 +46,11 @@ OURS = (ROOM_CLIMATE, MODEL)
 SIGNAL_CONTROL = f"{DOMAIN}_control"  # dispatched (unit id) when a unit's control changes
 RECONNECT_GRACE_S = 300  # a unit that just came back (reboot, firmware install, wifi) reports its own mode and setpoint
 #                          for a while: that is not someone using the thermostat, and the next ticks re-send ours
+# Registers and doors the owner sets by hand (the card's Openings page): state name -> how open it is (0..1), logged each
+# minute-row as `op` so the model can use it. A door "cracked" is a few inches; "open" ~ 90 degrees; "wide" against the wall.
+OPENING_LEVELS = {"register": {"closed": 0.0, "partial": 0.5, "open": 1.0},
+                  "door": {"closed": 0.0, "cracked": 0.15, "open": 0.6, "wide": 1.0}}
+OP_HEARTBEAT_MIN = 60  # log the openings at least this often even if nothing changed (a day file stands on its own)
 OURS_GRACE_S = 30  # unit state changes this soon after we sent it something are its echo of our command
 BAD_STATES = ("unknown", "unavailable")
 MODEL_FILE = "room_climate_model.json"  # the fitted thermal model (model.py), refitted nightly
@@ -106,6 +111,8 @@ class Manager:
         self._coast: dict = {}  # unit id -> {"until", "room"}: its rooms coasting on the run that just ended
         self.drives: dict[str, core.DriveState] = {}  # unit id -> its outer loop (core.drive)
         self.zone_hist: dict[str, deque] = {}  # unit id -> [(time, its rooms' weighted reading)] for the loop's rate
+        self._op_logged: dict = {}
+        self._op_logged_at = None
         self._back_at: dict[str, datetime] = {}  # unit id -> when it last came back from unavailable
         self._sent_at: dict[str, datetime] = {}  # unit id -> when we last called a service on it
         self._ours: list[str] = []  # context ids of our recent service calls
@@ -136,6 +143,14 @@ class Manager:
         loaded.pop("enabled", None)  # the old dry-run switch; control is now per unit
         for ud in loaded.get("units", []):
             ud.setdefault("control", THERMOSTAT)
+        loaded.setdefault("openings", [])
+        if not loaded["openings"] and not loaded.get("openings_seeded"):  # first time: the registers and doors found in floorplan.jpg
+            seed = pathlib.Path(__file__).parent / "default_openings.json"
+            try:
+                loaded["openings"] = (await self.hass.async_add_executor_job(lambda: json.loads(seed.read_text())))["openings"]
+            except (OSError, ValueError, KeyError) as e:
+                _LOGGER.warning("couldn't read the default openings: %s", e)
+            loaded["openings_seeded"] = True
         self.data = loaded
         await self._load_model()
 
@@ -964,6 +979,12 @@ class Manager:
             if st is not None and st.state not in BAD_STATES:
                 row["extra"][eid] = num(st.state) if num(st.state) is not None else st.state
         row["mpc"] = self.shadow.log_fields()  # what the model-based controller would do
+        ops = {o["id"]: OPENING_LEVELS[o["kind"]][o["state"]] for o in self.data.get("openings", [])
+               if o.get("state") in OPENING_LEVELS[o["kind"]]}  # not the ones whose state hasn't been set yet
+        if ops and (ops != self._op_logged or self._op_logged_at is None
+                    or core.elapsed(now, self._op_logged_at) >= OP_HEARTBEAT_MIN * 60):
+            row["op"] = ops  # register / door positions (0 closed .. 1 fully open), on change and hourly
+            self._op_logged, self._op_logged_at = ops, now
         if getattr(self, "exp_block", None):
             b = self.exp_block
             row["exp"] = {"kind": b["kind"], "unit": b.get("unit"), "fan": b.get("fan"), "off": b.get("off") or []}
@@ -1259,6 +1280,44 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         connection.send_result(msg["id"], mgr.snapshot())
 
     @websocket_api.websocket_command({
+        "type": f"{DOMAIN}/opening_save",
+        vol.Required("item"): vol.Schema({
+            vol.Required("id"): vol.Match(r"^[a-z0-9_-]{1,40}$"),
+            vol.Required("kind"): vol.In(list(OPENING_LEVELS)),
+            vol.Required("name"): vol.All(str, vol.Length(min=1, max=40)),
+            vol.Required("floor"): int,
+            vol.Required("x"): vol.Coerce(float), vol.Required("y"): vol.Coerce(float),
+            vol.Optional("room"): vol.Any(None, str),
+            vol.Required("state"): str}),
+    })
+    @websocket_api.async_response
+    async def ws_opening_save(hass, connection, msg):
+        it = dict(msg["item"])
+        if it["state"] not in OPENING_LEVELS[it["kind"]]:
+            connection.send_error(msg["id"], "invalid", f"a {it['kind']} is one of: " + ", ".join(OPENING_LEVELS[it["kind"]]))
+            return
+        items = mgr.data.setdefault("openings", [])
+        old = next((o for o in items if o["id"] == it["id"]), None)
+        now = dt_util.now().isoformat()
+        it["changed"] = now if old is None or old.get("state") != it["state"] else old.get("changed", now)
+        if old is None:
+            items.append(it)
+        else:
+            old.clear()
+            old.update(it)
+        _LOGGER.info("opening %s (%s, floor %s) -> %s", it["name"], it["kind"], it["floor"], it["state"])
+        await mgr.async_save()
+        connection.send_result(msg["id"], mgr.snapshot())
+
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/opening_delete", vol.Required("id"): str})
+    @websocket_api.async_response
+    async def ws_opening_delete(hass, connection, msg):
+        items = mgr.data.get("openings", [])
+        mgr.data["openings"] = [o for o in items if o["id"] != msg["id"]]
+        await mgr.async_save()
+        connection.send_result(msg["id"], mgr.snapshot())
+
+    @websocket_api.websocket_command({
         "type": f"{DOMAIN}/log_client", vol.Required("message"): str,
         vol.Optional("stack", default=""): str, vol.Optional("ua", default=""): str, vol.Optional("where", default=""): str,
     })
@@ -1346,7 +1405,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         hass.async_create_task(mgr.async_fit())
         connection.send_result(msg["id"], {"started": True})
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_fit_model, ws_reload_ml,
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_opening_save, ws_opening_delete, ws_fit_model, ws_reload_ml,
                ws_experiment_start, ws_experiment_stop):
         websocket_api.async_register_command(hass, fn)
 

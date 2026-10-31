@@ -1,0 +1,105 @@
+{
+ "_comment": "Registers (red) and doors (blue) found in floorplan.jpg by colour on 2026-10-31; positions in image pixels like the room shapes. state 'unset' until the owner sets it on the Openings page.",
+ "openings": [
+  {
+   "id": "reg-bedroom-1-register",
+   "kind": "register",
+   "name": "Bedroom 1 register",
+   "floor": 2,
+   "x": 476.0,
+   "y": 252.9,
+   "room": "bedroom_1",
+   "state": "unset"
+  },
+  {
+   "id": "reg-bath-2-register",
+   "kind": "register",
+   "name": "Bath 2 register",
+   "floor": 2,
+   "x": 724.5,
+   "y": 281.1,
+   "room": "bath_2",
+   "state": "unset"
+  },
+  {
+   "id": "reg-kitchen-register-1",
+   "kind": "register",
+   "name": "Kitchen register 1",
+   "floor": 2,
+   "x": 788.2,
+   "y": 317.8,
+   "room": "kitchen",
+   "state": "unset"
+  },
+  {
+   "id": "reg-kitchen-register-2",
+   "kind": "register",
+   "name": "Kitchen register 2",
+   "floor": 2,
+   "x": 788.0,
+   "y": 462.9,
+   "room": "kitchen",
+   "state": "unset"
+  },
+  {
+   "id": "reg-bedroom-2-register",
+   "kind": "register",
+   "name": "Bedroom 2 register",
+   "floor": 2,
+   "x": 477.5,
+   "y": 437.0,
+   "room": "bedroom_2",
+   "state": "unset"
+  },
+  {
+   "id": "reg-living-room-register",
+   "kind": "register",
+   "name": "Living room register",
+   "floor": 2,
+   "x": 554.6,
+   "y": 727.5,
+   "room": "living_room",
+   "state": "unset"
+  },
+  {
+   "id": "reg-dining-area-register",
+   "kind": "register",
+   "name": "Dining area register",
+   "floor": 2,
+   "x": 757.0,
+   "y": 726.0,
+   "room": "dining_area",
+   "state": "unset"
+  },
+  {
+   "id": "doo-bedroom-1-door",
+   "kind": "door",
+   "name": "Bedroom 1 door",
+   "floor": 2,
+   "x": 632.0,
+   "y": 321.0,
+   "room": "bedroom_1",
+   "state": "unset"
+  },
+  {
+   "id": "doo-bedroom-2-door",
+   "kind": "door",
+   "name": "Bedroom 2 door",
+   "floor": 2,
+   "x": 631.0,
+   "y": 404.3,
+   "room": "bedroom_2",
+   "state": "unset"
+  },
+  {
+   "id": "doo-hall-door-(north)",
+   "kind": "door",
+   "name": "Hall door (north)",
+   "floor": 2,
+   "x": 654.8,
+   "y": 296.9,
+   "room": null,
+   "state": "unset"
+  }
+ ]
+}

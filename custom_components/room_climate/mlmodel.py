@@ -89,6 +89,11 @@ class Inputs:
             t = t + 1 if any(ran.values()) else 0
             self.t_on.append(t)
         self.exp = [bool(r.get("exp")) for r in rows]
+        op, cur = [], {}
+        for r in rows:  # register / door positions (0..1) as they were each minute, carried forward from the last logged
+            cur = r.get("op") or cur
+            op.append(cur)
+        self.op = op
         self.utemp = [{u: x.get("temp") for u, x in (r.get("units") or {}).items()} for r in rows]  # unit inlet sensors
 
 
