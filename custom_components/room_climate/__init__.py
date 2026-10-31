@@ -1359,7 +1359,9 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     @websocket_api.async_response
     async def ws_opening_save(hass, connection, msg):
         it = dict(msg["item"])
-        if it["state"] not in OPENING_LEVELS[it["kind"]]:
+        prev = next((o for o in mgr.data.get("openings", []) if o["id"] == it["id"]), None)
+        keep_unset = it["state"] == "unset" and (prev is None or prev.get("state") == "unset")  # renaming / moving one not yet set
+        if it["state"] not in OPENING_LEVELS[it["kind"]] and not keep_unset:
             connection.send_error(msg["id"], "invalid", f"a {it['kind']} is one of: " + ", ".join(OPENING_LEVELS[it["kind"]]))
             return
         items = mgr.data.setdefault("openings", [])
