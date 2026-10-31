@@ -23,21 +23,22 @@ except ImportError:  # offline
 HORIZONS = (30, 60, 120)
 STEP_MIN = 2  # replay step
 FEATURES = ["ode", "dT_out", "out_h", "trend10", "trend30", "nbr1", "nbr2", "own_y", "oth_y", "comp_frac", "t_on0",
-            "heat_frac", "sun_mean", "sun0", "hsin", "hcos", "inlet_gap", "inlet_d10"]
+            "heat_frac", "sun_mean", "sun0", "hsin", "hcos", "inlet_gap", "inlet_d10", "reg_mult", "door_lvl"]
 NF = len(FEATURES)
 NF_V1 = 16  # models saved before the inlet features have no `nf`: they were trained on the first 16
+PAD = {"reg_mult": 1.0, "door_lvl": 0.6}  # rows logged before a feature existed: every register open, a door about as open as usual
 
 
 def pad(rows: list) -> list:
     """Rows logged before a feature existed get 0 for it (rows are [time, room, horizon, change, features])."""
     for r in rows:
         if len(r[4]) < NF:
-            r[4] = list(r[4]) + [0.0] * (NF - len(r[4]))
+            r[4] = list(r[4]) + [PAD.get(FEATURES[j], 0.0) for j in range(len(r[4]), NF)]
     return rows
 
 
 def make_features(ode, T0, out0, out_mean, T10, T30, nb1, nb2, own_y, oth_y, comp_frac, t_on0_min, heat_frac, sun_mean,
-                  sun0, hour, inlet_gap=0.0, inlet_d10=0.0) -> list:
+                  sun0, hour, inlet_gap=0.0, inlet_d10=0.0, reg_mult=1.0, door_lvl=0.6) -> list:
     """The feature vector (FEATURES order), shared by the offline benchmark and the live logger so they can't drift:
     ode: the physics model's predicted change over the horizon; dT_out: room minus outdoor now; out_h: mean outdoor over
     the horizon minus the room; trend10/30: the room's change over the last 10/30 min; nbr1/2: its two strongest-coupled
@@ -45,9 +46,10 @@ def make_features(ode, T0, out0, out_mean, T10, T30, nb1, nb2, own_y, oth_y, com
     horizon; comp_frac: share of the horizon the compressor ran; t_on0: hours it had already run (cap 1.5); heat_frac:
     share of it in heat mode; sun_mean/sun0: overhead sun index over the horizon / now; hsin/hcos: time of day;
     inlet_gap: the room's own unit's inlet sensor minus the room (0 while the unit is fed the room sensor, which it then
-    echoes); inlet_d10: that inlet's change over the last 10 min."""
+    echoes); inlet_d10: that inlet's change over the last 10 min; reg_mult: the multiplier the room's registers put on its unit's
+    effect (1 with every register open; openings.register_multipliers); door_lvl: how open its door is, 0..1."""
     return [ode, T0 - out0, out_mean - T0, T0 - T10, T0 - T30, nb1, nb2, own_y, oth_y, comp_frac, min(t_on0_min, 90) / 60,
-            heat_frac, sun_mean, sun0, math.sin(2 * math.pi * hour / 24), math.cos(2 * math.pi * hour / 24), inlet_gap, inlet_d10]
+            heat_frac, sun_mean, sun0, math.sin(2 * math.pi * hour / 24), math.cos(2 * math.pi * hour / 24), inlet_gap, inlet_d10, reg_mult, door_lvl]
 
 
 class Inputs:

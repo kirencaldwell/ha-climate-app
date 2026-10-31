@@ -890,6 +890,7 @@ class Manager:
                 return hm.sun_from_irradiance(hm.sun_elevation(t, lat, lon), hm.sun_azimuth(t, lat, lon), *irr)
             return hm.sun_at(t, lat, lon, cloud_ahead(t))
 
+        self.shadow.set_openings(self.data.get("openings", []), {r.id: r.unit for r in rooms})
         self.shadow.set_correct(settings.observer_on)
         self.shadow.observe(now, temps, actual, outdoor, sun_at(now))
         if self.shadow.due(now) and not self._shadow_busy:
@@ -1276,8 +1277,15 @@ class Manager:
         except Exception:  # noqa: BLE001 - a display extra must never break the snapshot
             out["unit_diag"] = {}
         try:  # suggested register / door positions (openings.py)
-            out["openings_rec"] = openings.recommend(self.data.get("openings", []), self.data["rooms"], out["live"],
-                                                     (self.house_info or {}).get("mode") or self.house.mode, settings)
+            rec = openings.recommend(self.data.get("openings", []), self.data["rooms"], out["live"],
+                                     (self.house_info or {}).get("mode") or self.house.mode, settings)
+            adv, at = self.shadow.opening_advice, self.shadow.opening_advice_at
+            if adv and at is not None and core.elapsed(now, at) < 1800:  # the model's view of the registers replaces the rule's
+                cur = {o["id"]: o.get("state") for o in self.data.get("openings", [])}
+                for oid, a in adv.items():
+                    if cur.get(oid) in openings.REGISTER_GAIN or cur.get(oid) == "unset":
+                        rec[oid] = {**a, "match": cur.get(oid) == a["rec"]}
+            out["openings_rec"] = rec
         except Exception:  # noqa: BLE001
             out["openings_rec"] = {}
         return out
