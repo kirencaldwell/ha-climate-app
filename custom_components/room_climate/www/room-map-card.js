@@ -167,6 +167,7 @@ class RoomMapCard extends HTMLElement {
       this._failed = null;
       if (!this._modal && !this._opEditing) this._render();  // don't rebuild the page under an open editor (or a field being typed in)
       else if (this._diag) this._diagUpdate();  // diagnostics stay live
+      else if (this._unitOpen) this._unitUpdate();
     } catch (e) { this._fail("refresh", e); }
     finally { this._loading = false; }
   }
@@ -223,6 +224,8 @@ class RoomMapCard extends HTMLElement {
 
   _click(e) {
     if (this._config.page === "openings") { this._opClick(e); return; }
+    const ut = e.target.closest("[data-unit]");
+    if (ut && this._admin) { this._openUnit(ut.dataset.unit); return; }
     const t = e.target.closest("[data-act],[data-room],[data-floor]");
     if (!t || !this._data) return;
     if (["diag", "model", "ctl", "exp-start", "exp-stop"].includes(t.dataset.act) && !this._admin) return;  // admin view only
@@ -304,6 +307,13 @@ class RoomMapCard extends HTMLElement {
         <text x="${cx}" y="${cy + (small ? 3.5 : 5.5) * k}" text-anchor="middle" font-size="${(small ? 4 : 6) * k}" font-weight="600" fill="${col}">${txt}</text>
         ${small ? "" : `<text x="${cx}" y="${cy + 10 * k}" text-anchor="middle" font-size="${2.6 * k}" fill="${ink}" fill-opacity=".55">${ctl ? "TARGET " + live.target + "°" : "MONITOR ONLY"}</text>`}</g>`;
     }).join("");
+    const unitMarks = !this._admin ? "" : (d.unit_markers || []).filter(m => m.floor === this._floor).map(m => {
+      const ud = (d.units || []).find(x => x.id === m.unit) || {}, live = (d.units_live || {})[m.unit] || {};
+      const c = live.mode === "heat" ? palette.hot : live.mode === "cool" ? palette.cold : "#3de0a5", w = Math.max(m.w, 12), h = Math.max(m.h, 12);
+      return `<g data-unit="${m.unit}" style="cursor:pointer"><circle cx="${m.x}" cy="${m.y}" r="${Math.max(w, h) * 0.9}" fill="#000" fill-opacity="0.001"/>
+        <rect x="${m.x - w * 0.7}" y="${m.y - h * 0.7}" width="${w * 1.4}" height="${h * 1.4}" rx="${2 * k}" fill="${c}" fill-opacity=".22" stroke="${c}" stroke-width="${1.1 * k}"/>
+        <path d="M${m.x - w * 0.4} ${m.y - h * 0.15}H${m.x + w * 0.4}M${m.x - w * 0.4} ${m.y + h * 0.12}H${m.x + w * 0.4}M${m.x - w * 0.4} ${m.y + h * 0.4}H${m.x + w * 0.4}" stroke="${c}" stroke-width="${.8 * k}"/>
+        <title>${ud.name || m.unit}</title></g>`; }).join("");
     const rot = { up: 0, right: 90, down: 180, left: 270 }[this._config.north];
     const compass = rot == null ? "" : `<g transform="translate(${vb[0] + vb[2] - 8 * k} ${vb[1] + 8 * k}) rotate(${rot})" fill="${ink}" opacity=".7">
         <path d="M0 -6 L2.5 2 L0 0.5 L-2.5 2 Z" transform="scale(${k})"/>
@@ -311,7 +321,7 @@ class RoomMapCard extends HTMLElement {
     const tabs = floors.length > 1 ? `<div class="rc-seg">${floors.map(f =>
       `<button data-floor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
     this._wrap.innerHTML = `${tabs}<div class="rc-main">
-      <div class="rc-map"><svg viewBox="${vb.join(" ")}" style="${tech ? "border-radius:10px" : ""}">${bg}${shapes}${compass}</svg></div>
+      <div class="rc-map"><svg viewBox="${vb.join(" ")}" style="${tech ? "border-radius:10px" : ""}">${bg}${shapes}${unitMarks}${compass}</svg></div>
       <div class="rc-panel"></div></div>`;
     this._panel();
   }
@@ -651,6 +661,59 @@ class RoomMapCard extends HTMLElement {
     document.addEventListener("keydown", this._onKey);
     this._diagUpdate();
   }
+  // A minisplit's panel (admin): what it is doing, its own sensors and telemetry, who is driving it.
+  _openUnit(uid) {
+    this._closeSchedule();
+    const m = this._modal = document.createElement("div");
+    m.className = "rc-modal";
+    const ud = (this._data.units || []).find(x => x.id === uid) || {};
+    m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="${ud.name || uid}">
+      <header><h3>${ud.name || uid}</h3><button data-x="close" aria-label="Close">✕</button></header>
+      <div class="rc-body" data-slot="unit"></div><footer><button data-x="close" class="on">Close</button></footer></div>`;
+    document.body.append(m);
+    this._unitOpen = uid;
+    m.addEventListener("click", e => {
+      const c = e.target.closest('[data-act="ctl"]');
+      if (c) { this._setControl(c.dataset.u, c.dataset.c).then(() => this._unitUpdate()); return; }
+      if (e.target.closest("[data-x]") || e.target.classList.contains("rc-modal")) { this._unitOpen = null; this._closeSchedule(); this._render(); }
+    });
+    this._unitUpdate();
+  }
+  _unitUpdate() {
+    const el = this._modal && this._modal.querySelector('[data-slot="unit"]'); if (!el || !this._unitOpen) return;
+    const d = this._data, uid = this._unitOpen, ud = (d.units || []).find(x => x.id === uid) || {}, ul = (d.units_live || {})[uid] || {};
+    const g = ((d.unit_diag || {})[uid]) || {}, sn = g.sensors || {};
+    const f1 = v => v == null || v === "" ? "—" : isNaN(+v) ? v : (+v).toFixed(1).replace(/\.0$/, "");
+    const val = k => sn[k] ? `${sn[k].state}${sn[k].unit && !isNaN(+sn[k].state) ? " " + sn[k].unit : ""}` : "—";
+    const rooms = (d.rooms || []).filter(r => r.unit === uid);
+    const serves = rooms.map(r => { const l = (d.live || {})[r.id] || {}; return `${r.name} ${l.temp == null ? "—" : l.temp.toFixed(1) + "°"} (→ ${l.target ?? "—"}°)`; }).join(" · ") || "—";
+    const room0 = rooms.length ? ((d.live || {})[rooms[0].id] || {}).temp : null;
+    const gap = g.unit_temp != null && room0 != null ? g.unit_temp - room0 : null;
+    const ctlMap = { room_climate: ["Room Climate", "rc"], model: ["Model (joint planner)", "md"], thermostat: ["Its own thermostat", ""] };
+    const [ctlName, ctlCls] = ctlMap[ul.control] || [ul.control || "—", ""];
+    const err = sn.error_code ? sn.error_code.state : null, errBad = err && !/no error/i.test(err);
+    const feed = sn.use_remote_temperature ? sn.use_remote_temperature.state : null;
+    const row = (k, v, cls) => `<tr><td>${k}</td><td class="${cls || ""}"><b>${v}</b></td></tr>`;
+    const hand = ["room_climate", "model", "thermostat"].map(c => `<button data-act="ctl" data-u="${uid}" data-c="${c}" class="${ul.control === c ? "on" : ""}" style="min-height:40px">${(ctlMap[c] || [c])[0].replace(" (joint planner)", "")}</button>`).join("");
+    el.innerHTML = `<div class="rc-chips" style="margin-bottom:8px">${hand}</div>
+      <table class="rc-tbl" style="font-size:.95em">
+      ${row("Controlled by", `<span class="rc-ctl ${ctlCls}">${ctlName}</span>`)}
+      ${row("Mode / action", `${g.hvac ?? "—"} · ${g.action ?? "idle"}`)}
+      ${row("Setpoint", `${f1(g.setpoint)}°${g.wants && g.wants.setpoint != null && Math.abs((g.wants.setpoint) - g.setpoint) > .6 ? ` · wanted ${f1(g.wants.setpoint)}°` : ""}`)}
+      ${row("Fan / vane", `${g.fan ?? "—"} · ${sn.vertical_vane ? sn.vertical_vane.state : g.swing ?? "—"}`)}
+      ${row("Its own sensor", feed === "on" ? `${f1(g.unit_temp)}° <small>(echoes the room sensor: it is fed the H5100)</small>` : `${f1(g.unit_temp)}° ${gap == null ? "" : `<small>(${gap > 0 ? "+" : ""}${gap.toFixed(1)}° vs the room)</small>`}`)}
+      ${row("Serves", serves)}
+      ${row("Room sensor fed to the unit", feed == null ? "—" : feed === "on" ? "yes (remote temperature)" : "no: it uses its own inlet sensor")}
+      ${row("Compressor", val("compressor_frequency"))}
+      ${row("Input power", val("input_power"))}
+      ${row("Stage / sub-mode", `${val("stage")} · ${val("sub_mode")}`)}
+      ${row("Outdoor unit air", val("outdoor_unit_air_temperature"))}
+      ${row("Error code", err == null ? "—" : err, errBad ? "bad" : "ok")}
+      ${row("Wi-Fi signal", val("signal_db"))}
+      ${g.wants && g.wants.reason ? row("Room Climate says", `<small>${String(g.wants.reason).replace(/[<&]/g, "")}</small>`) : ""}</table>
+      <p class="rc-sub" style="margin-top:10px">Telemetry comes from the unit's ESPHome device. Updates every 15 s.</p>`;
+  }
+
   _diagUpdate() {
     const el = this._modal && this._modal.querySelector('[data-slot="diag"]');
     if (el) el.innerHTML = this._diagHtml();

@@ -150,12 +150,22 @@ class Manager:
             if clean != o.get("id"):
                 _LOGGER.info("opening id %s -> %s", o.get("id"), clean)
                 o["id"] = clean
-        if not loaded["openings"] and not loaded.get("openings_seeded"):  # first time: the registers and doors found in floorplan.jpg
-            seed = pathlib.Path(__file__).parent / "default_openings.json"
-            try:
-                loaded["openings"] = (await self.hass.async_add_executor_job(lambda: json.loads(seed.read_text())))["openings"]
-            except (OSError, ValueError, KeyError) as e:
-                _LOGGER.warning("couldn't read the default openings: %s", e)
+        # The registers, doors and minisplit markers found in floorplan.jpg: whatever the stored data doesn't have yet from
+        # a newer seed version is added once (a deleted item stays deleted: it is only added when its seed version is new).
+        seed_file = pathlib.Path(__file__).parent / "default_openings.json"
+        try:
+            seed = await self.hass.async_add_executor_job(lambda: json.loads(seed_file.read_text()))
+        except (OSError, ValueError) as e:
+            seed = None
+            _LOGGER.warning("couldn't read the default openings: %s", e)
+        have = loaded.get("openings_seed_version", 1 if loaded.get("openings_seeded") else 0)
+        if seed and seed.get("version", 1) > have:
+            ids = {o["id"] for o in loaded["openings"]}
+            for o in seed["openings"]:
+                if o.get("v", 1) > have and o["id"] not in ids:
+                    loaded["openings"].append({k: v for k, v in o.items() if k != "v"})
+            loaded["unit_markers"] = seed.get("units", [])
+            loaded["openings_seed_version"] = seed["version"]
             loaded["openings_seeded"] = True
         self.data = loaded
         await self._load_model()
@@ -1101,6 +1111,47 @@ class Manager:
             if ud is not None:
                 await self._set_vane(ud["entity"], pos)
 
+    # The ESPHome telemetry entities that share a unit's device, by the end of their entity id.
+    DIAG_KEYS = ("compressor_frequency", "input_power", "outdoor_unit_air_temperature", "stage", "sub_mode", "error_code",
+                 "signal_db", "vertical_vane", "use_remote_temperature", "remote_temperature")
+
+    def unit_diag(self) -> dict:
+        """Per unit: its own sensors (compressor, power, stage, outdoor air, error, wifi, vane, whether the room sensor is fed
+        to it) found through the entity registry, plus what Room Climate has it doing. For the admin card's unit panel."""
+        out = {}
+        reg = er.async_get(self.hass)
+        cache = getattr(self, "_diag_ents", None)
+        if cache is None:
+            cache = self._diag_ents = {}
+        for ud in self.data["units"]:
+            uid = ud["id"]
+            ents = cache.get(uid)
+            if not ents:
+                ent = reg.async_get(ud["entity"])
+                ents = {}
+                if ent is not None and ent.device_id:
+                    for e in er.async_entries_for_device(reg, ent.device_id):
+                        for k in self.DIAG_KEYS:  # longest key first would matter for remote_temperature: its switch ends differently
+                            if e.entity_id.endswith("_" + k) and not (k == "remote_temperature" and e.domain == "switch"):
+                                ents[k] = e.entity_id
+                            elif k == "use_remote_temperature" and e.entity_id.endswith("_use_remote_temperature"):
+                                ents[k] = e.entity_id
+                if ents:
+                    cache[uid] = ents
+            vals = {}
+            for k, eid in ents.items():
+                st = self.hass.states.get(eid)
+                if st is not None and st.state not in BAD_STATES:
+                    vals[k] = {"state": st.state, "unit": st.attributes.get("unit_of_measurement")}
+            cur = self.hass.states.get(ud["entity"])
+            a = cur.attributes if cur is not None else {}
+            last = self.last.get(uid)
+            out[uid] = {"sensors": vals, "hvac": None if cur is None else cur.state, "action": a.get("hvac_action"),
+                        "fan": a.get("fan_mode"), "swing": a.get("swing_mode"), "setpoint": a.get("temperature"),
+                        "unit_temp": self._unit_temp(ud["entity"]),
+                        "wants": None if last is None else {"mode": last.mode, "setpoint": last.setpoint, "fan": last.fan, "reason": last.reason}}
+        return out
+
     def _stored(self, setpoint_f: float) -> float:
         """`setpoint_f` as the unit will store and report it, in HA's temperature unit."""
         return round(TemperatureConverter.convert(core.stored_setpoint_c(setpoint_f), C,
@@ -1220,6 +1271,10 @@ class Manager:
                                             core.settings_from(self.data.get("settings")))
         except Exception:  # noqa: BLE001 - a display extra must never break the snapshot
             out["score"] = None
+        try:
+            out["unit_diag"] = self.unit_diag()
+        except Exception:  # noqa: BLE001 - a display extra must never break the snapshot
+            out["unit_diag"] = {}
         try:  # suggested register / door positions (openings.py)
             out["openings_rec"] = openings.recommend(self.data.get("openings", []), self.data["rooms"], out["live"],
                                                      (self.house_info or {}).get("mode") or self.house.mode, settings)

@@ -9,7 +9,8 @@
    "x": 476.0,
    "y": 252.9,
    "room": "bedroom_1",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "reg-bath-2-register",
@@ -19,7 +20,8 @@
    "x": 724.5,
    "y": 281.1,
    "room": "bath_2",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "reg-kitchen-register-1",
@@ -29,7 +31,8 @@
    "x": 788.2,
    "y": 317.8,
    "room": "kitchen",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "reg-kitchen-register-2",
@@ -39,7 +42,8 @@
    "x": 788.0,
    "y": 462.9,
    "room": "kitchen",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "reg-bedroom-2-register",
@@ -49,7 +53,8 @@
    "x": 477.5,
    "y": 437.0,
    "room": "bedroom_2",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "reg-living-room-register",
@@ -59,7 +64,8 @@
    "x": 554.6,
    "y": 727.5,
    "room": "living_room",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "reg-dining-area-register",
@@ -69,7 +75,8 @@
    "x": 757.0,
    "y": 726.0,
    "room": "dining_area",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "doo-bedroom-1-door",
@@ -79,7 +86,8 @@
    "x": 632.0,
    "y": 321.0,
    "room": "bedroom_1",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "doo-bedroom-2-door",
@@ -89,7 +97,8 @@
    "x": 631.0,
    "y": 404.3,
    "room": "bedroom_2",
-   "state": "unset"
+   "state": "unset",
+   "v": 1
   },
   {
    "id": "doo-hall-door-north",
@@ -99,7 +108,71 @@
    "x": 654.8,
    "y": 296.9,
    "room": null,
-   "state": "unset"
+   "state": "unset",
+   "v": 1
+  },
+  {
+   "id": "doo-bath-3-door",
+   "kind": "door",
+   "name": "Bath 3 door",
+   "floor": 3,
+   "x": 1157.1,
+   "y": 350.9,
+   "room": "bath_3",
+   "state": "unset",
+   "v": 2
+  },
+  {
+   "id": "doo-primary-bedroom-door",
+   "kind": "door",
+   "name": "Primary bedroom door",
+   "floor": 3,
+   "x": 1088.4,
+   "y": 351.0,
+   "room": "primary_bedroom",
+   "state": "unset",
+   "v": 2
+  },
+  {
+   "id": "doo-bedroom-3-door",
+   "kind": "door",
+   "name": "Bedroom 3 door",
+   "floor": 3,
+   "x": 1059.0,
+   "y": 382.5,
+   "room": "bedroom_3",
+   "state": "unset",
+   "v": 2
+  },
+  {
+   "id": "doo-attic-door",
+   "kind": "door",
+   "name": "Attic door",
+   "floor": 3,
+   "x": 1158.6,
+   "y": 545.8,
+   "room": null,
+   "state": "unset",
+   "v": 2
   }
- ]
+ ],
+ "units": [
+  {
+   "unit": "minisplit_1",
+   "floor": 3,
+   "x": 931.9,
+   "y": 309.5,
+   "w": 12,
+   "h": 36
+  },
+  {
+   "unit": "minisplit_2",
+   "floor": 3,
+   "x": 902.5,
+   "y": 524.2,
+   "w": 12,
+   "h": 36
+  }
+ ],
+ "version": 2
 }
