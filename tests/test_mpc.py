@@ -271,6 +271,28 @@ def test_readiness_can_skip_only_the_fit_check():
     assert not any("doesn't beat" in x for x in why2) and any("no fresh plan" in x for x in why2)  # every other check still counts
 
 
+def test_changing_what_a_unit_is_doing_now_costs_something():
+    import joint
+    truth, rooms, units, s = _house()
+    start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
+    w = coupled.Weather(start, 2, mean=50, seed=5)
+    temps = {r.id: 66.0 for r in rooms}
+    house = core.HouseState("heat", start - timedelta(hours=3))
+    running = {u.id: False for u in units}
+    ids = [u.id for u in units]
+    cur = {"air_handler": ["run:-@4"] * 6}
+    new = {"air_handler": ["off"] * 6}
+    def cost(prev, pattern):
+        pl = joint.JointPlanner()
+        pl.prev = prev
+        return pl.plan(truth, rooms, units, temps, start, house, running, w.outdoor, w.sun, s, fixed_pattern=pattern, fixed_mode="heat").cost
+    base = cost(None, new)
+    assert abs(cost((start, "heat", cur), new) - base - joint.JointSettings().hold_class_cost) < 1e-9  # run -> off: the dear change
+    assert abs(cost((start, "heat", cur), cur) - cost(None, cur)) < 1e-9  # keeping what it is doing costs nothing extra
+    detail = {"air_handler": ["run:-@2"] * 6}
+    assert abs(cost((start, "heat", cur), detail) - cost(None, detail) - joint.JointSettings().hold_detail_cost) < 1e-9  # a gap change: the cheap one
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

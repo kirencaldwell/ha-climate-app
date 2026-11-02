@@ -122,6 +122,20 @@ def test_vane_day_sweeps_the_vane_at_fan_auto_instead_of_the_fan():
     assert "vane" in ex.describe(ms1[0])
 
 
+def test_experiment_blocks_turn_the_idle_units_room_sensor_feed_off():
+    start = datetime.fromisoformat("2026-11-03T09:00:00-08:00")
+    p = ex.plan(start, 8, ["ms2", "ms1", "ah"], fan_units=("ms1", "ms2"), mode="heat", leaky=("ms2",), feed_off=True)
+    for b in p["blocks"]:
+        if b["kind"] == "solo":
+            assert b["unit"] not in b["feed_off"] and set(b["feed_off"]) == {"ms2", "ms1", "ah"} - {b["unit"]}  # the running unit keeps the room sensor
+        elif b["kind"] in ("float", "coast"):
+            assert set(b["feed_off"]) == {"ms2", "ms1", "ah"}
+        else:
+            assert b["feed_off"] == []  # the last hour: normal feeds
+    none = ex.plan(start, 8, ["ms2", "ms1", "ah"], mode="heat")
+    assert all(b["feed_off"] == [] for b in none["blocks"])
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

@@ -60,7 +60,7 @@ def order(unit_ids: list, leaky=()) -> list:
     return sorted(unit_ids, key=lambda u: u not in leaky)
 
 
-def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat", leaky=(), focus=None, vane_units=()) -> dict:
+def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str = "heat", leaky=(), focus=None, vane_units=(), feed_off=False) -> dict:
     """{"start", "end", "mode", "blocks": [{"start", "end", "kind", "unit", "fan", "off"}]} with ISO times. `off` lists the
     units held fully off during the block (the leak test: see the module doc)."""
     hours = max(MIN_H, min(MAX_H, hours))
@@ -76,11 +76,14 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
     vane_units = set(vane_units)
 
     def add(kind, minutes, unit=None, fan=None, off=(), vane=None):
+        # feed_off: the units whose room-sensor feed is switched off for the block: the idle ones (the unit that is running keeps
+        # the room sensor as its feedback), so their own inlet sensors become readable (the leak's signature) without hurting control
         nonlocal t
         stop = min(restore, t + timedelta(minutes=minutes))
         if stop - t >= timedelta(minutes=15):
             blocks.append({"start": t.isoformat(), "end": stop.isoformat(), "kind": kind, "unit": unit, "fan": fan,
-                           "off": list(off), "vane": vane})
+                           "off": list(off), "vane": vane,
+                           "feed_off": [u for u in unit_ids if u != unit] if feed_off else []})
         t = stop
 
     add("float", FLOAT_MIN)
@@ -101,7 +104,7 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
             add("coast", coast)
         rnd += 1
         add("float", FLOAT_MIN // 2)
-    blocks.append({"start": restore.isoformat(), "end": end.isoformat(), "kind": "restore", "unit": None, "fan": None, "off": [], "vane": None})
+    blocks.append({"start": restore.isoformat(), "end": end.isoformat(), "kind": "restore", "unit": None, "fan": None, "off": [], "vane": None, "feed_off": []})
     return {"start": start.isoformat(), "end": end.isoformat(), "mode": mode, "blocks": blocks}
 
 

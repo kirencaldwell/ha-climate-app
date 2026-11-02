@@ -497,6 +497,8 @@ class Manager:
         if now >= datetime.fromisoformat(exp["end"]):
             if exp.get("vane0") and not exp.get("vane_back"):
                 await self._restore_vanes(exp)
+            if exp.get("feed0") and not exp.get("feed_back"):
+                await self._restore_feeds(exp)
             _LOGGER.info("experiment finished (%s to %s)", exp["start"], exp["end"])
             self.data.pop("experiment", None)
             self.drives.clear()
@@ -507,8 +509,14 @@ class Manager:
             if exp.get("vane0") and not exp.get("vane_back"):
                 await self._restore_vanes(exp)
                 exp["vane_back"] = True
+            if exp.get("feed0") and not exp.get("feed_back"):
+                await self._restore_feeds(exp)
+                exp["feed_back"] = True
             return None
         mode = exp["mode"]
+        for fu in (exp.get("feed0") or {}):  # the idle units' room-sensor feed off, the running unit's on
+            if b.get("feed_off"):
+                await self._set_feed(fu, fu not in b["feed_off"] and exp["feed0"][fu] is not None)
         if self.house.mode != mode:
             self.house = core.HouseState(mode, now)
         info["mode"], info["reason"] = mode, "experiment: " + experiment.describe(b, self._unit_names())
@@ -535,7 +543,9 @@ class Manager:
         self.data["experiment"] = experiment.plan(now, hours, ours, fan_units, mode,
                                                     experiment.leaky_units(m.rooms.values() if m else ()),
                                                     settings.experiment_focus,
-                                                    [x.strip() for x in settings.experiment_vane_units.split(",") if x.strip()])
+                                                    [x.strip() for x in settings.experiment_vane_units.split(",") if x.strip()],
+                                                    settings.experiment_feed_off)
+        self.data["experiment"]["feed0"] = {u["id"]: self._feed(u["id"]) for u in self.data["units"] if self._feed(u["id"]) is not None}
         self.data["experiment"]["vane0"] = {u["id"]: self._vane(u["entity"]) for u in self.data["units"]
                                             if self._vane(u["entity"]) is not None}  # to put the vanes back afterwards
         _LOGGER.info("experiment started: %s h in %s mode for %s", hours, mode, ", ".join(ours))
@@ -546,6 +556,8 @@ class Manager:
         exp = self.data.get("experiment")
         if exp and exp.get("vane0"):
             await self._restore_vanes(exp)
+        if exp and exp.get("feed0"):
+            await self._restore_feeds(exp)
         if self.data.pop("experiment", None) is not None:
             _LOGGER.info("experiment stopped from the card")
             self.drives.clear()
@@ -1156,6 +1168,29 @@ class Manager:
                         "unit_temp": self._unit_temp(ud["entity"]),
                         "wants": None if last is None else {"mode": last.mode, "setpoint": last.setpoint, "fan": last.fan, "reason": last.reason}}
         return out
+
+    def _feed_entity(self, uid: str):
+        ents = getattr(self, "_diag_ents", None)
+        if not ents or uid not in ents:
+            self.unit_diag()  # fills the per-unit entity cache
+            ents = getattr(self, "_diag_ents", None) or {}
+        return (ents.get(uid) or {}).get("use_remote_temperature")
+
+    def _feed(self, uid: str):
+        """Whether the unit is being fed the room sensor (its 'Use Remote Temperature' switch), None if it has no such switch."""
+        eid = self._feed_entity(uid)
+        st = self.hass.states.get(eid) if eid else None
+        return None if st is None or st.state in BAD_STATES else st.state == "on"
+
+    async def _set_feed(self, uid: str, on: bool):
+        eid = self._feed_entity(uid)
+        if eid and self._feed(uid) is not None and self._feed(uid) != on:
+            _LOGGER.info("SEND %s %s (experiment)", eid, "on" if on else "off")
+            await self.hass.services.async_call("switch", "turn_on" if on else "turn_off", {"entity_id": eid}, blocking=True)
+
+    async def _restore_feeds(self, exp: dict):
+        for uid, on in (exp.get("feed0") or {}).items():
+            await self._set_feed(uid, on)
 
     def _stored(self, setpoint_f: float) -> float:
         """`setpoint_f` as the unit will store and report it, in HA's temperature unit."""

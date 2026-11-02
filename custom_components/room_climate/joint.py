@@ -54,6 +54,11 @@ class JointSettings:
     unit_start_cost: float = 0.6  # per indoor-unit start (tuned in simulation: tools/mc_suite.py, 'tune')
     compressor_start_cost: float = 1.6  # per start of the shared compressor (every unit idle -> one running)
     change_cost: float = 0.02  # per block-to-block change of a unit's run/fan pattern
+    # What it costs to change what a unit is doing NOW (the first block against the last plan's command for this time): without it
+    # near-tied plans flip a unit's command at every replan (the air handler went from ~10 to 44-75 starts a day). Switching between
+    # run, off and sleep is dearer than changing the gap or fan of a unit that keeps running.
+    hold_class_cost: float = 0.4
+    hold_detail_cost: float = 0.08
     energy_cost: float = 0.02  # per hour of full output
     aim_weight: float = 0.1
     terminal_h: float = 0.5
@@ -130,6 +135,18 @@ class JointPlanner:
         opts = {u.id: self._options(m, u, fan_units) for u in known}
         label = {u.id: [("sleep" if f == "sleep" else "off" if not r else f"run:{f or '-'}@{g:g}") for r, f, g in opts[u.id]] for u in known}
         nb = len(blocks)
+        cmd_now = {}  # unit id -> option label the last plan has it doing at this time
+        if self.prev is not None:
+            t0_, _, pat_ = self.prev
+            sh_ = max(0, int(((now - t0_).total_seconds() / 60) // js.block_min[0]))
+            cmd_now = {uid: p_[min(sh_, len(p_) - 1)] for uid, p_ in pat_.items() if p_}
+
+        def hold(uid, lab):
+            prev = cmd_now.get(uid)
+            if prev is None or prev == lab:
+                return 0.0
+            cls = lambda x: "run" if x.startswith("run") else x
+            return js.hold_class_cost if cls(prev) != cls(lab) else js.hold_detail_cost
         zone = {u.id: [r for r in scored if r.unit == u.id] for u in known}
         evals = [0]
         cache = {}
@@ -196,6 +213,7 @@ class JointPlanner:
             for u in known:
                 p = pattern[u.id]
                 c += js.change_cost * sum(1 for x, y in zip(p, p[1:]) if x != y)
+                c += hold(u.id, label[u.id][p[0]])
             cache[key] = (c, traj, first_sp, first_fan)
             return cache[key]
 
