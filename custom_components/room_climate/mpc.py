@@ -584,7 +584,7 @@ class ShadowPlanner:
         self.plan, self.plan_at = p, now
         self.plan_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-    def readiness(self, now: datetime, rooms_needed, strict: bool = True, min_n: int = 36, skip_fit: bool = False):
+    def readiness(self, now: datetime, rooms_needed, strict: bool = True, min_n: int = 36, skip_fit: bool = False, skip_rooms=()):
         """(ready to control units?, reasons it isn't). Strict, for handing a unit over: a usable fit, a fresh plan,
         and for every room it scores, 60- and 120-min predictions (at least `min_n` each, about 6 h) beating "nothing
         changes" (to within READY_TOL_F). Not strict, for staying in control: 10% slack on top and fewer scores, so it doesn't
@@ -601,7 +601,7 @@ class ShadowPlanner:
             why.append("no fresh plan")
         acc = self.accuracy()
         slack, need = (1.0, min_n) if strict else (1.1, max(1, min_n // 3))
-        for rid in sorted(rooms_needed):
+        for rid in sorted(set(rooms_needed) - set(skip_rooms)):
             for h in ("60", "120"):
                 v = acc.get(rid, {}).get(h)
                 if not v or v["n"] < need:

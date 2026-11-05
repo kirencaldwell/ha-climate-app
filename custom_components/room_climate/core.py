@@ -81,6 +81,7 @@ class Settings:
     experiment_feed_off: bool = True  # in experiments, switch off the room-sensor feed of units that are idle (their own inlet sensor is then readable)
     experiment_vane_units: str = ""  # comma-separated unit ids whose solos sweep the vertical vane (at fan auto) instead of the fan
     experiment_focus: str = "air_handler"  # the unit an experiment spends the most time on (experiment.py): the weakest model
+    model_gate_skip_rooms: str = ""  # the owner's call (2026-11-05): rooms whose live 60/120-min score checks the readiness gate skips
     model_gate_skip_fit: bool = False  # the owner's call (2026-10-28 trial of the joint planner): hand units to the model although
     #                                    the latest fit doesn't beat 'nothing changes' on every room (the live per-room scores still count)
     model_planner: str = "optimizer"  # what units under "model" control follow: "optimizer" (setpoint targets + the outer loop) or

@@ -293,6 +293,24 @@ def test_changing_what_a_unit_is_doing_now_costs_something():
     assert abs(cost((start, "heat", cur), detail) - cost(None, detail) - joint.JointSettings().hold_detail_cost) < 1e-9  # a gap change: the cheap one
 
 
+def test_readiness_can_skip_named_rooms_live_score_checks_only():
+    truth, rooms, units, s = _house()
+    sh = mpc.ShadowPlanner()
+    sh.set_model(truth)
+    truth.meta = {"usable": True}
+    sh.error = None
+    sh.plan_at = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
+    now = sh.plan_at
+    bad = {"60": {"rmse": 1.0, "base_rmse": 0.3, "n": 100}, "120": {"rmse": 2.0, "base_rmse": 0.5, "n": 100}}
+    sh.accuracy = lambda: {"kitchen": bad, "bedroom_3": {"60": {"rmse": 0.2, "base_rmse": 0.5, "n": 100}, "120": {"rmse": 0.3, "base_rmse": 0.8, "n": 100}}}
+    ok, why = sh.readiness(now, ["kitchen", "bedroom_3"])
+    assert not ok and all(x.startswith("kitchen") for x in why)
+    ok2, why2 = sh.readiness(now, ["kitchen", "bedroom_3"], skip_rooms={"kitchen"})
+    assert ok2 and not why2
+    ok3, why3 = sh.readiness(now, ["kitchen", "bedroom_3"], skip_rooms={"bedroom_3"})
+    assert not ok3  # skipping a good room doesn't excuse the bad one
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
