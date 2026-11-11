@@ -311,6 +311,19 @@ def test_readiness_can_skip_named_rooms_live_score_checks_only():
     assert not ok3  # skipping a good room doesn't excuse the bad one
 
 
+def test_the_cycling_costs_come_from_the_settings():
+    truth, rooms, units, s = _house()
+    start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
+    w = coupled.Weather(start, 2, mean=50, seed=5)
+    temps = {r.id: 64.0 for r in rooms}
+    actual = {u.id: {"mode": "heat", "setpoint": 66.0, "running": False} for u in units}
+    sh = mpc.ShadowPlanner()
+    sh.set_model(truth)
+    sh.run(start, rooms, units, temps, actual, w.outdoor(start), w.sun, dataclasses.replace(s, joint_unit_start_cost=7.0, joint_hold_class_cost=3.0))
+    assert sh.joint.js.unit_start_cost == 7.0 and sh.joint.js.hold_class_cost == 3.0 and sh.jerror is None
+    assert core.Settings().joint_unit_start_cost == 1.5 and core.Settings().joint_compressor_start_cost == 4.0
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

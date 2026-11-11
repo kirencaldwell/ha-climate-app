@@ -453,6 +453,9 @@ class ShadowPlanner:
         """What the joint planner would do now, with its own house mode. Shadow: never sent anywhere. `live`
         (model_planner "joint"): it becomes the model's decision for the units under model control."""
         t0 = time.perf_counter()
+        js = self.joint.js  # the cycling costs are settings, so they can be tuned without a deploy
+        js.unit_start_cost, js.compressor_start_cost = settings.joint_unit_start_cost, settings.joint_compressor_start_cost
+        js.hold_class_cost, js.hold_detail_cost = settings.joint_hold_class_cost, settings.joint_hold_detail_cost
         running = {u: bool(a.get("running")) for u, a in actual.items()}
         p = self.joint.plan(self.model, rooms, units, temps, now, self.jhouse, running, outdoor, sun_at, settings,
                             ignore=set(ignore), fixed=fixed, lagged=dict(self.lagged),

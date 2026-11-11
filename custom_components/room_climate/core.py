@@ -81,6 +81,13 @@ class Settings:
     experiment_feed_off: bool = True  # in experiments, switch off the room-sensor feed of units that are idle (their own inlet sensor is then readable)
     experiment_vane_units: str = ""  # comma-separated unit ids whose solos sweep the vertical vane (at fan auto) instead of the fan
     experiment_focus: str = "air_handler"  # the unit an experiment spends the most time on (experiment.py): the weakest model
+    # What the joint planner charges for cycling (cost units of its comfort cost): per indoor-unit start, per start of the shared
+    # compressor, and for changing what a unit is doing now (run/off/sleep, then gap/fan). Raised 2.5x on 2026-11-10 (they were 0.6 /
+    # 1.6 / 0.4 / 0.08) after Bedroom 3 averaged 3-minute runs; the simulator: compressor starts -7% for +34% discomfort.
+    joint_unit_start_cost: float = 1.5
+    joint_compressor_start_cost: float = 4.0
+    joint_hold_class_cost: float = 1.0
+    joint_hold_detail_cost: float = 0.2
     model_gate_skip_rooms: str = ""  # the owner's call (2026-11-05): rooms whose live 60/120-min score checks the readiness gate skips
     model_gate_skip_fit: bool = False  # the owner's call (2026-10-28 trial of the joint planner): hand units to the model although
     #                                    the latest fit doesn't beat 'nothing changes' on every room (the live per-room scores still count)
