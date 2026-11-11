@@ -29,7 +29,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from . import core, datalog, experiment, fit, mlmodel, mpc, openings
+from . import core, datalog, experiment, fit, mlmodel, moisture, mpc, openings
 from . import model as hm
 
 DOMAIN = "room_climate"
@@ -61,6 +61,8 @@ ML_FILE = "room_climate_ml.json"  # the daily-trained ML correction (ridge, trai
 ML_EXTERNAL_FILE = "room_climate_ml_external.json"  # a better one trained elsewhere (the Mac: ridge + trees blend); wins if present
 ML_KEEP_DAYS = 14
 BACKTEST_FILE = "room_climate_model_backtest.json"  # the fitted model's predictions over the logged past (charts)
+MOISTURE_DAYS = 10  # the moisture fit reads this many days of the minute log
+MOISTURE_FILE = "room_climate_moisture.json"
 FIT_DAYS = 14  # fit on this many days of the minute log
 HISTORY_H = 72  # the Model page's charts reach back this far (5-minute samples, rebuilt from the minute log)
 
@@ -133,6 +135,7 @@ class Manager:
         self.fit_state: dict = {"running": False, "error": None, "started": None, "finished": None, "seconds": None}
         self.fit_history: list = []
         self.ml_state: dict = None  # the ML correction's last training / loading (mlmodel.py)
+        self.moisture_state: dict = None  # the moisture model's last fit (moisture.py)
         self.ml_external = False  # an externally trained correction (ML_EXTERNAL_FILE) is in use
 
     async def async_load(self):
@@ -273,6 +276,41 @@ class Manager:
                 self.ml_state = {"trained": None, "rows": n, "why": "not enough rows yet"}
         except Exception as e:  # noqa: BLE001 - a failed training keeps yesterday's correction
             _LOGGER.warning("ML correction training failed: %s: %s", type(e).__name__, e)
+
+    async def async_fit_moisture(self, _now=None):
+        """Fit the moisture model (moisture.py) on the last MOISTURE_DAYS of the minute log, in an executor job, and save it. The log
+        has relative humidity from v0.28.0 on, so this starts with "not enough data yet" and improves night by night."""
+        rooms = [r["id"] for r in self.data["rooms"] if r.get("sensor") and self._humidity(r) is not None]
+        units = [u["id"] for u in self.data["units"]]
+        logdir = self.hass.config.path("room_climate_data")
+        since = (dt_util.now() - timedelta(days=MOISTURE_DAYS)).strftime("%Y-%m-%d")
+        path = self.hass.config.path(MOISTURE_FILE)
+
+        def work():
+            rows = list(datalog.read_rows(logdir, since)) if os.path.isdir(logdir) else []
+            S = moisture.series(rows, rooms, units)
+            n = len(S["t"])
+            if n < 300:
+                return None, n, None
+            cut = int(n * 0.75)
+            head = {k: ({r: v[:cut] for r, v in x.items()} if isinstance(x, dict) else x[:cut]) for k, x in S.items()}
+            held = moisture.fit(head, rooms, units, ridge=0.1)
+            ev = moisture.evaluate(held, S, cut) if held is not None else {}
+            m = moisture.fit(S, rooms, units, ridge=0.1)
+            m.report = {"held_out": {str(h): {r: list(v) for r, v in d.items()} for h, d in ev.items()}, "steps": n}
+            with open(path + ".tmp", "w") as f:
+                json.dump(m.to_dict(), f)
+            os.replace(path + ".tmp", path)
+            return m, n, ev
+        try:
+            m, n, ev = await self.hass.async_add_executor_job(work)
+            if m is None:
+                self.moisture_state = {"fitted": None, "steps": n, "why": "not enough humidity log yet (needs about 2 days)"}
+            else:
+                self.moisture_state = {"fitted": m.fitted, "steps": n, "rooms": len(m.rooms), "held_out_rh_points": m.report["held_out"]}
+                _LOGGER.info("moisture model fitted on %s ten-minute steps for %s rooms", n, len(m.rooms))
+        except Exception as e:  # noqa: BLE001 - a failed fit keeps yesterday's file
+            _LOGGER.warning("moisture fit failed: %s: %s", type(e).__name__, e)
 
     async def async_load_history(self):
         """Rebuild the charts' 5-minute samples from the last HISTORY_H of the minute log (once, at startup)."""
@@ -950,7 +988,7 @@ class Manager:
                 "sunshine": None if self.irradiance_at(now) is None else
                 dict(zip(("ghi", "dni", "dhi"), (round(x) for x in self.irradiance_at(now)))),
                 "ready": {"ok": ok, "why": reasons},
-                "fit": self.fit_state, "fits": self.fit_history[-30:], "shadow": self.shadow.debug(now), "ml": self.ml_state,
+                "fit": self.fit_state, "fits": self.fit_history[-30:], "shadow": self.shadow.debug(now), "ml": self.ml_state, "moisture": self.moisture_state,
                 "targets": targets, "today": today, "house_today": self.house.mode,
                 "comfort": {k: getattr(s, k) for k in ("band_below", "band_above", "warm_weight", "aim_offset")}}
 
@@ -987,7 +1025,8 @@ class Manager:
                 continue
             val, _ = self._f(r.sensor)  # raw: None while the sensor is out (the controller bridges short gaps)
             c, h = info.get("rooms", {}).get(r.id, (None, None))
-            row["rooms"][r.id] = {"temp": num(val), "target": core.target_temp(r, now), "prio": core.room_priority(r, now),
+            rd = next((x for x in self.data["rooms"] if x["id"] == r.id), {})
+            row["rooms"][r.id] = {"temp": num(val), "rh": self._humidity(rd), "target": core.target_temp(r, now), "prio": core.room_priority(r, now),
                                   "pred": num(predicted.get(r.id)), "unit": r.unit, "cold": c, "hot": h}
         hs = core.house_error([r for r in rooms if r.sensor], {r.id: row["rooms"][r.id]["temp"] for r in rooms if r.id in row["rooms"]},
                               now, core.settings_from(self.data.get("settings")))
@@ -1193,6 +1232,19 @@ class Manager:
         for uid, on in (exp.get("feed0") or {}).items():
             await self._set_feed(uid, on)
 
+    def _humidity(self, room_dict: dict):
+        """A room's relative humidity (%), from its own humidity sensor if it has one, else the H5100-style sibling of its
+        temperature sensor (sensor.x_temperature -> sensor.x_humidity). None if there is none."""
+        ent = room_dict.get("humidity_sensor")
+        if not ent:
+            s = room_dict.get("sensor") or ""
+            ent = s[:-len("_temperature")] + "_humidity" if s.endswith("_temperature") else None
+        st = self.hass.states.get(ent) if ent else None
+        try:
+            return None if st is None or st.state in BAD_STATES else round(float(st.state), 1)
+        except ValueError:
+            return None
+
     def _stored(self, setpoint_f: float) -> float:
         """`setpoint_f` as the unit will store and report it, in HA's temperature unit."""
         return round(TemperatureConverter.convert(core.stored_setpoint_c(setpoint_f), C,
@@ -1303,7 +1355,9 @@ class Manager:
             val, _ = self._f(r.sensor) if r.sensor else (None, None)
             c = self.last.get(r.unit)
             w = core.room_priority(r, now)
-            out["live"][r.id] = {"temp": val, "target": core.target_temp(r, now), "priority": w,
+            rh = self._humidity(next((x for x in self.data["rooms"] if x["id"] == r.id), {}))
+            out["live"][r.id] = {"temp": val, "rh": rh, "dew": (None if rh is None or val is None else round(moisture.dew_point_f(val, rh) or 0, 1)),
+                                 "target": core.target_temp(r, now), "priority": w,
                                  "allowable": round(core.allowable_error(w, core.settings_from(self.data.get("settings")).allowable_ref_f), 2),
                                  "mode": c.mode if c else "off", "reason": c.reason if c else ""}
         try:  # the whole-house tracking error, and each room's share of it
@@ -1567,6 +1621,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     async_track_time_change(hass, mgr.async_fit, hour=3, minute=40, second=0)
     # Then the ML correction, once the physics fit (13 min) is done; its rows are flushed to disk hourly.
     async_track_time_change(hass, mgr.async_train_ml, hour=3, minute=58, second=0)
+    async_track_time_change(hass, mgr.async_fit_moisture, hour=4, minute=20, second=0)
     async_track_time_interval(hass, mgr.async_flush_ml, timedelta(hours=1))
     age = mgr.model_age_h()
     if age is None or age > 26:

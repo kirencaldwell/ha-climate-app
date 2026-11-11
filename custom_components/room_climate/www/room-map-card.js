@@ -305,7 +305,7 @@ class RoomMapCard extends HTMLElement {
         ${active ? `<circle cx="${s.x + s.w - 3 * k}" cy="${s.y + 3 * k}" r="${1.2 * k}" fill="${live.mode === "heat" ? palette.hot : palette.cold}"><animate attributeName="opacity" values="1;.2;1" dur="1.4s" repeatCount="indefinite"/></circle>` : ""}
         <text x="${cx}" y="${cy - (small ? 1 : 2) * k}" text-anchor="middle" font-size="${(small ? 2.6 : 3.2) * k}" fill="${ink}" fill-opacity=".75" letter-spacing="${.3 * k}">${r.name.toUpperCase()}</text>
         <text x="${cx}" y="${cy + (small ? 3.5 : 5.5) * k}" text-anchor="middle" font-size="${(small ? 4 : 6) * k}" font-weight="600" fill="${col}">${txt}</text>
-        ${small ? "" : `<text x="${cx}" y="${cy + 10 * k}" text-anchor="middle" font-size="${2.6 * k}" fill="${ink}" fill-opacity=".55">${ctl ? "TARGET " + live.target + "°" : "MONITOR ONLY"}</text>`}</g>`;
+        ${small ? "" : `<text x="${cx}" y="${cy + 10 * k}" text-anchor="middle" font-size="${2.6 * k}" fill="${ink}" fill-opacity=".55">${ctl ? "TARGET " + live.target + "°" : "MONITOR ONLY"}${live.rh != null ? " · " + Math.round(live.rh) + "% RH" : ""}</text>`}</g>`;
     }).join("");
     const unitMarks = !this._admin ? "" : (d.unit_markers || []).filter(m => m.floor === this._floor).map(m => {
       const ud = (d.units || []).find(x => x.id === m.unit) || {}, live = (d.units_live || {})[m.unit] || {};
@@ -500,7 +500,7 @@ class RoomMapCard extends HTMLElement {
     const ptoday = todayOf(room.priority_schedule, e => `w${fmtW(e.priority)}`);
     const pnow = live.priority ?? room.priority;
     el.innerHTML = `<h3>${room.name}</h3>
-      <p class="rc-sub">${reading} · target ${live.target}° · ${((this._data.units_live || {})[room.unit] || {}).control === "room_climate"
+      <p class="rc-sub">${reading}${live.rh != null ? ` · ${Math.round(live.rh)}% RH${live.dew != null ? ` (dew point ${Math.round(live.dew)}°)` : ""}` : ""} · target ${live.target}° · ${((this._data.units_live || {})[room.unit] || {}).control === "room_climate"
         ? `Room Climate in control · unit ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}`
         : `<span style="color:#ffd166">thermostat in control</span> · Room Climate would ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}`}</p>
       <div class="rc-row"><span class="rc-lbl">Default temp</span>${step("def", room.default_temp)}</div>
