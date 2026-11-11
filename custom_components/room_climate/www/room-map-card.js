@@ -530,11 +530,49 @@ class RoomMapCard extends HTMLElement {
     this._rhBusy = true;
     try {
       const d = await this._hass.callWS({ type: "room_climate/room_history", room_id: id, hours });
-      this._rh = { id, hours, at: Date.now(), points: d.points };
+      this._rh = { id, hours, at: Date.now(), points: d.points, hum: await this._humHist(id, hours) };
       const el = this._wrap && this._wrap.querySelector(".rc-hist");
       if (el && this._sel === id) el.outerHTML = this._roomChart(this._data.rooms.find(r => r.id === id));
     } catch (e) { this._rh = { id, hours, at: Date.now(), points: [] }; }
     finally { this._rhBusy = false; }
+  }
+
+  // The room's humidity sensor's history (HA's own recorder, so it reaches back before Room Climate logged humidity): [[ms, %], ...].
+  async _humHist(id, hours) {
+    const room = this._data.rooms.find(r => r.id === id) || {};
+    const s = room.sensor || "";
+    const eid = room.humidity_sensor || (s.endsWith("_temperature") ? s.slice(0, -"_temperature".length) + "_humidity" : null);
+    if (!eid) return [];
+    try {
+      const now = new Date(), start = new Date(now.getTime() - hours * 3600000);
+      const r = await this._hass.callWS({ type: "history/history_during_period", start_time: start.toISOString(), end_time: now.toISOString(),
+        entity_ids: [eid], minimal_response: true, no_attributes: true, significant_changes_only: false });
+      return ((r || {})[eid] || []).map(x => {
+        const t = x.lu != null ? x.lu * 1000 : x.lc != null ? x.lc * 1000 : Date.parse(x.last_updated || x.last_changed);
+        return [t, parseFloat(x.s != null ? x.s : x.state)];
+      }).filter(p => isFinite(p[0]) && isFinite(p[1]));
+    } catch (e) { return []; }
+  }
+
+  // Humidity under the temperature chart, on the same time axis (a second panel, not a second scale): the room's relative humidity
+  // against the 30-60% band usually considered comfortable.
+  _humChart(hum, hours) {
+    if (!hum || hum.length < 2) return "";
+    const W = 320, H = 110, L = 34, R = 8, T = 8, B = 18;
+    const t1 = Date.now(), t0 = t1 - hours * 3600000;
+    const v = hum.map(p => p[1]);
+    let lo = Math.floor((Math.min(...v, 30) - 3) / 5) * 5, hi = Math.ceil((Math.max(...v, 60) + 3) / 5) * 5;
+    const x = t => L + (W - L - R) * (t - t0) / (t1 - t0), y = q => T + (H - T - B) * (1 - (q - lo) / (hi - lo));
+    let g = "";
+    for (let q = Math.ceil(lo / 10) * 10; q <= hi; q += 10)
+      g += `<line x1="${L}" x2="${W - R}" y1="${y(q)}" y2="${y(q)}" stroke="currentColor" stroke-opacity=".12"/>` +
+           `<text x="${L - 4}" y="${y(q) + 4}" text-anchor="end" font-size="10" fill="currentColor" fill-opacity=".6">${q}%</text>`;
+    const path = hum.filter(p => p[0] >= t0).map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
+    const last = hum[hum.length - 1][1];
+    return `<div class="rc-sub" style="margin:8px 0 2px">Humidity · now <b>${Math.round(last)}%</b></div>
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%;display:block"><rect x="${L}" y="${y(60)}" width="${W - L - R}" height="${y(30) - y(60)}" fill="#2bb3a7" fill-opacity=".10"/>
+        ${g}<path d="${path}" fill="none" stroke="#2bb3a7" stroke-width="2" stroke-linejoin="round"/></svg>
+      <div class="rc-legend"><span><b style="color:#2bb3a7">━</b> relative humidity</span><span>▒ 30–60%</span></div>`;
   }
 
   // Reading (solid) against its target (dashed step) with the room's allowed-error band, from the 5-minute samples.
@@ -570,7 +608,7 @@ class RoomMapCard extends HTMLElement {
     return `<div class="rc-hist">${head}<svg viewBox="0 0 ${W} ${H}" style="width:100%;display:block">${g}${band}` +
       `<path d="${stepPath}" fill="none" stroke="currentColor" stroke-opacity=".7" stroke-width="1.5" stroke-dasharray="4 3"/>` +
       `<path d="${seg(p => p[1])}" fill="none" stroke="var(--primary-color, #03a9f4)" stroke-width="2" stroke-linejoin="round"/></svg>` +
-      `<div class="rc-legend"><span><b style="color:var(--primary-color, #03a9f4)">━</b> temperature ${last ? last[1] + "°" : ""}</span><span>┅ target ${last ? last[2] + "°" : ""}</span><span>▒ allowed error</span></div></div>`;
+      `<div class="rc-legend"><span><b style="color:var(--primary-color, #03a9f4)">━</b> temperature ${last ? last[1] + "°" : ""}</span><span>┅ target ${last ? last[2] + "°" : ""}</span><span>▒ allowed error</span></div>${this._humChart(c.hum, hours)}</div>`;
   }
 
   // A unit's real state (from HA) next to what the controller wants. Shared by the home panel and diagnostics.
