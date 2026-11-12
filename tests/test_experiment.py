@@ -136,6 +136,23 @@ def test_experiment_blocks_turn_the_idle_units_room_sensor_feed_off():
     assert all(b["feed_off"] == [] for b in none["blocks"])
 
 
+def test_auto_experiment_tests_each_unit_alone_at_setpoints_around_the_target():
+    start = datetime.fromisoformat("2026-11-12T09:00:00-08:00")
+    p = ex.plan_auto(start, 9, ["ah", "ms2", "ms1"], mode="heat", offsets=(0.0, 3.0, -3.0), level_min=40)
+    auto = [b for b in p["blocks"] if b["kind"] == "auto"]
+    assert [(b["unit"], b["auto_offset"]) for b in auto[:3]] == [("ah", 0.0), ("ah", 3.0), ("ah", -3.0)]
+    assert all(set(b["off"]) == {"ah", "ms2", "ms1"} - {b["unit"]} for b in auto)  # the others fully off
+    assert {b["unit"] for b in auto} == {"ah", "ms2", "ms1"} and p["blocks"][-1]["kind"] == "restore" and p["kind"] == "auto"
+    assert "AUTO" in ex.describe(auto[1]) and "+3" in ex.describe(auto[1])
+    cmds = {u: core.Command("heat", 68.0, "x", False, 68.0, 67.5, 67.0, 0.0) for u in ("ah", "ms2")}
+    out = ex.commands(auto[1], "heat", cmds, {"ah": ["k"], "ms2": ["b"]}, {"k": 67.0, "b": 67.0}, core.Settings())
+    assert out["ah"].mode == "auto" and abs(out["ah"].setpoint - 70.5) < 0.6 and out["ms2"].mode == "off"
+    low = ex.commands(auto[2], "heat", cmds, {"ah": ["k"], "ms2": ["b"]}, {"k": 67.0, "b": 67.0}, core.Settings())
+    assert low["ah"].mode == "auto" and abs(low["ah"].setpoint - 64.5) < 0.6
+    cold = ex.commands(auto[2], "heat", cmds, {"ah": ["k"], "ms2": ["b"]}, {"k": 59.0, "b": 67.0}, core.Settings())
+    assert cold["ah"].mode == "heat"  # a room under the floor is heated whatever the test says
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

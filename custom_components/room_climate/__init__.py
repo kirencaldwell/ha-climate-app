@@ -567,7 +567,7 @@ class Manager:
         return {u["id"]: (u.get("name") or u["id"]).replace(" minisplit", "").replace(" air handler", "")
                 for u in self.data["units"]}
 
-    async def async_start_experiment(self, hours: float):
+    async def async_start_experiment(self, hours: float, kind: str = None):
         """Run an experiment for `hours` (experiment.plan). Raises ValueError if no unit is under our control."""
         settings = core.settings_from(self.data.get("settings"))
         ours = [u["id"] for u in self.data["units"] if self.control(u["id"]) in OURS]
@@ -578,6 +578,15 @@ class Manager:
         fan_units = {x.strip() for x in settings.fan_units.split(",")}
         m = self.shadow.model
         ours = experiment.order(ours, experiment.leaky_units(m.rooms.values() if m else ()))
+        if kind == "auto":  # the units' own AUTO mode at setpoints below and above the target, one unit at a time
+            offs = tuple(float(x) for x in settings.experiment_auto_offsets.split(",") if x.strip())
+            self.data["experiment"] = experiment.plan_auto(now, hours, ours, mode, offs, settings.experiment_auto_level_min)
+            self.data["experiment"]["feed0"] = {u["id"]: self._feed(u["id"]) for u in self.data["units"] if self._feed(u["id"]) is not None}
+            self.data["experiment"]["vane0"] = {}
+            _LOGGER.info("auto-mode experiment started: %s h, setpoints %s from target, units %s", hours, offs, ", ".join(ours))
+            await self.async_save()
+            await self.async_tick()
+            return
         self.data["experiment"] = experiment.plan(now, hours, ours, fan_units, mode,
                                                     experiment.leaky_units(m.rooms.values() if m else ()),
                                                     settings.experiment_focus,
@@ -1060,7 +1069,8 @@ class Manager:
             self._op_logged, self._op_logged_at = ops, now
         if getattr(self, "exp_block", None):
             b = self.exp_block
-            row["exp"] = {"kind": b["kind"], "unit": b.get("unit"), "fan": b.get("fan"), "off": b.get("off") or []}
+            row["exp"] = {"kind": b["kind"], "unit": b.get("unit"), "fan": b.get("fan"), "off": b.get("off") or [],
+                          "ao": b.get("auto_offset")}
         f = self.forecast
         if f is not None and f["at"] != self._forecast_logged:  # each fetched forecast, once (next 6 h)
             self._forecast_logged = f["at"]
@@ -1532,11 +1542,12 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         connection.send_result(msg["id"], mgr.snapshot())
 
     @websocket_api.websocket_command({"type": f"{DOMAIN}/experiment_start",
-                                      vol.Required("hours"): vol.All(vol.Coerce(float), vol.Range(min=experiment.MIN_H, max=experiment.MAX_H))})
+                                      vol.Required("hours"): vol.All(vol.Coerce(float), vol.Range(min=experiment.MIN_H, max=experiment.MAX_H)),
+                                      vol.Optional("kind"): vol.In(["standard", "auto"])})
     @websocket_api.async_response
     async def ws_experiment_start(hass, connection, msg):
         try:
-            await mgr.async_start_experiment(msg["hours"])
+            await mgr.async_start_experiment(msg["hours"], msg.get("kind"))
         except ValueError as e:
             connection.send_error(msg["id"], "not_ready", str(e))
             return

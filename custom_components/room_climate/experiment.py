@@ -108,6 +108,39 @@ def plan(start: datetime, hours: float, unit_ids: list, fan_units=(), mode: str 
     return {"start": start.isoformat(), "end": end.isoformat(), "mode": mode, "blocks": blocks}
 
 
+def plan_auto(start: datetime, hours: float, unit_ids: list, mode: str = "heat", offsets=(0.0, 3.0, -3.0), level_min: int = 40,
+              coast_min: int = 20) -> dict:
+    """The auto-mode experiment: one unit at a time is put in its own AUTO mode (it decides heat / cool / idle itself from its
+    room sensor against one setpoint) with the setpoint at the room's target plus each of `offsets` in turn, `level_min` minutes
+    each, the other units fully off; a coast between units, and the last hour normal control. Tests how the units track a
+    setpoint on their own (dead band, mode choice, stage, cycling), which is gentler on them than us switching them by hand."""
+    hours = max(MIN_H, min(MAX_H, hours))
+    end = start + timedelta(hours=hours)
+    restore = end - timedelta(minutes=RESTORE_MIN)
+    blocks, t = [], start
+
+    def add(kind, minutes, unit=None, off=(), ao=None):
+        nonlocal t
+        stop = min(restore, t + timedelta(minutes=minutes))
+        if stop - t >= timedelta(minutes=15):
+            blocks.append({"start": t.isoformat(), "end": stop.isoformat(), "kind": kind, "unit": unit, "fan": None,
+                           "off": list(off), "vane": None, "feed_off": [], "auto_offset": ao})
+        t = stop
+
+    add("float", coast_min)
+    for uid in unit_ids:
+        for ao in offsets:
+            if t >= restore - timedelta(minutes=15):
+                break
+            add("auto", level_min, uid, [u for u in unit_ids if u != uid], ao)
+        add("coast", coast_min)
+    if t < restore:
+        add("float", int((restore - t).total_seconds() // 60))
+    blocks.append({"start": restore.isoformat(), "end": end.isoformat(), "kind": "restore", "unit": None, "fan": None, "off": [],
+                   "vane": None, "feed_off": [], "auto_offset": None})
+    return {"start": start.isoformat(), "end": end.isoformat(), "mode": mode, "blocks": blocks, "kind": "auto"}
+
+
 def current(exp: dict, now: datetime) -> Optional[dict]:
     """The block in force now (None: before the start or after the end)."""
     for b in exp.get("blocks", []):
@@ -120,6 +153,8 @@ def describe(b: Optional[dict], names: dict = None) -> str:
     if b is None:
         return "finished"
     nm = (names or {}).get(b.get("unit"), b.get("unit"))
+    if b["kind"] == "auto":
+        return f"{nm} in AUTO, setpoint {b['auto_offset']:+g}° from its target (the others off)"
     return {"float": "all units idle (the house drifts)",
             "coast": "all units idle (after a run)",
             "restore": "back to normal control before the time is up",
@@ -140,6 +175,16 @@ def commands(b: dict, mode: str, cmds: dict, unit_rooms: dict, readings: dict, s
         temps = [readings[r] for r in unit_rooms.get(uid, []) if readings.get(r) is not None]
         solo = b["kind"] == "solo" and b.get("unit") == uid
         why = f"experiment: {describe(b)}"
+        if b["kind"] == "auto" and b.get("unit") == uid:
+            temps_ = [readings[r] for r in unit_rooms.get(uid, []) if readings.get(r) is not None]
+            if temps_ and min(temps_) < settings.floor:  # never let the empty house get cold, whatever the test says
+                out[uid] = core.Command("heat", core.to_grid(c.room + c.offset + PUSH), "experiment: a room is below the floor; heating", True)
+                continue
+            base = c.target if c.target is not None else c.room
+            lo, hi = settings.floor + 1.0, settings.ceiling - 1.0
+            sp = core.to_grid(max(lo, min(hi, base + c.offset + b["auto_offset"])))
+            out[uid] = core.Command("auto", sp, why, True, sp, c.target, c.room, c.offset, None)
+            continue
         if uid in (b.get("off") or ()) and not (mode == "heat" and temps and min(temps) < settings.floor):
             out[uid] = core.Command("off", None, why)  # the leak test: this unit fully off, not idling in its mode
             continue

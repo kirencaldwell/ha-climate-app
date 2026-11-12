@@ -78,6 +78,8 @@ class Settings:
     opening_conf_tau_h: float = 24.0
     observer_on: bool = False  # the planner's feedback (observer.py): per-room drift and per-unit gain corrections learned online
     #                            (offset-free MPC); 2026-10-29 simulator: joint planner discomfort 32.8 -> 25.8
+    experiment_auto_offsets: str = "0,3,-3"  # the auto-mode experiment's setpoints, F from each unit's room target, one block each
+    experiment_auto_level_min: int = 40
     experiment_feed_off: bool = True  # in experiments, switch off the room-sensor feed of units that are idle (their own inlet sensor is then readable)
     experiment_vane_units: str = ""  # comma-separated unit ids whose solos sweep the vertical vane (at fan auto) instead of the fan
     experiment_focus: str = "air_handler"  # the unit an experiment spends the most time on (experiment.py): the weakest model

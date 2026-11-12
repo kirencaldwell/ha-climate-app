@@ -81,7 +81,10 @@ class Inputs:
         self.modes, self.sps, self.ran, self.fans = [], [], [], []
         for r in rows:
             us = {u: x for u, x in (r.get("units") or {}).items() if x.get("state") not in (None, "unavailable")}
-            self.modes.append({u: (x["state"] if x["state"] in ("heat", "cool") else "off") for u, x in us.items()})
+            # a unit in its own AUTO mode is heating or cooling as its action says (idle in auto counts as off)
+            self.modes.append({u: (x["state"] if x["state"] in ("heat", "cool") else
+                                   "heat" if (x["state"] == "auto" and x.get("action") == "heating") else
+                                   "cool" if (x["state"] == "auto" and x.get("action") == "cooling") else "off") for u, x in us.items()})
             self.sps.append({u: x.get("sp") for u, x in us.items()})
             self.ran.append({u: x.get("action") in ("heating", "cooling") for u, x in us.items()})
             self.fans.append({u: x.get("fan") for u, x in us.items()})
