@@ -869,7 +869,16 @@ class Manager:
                 d = self.shadow.decision.get(u.id) or {}
                 reason = "model: " + ((self.shadow.live_reason if settings.model_planner == "joint" else None)
                                       or (self.shadow.plan.reason if self.shadow.plan else ""))
-                if d.get("sleep"):
+                cur_ = self.hass.states.get(u.entity)
+                if (cur_ is not None and cur_.state == "auto" and not settings.auto_hvac and not d.get("sleep")
+                        and d.get("hvac") is None):
+                    # left in AUTO by an earlier version: it does not switch between heating and cooling, so put it back in the
+                    # mode we choose (the house's, else heat), keeping its setpoint
+                    hm_ = self.shadow.house.mode if self.shadow.house.mode in ("heat", "cool") else "heat"
+                    sp_ = cur_.attributes.get("temperature")
+                    c = core.Command(hm_, None if sp_ is None else float(sp_), "model: back to an explicit mode (AUTO does not switch modes)",
+                                     False, None if sp_ is None else float(sp_), None, c.room, c.offset)
+                elif d.get("sleep"):
                     c = core.Command("off", None, reason + " (this unit fully off: no leak)")
                 elif settings.model_planner == "joint" and d.get("mode") in ("heat", "cool"):
                     # the joint planner picks run / fan / setpoint itself: no outer loop
