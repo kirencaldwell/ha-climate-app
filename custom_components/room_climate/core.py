@@ -88,6 +88,7 @@ class Settings:
     # 1.6 / 0.4 / 0.08) after Bedroom 3 averaged 3-minute runs; the simulator: compressor starts -7% for +34% discomfort.
     # The planner's actuator is each unit's setpoint (target + an offset it chooses), in the hvac mode WE set (heat or cool): the
     # units' own AUTO mode did not switch between heating and cooling in the 11-12 experiment, so the mode is ours to set.
+    unit_fan_auto: bool = True  # units under model control keep their fan on "auto": the unit scales it with how hard it is working
     setpoint_actuator: bool = True
     auto_hvac: bool = False  # send hvac mode "auto" instead of heat/cool with the setpoint (it will not switch modes for us)
     joint_unit_start_cost: float = 1.5

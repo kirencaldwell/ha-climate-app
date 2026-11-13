@@ -870,6 +870,11 @@ class Manager:
                 reason = "model: " + ((self.shadow.live_reason if settings.model_planner == "joint" else None)
                                       or (self.shadow.plan.reason if self.shadow.plan else ""))
                 cur_ = self.hass.states.get(u.entity)
+                if (settings.unit_fan_auto and settings.setpoint_actuator and cur_ is not None and cur_.state not in BAD_STATES
+                        and cur_.attributes.get("fan_mode") not in (None, "auto") and "auto" in (cur_.attributes.get("fan_modes") or [])):
+                    # we no longer command fan speeds (the unit holds a setpoint itself): leave it on auto so it modulates the fan too
+                    _LOGGER.info("SEND %s fan_mode %s -> auto (the setpoint actuator leaves the fan to the unit)", u.entity, cur_.attributes.get("fan_mode"))
+                    await self._call(u, SERVICE_SET_FAN_MODE, {ATTR_FAN_MODE: "auto"})
                 if (cur_ is not None and cur_.state == "auto" and not settings.auto_hvac and not d.get("sleep")
                         and d.get("hvac") is None):
                     # left in AUTO by an earlier version: it does not switch between heating and cooling, so put it back in the
