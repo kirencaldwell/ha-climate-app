@@ -873,7 +873,7 @@ class Manager:
                     c = core.Command("off", None, reason + " (this unit fully off: no leak)")
                 elif settings.model_planner == "joint" and d.get("mode") in ("heat", "cool"):
                     # the joint planner picks run / fan / setpoint itself: no outer loop
-                    c = core.Command(d["mode"], d.get("setpoint"), reason, bool(d.get("run")), d.get("setpoint"), None,
+                    c = core.Command(d.get("hvac") or d["mode"], d.get("setpoint"), reason, bool(d.get("run")), d.get("setpoint"), None,
                                      c.room, c.offset, d.get("fan"))
                 elif d.get("mode") in ("heat", "cool") and settings.drive and d.get("target") is not None:
                     # the model picks the target; the same outer loop as today's controller sets the setpoint

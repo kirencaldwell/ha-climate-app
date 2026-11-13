@@ -456,6 +456,8 @@ class ShadowPlanner:
         js = self.joint.js  # the cycling costs are settings, so they can be tuned without a deploy
         js.unit_start_cost, js.compressor_start_cost = settings.joint_unit_start_cost, settings.joint_compressor_start_cost
         js.hold_class_cost, js.hold_detail_cost = settings.joint_hold_class_cost, settings.joint_hold_detail_cost
+        o_now = outdoor(now) if callable(outdoor) else outdoor
+        js.auto_actuator = settings.auto_actuator and (o_now is None or o_now <= settings.auto_max_outdoor_f)
         running = {u: bool(a.get("running")) for u, a in actual.items()}
         p = self.joint.plan(self.model, rooms, units, temps, now, self.jhouse, running, outdoor, sun_at, settings,
                             ignore=set(ignore), fixed=fixed, lagged=dict(self.lagged),
@@ -506,8 +508,9 @@ class ShadowPlanner:
                 self.decision[u.id] = {"mode": "off", "setpoint": None, "sleep": True}
             else:
                 lab = (p.pattern.get(u.id) or ["off"])[0]
+                auto = lab.startswith("auto") and not (from_off or p.mode != mode)
                 self.decision[u.id] = {"mode": mode, "setpoint": setpoints.get(u.id), "fan": fans.get(u.id),
-                                       "run": lab.startswith("run")}
+                                       "run": lab.startswith(("run", "auto")), "hvac": "auto" if auto else None}
         self.live_reason = f"joint: {p.reason}"
 
     def _project(self, now, temps, actual, outdoor, sun_at, horizon_min=120, step_min=10):
