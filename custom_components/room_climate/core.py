@@ -86,10 +86,10 @@ class Settings:
     # What the joint planner charges for cycling (cost units of its comfort cost): per indoor-unit start, per start of the shared
     # compressor, and for changing what a unit is doing now (run/off/sleep, then gap/fan). Raised 2.5x on 2026-11-10 (they were 0.6 /
     # 1.6 / 0.4 / 0.08) after Bedroom 3 averaged 3-minute runs; the simulator: compressor starts -7% for +34% discomfort.
-    # A guard, not a rule: in the 11-12 experiment the units never cooled in AUTO with the outdoors at 40-45 F (a low-ambient cooling
-    # lockout is likely, untested), so AUTO is only used for heating plans while it is at most this cold outside.
-    auto_max_outdoor_f: float = 55.0
-    auto_actuator: bool = True  # heating plans: the planner sets each unit's setpoint and the unit holds it in its own AUTO mode
+    # The planner's actuator is each unit's setpoint (target + an offset it chooses), in the hvac mode WE set (heat or cool): the
+    # units' own AUTO mode did not switch between heating and cooling in the 11-12 experiment, so the mode is ours to set.
+    setpoint_actuator: bool = True
+    auto_hvac: bool = False  # send hvac mode "auto" instead of heat/cool with the setpoint (it will not switch modes for us)
     joint_unit_start_cost: float = 1.5
     joint_compressor_start_cost: float = 4.0
     joint_hold_class_cost: float = 1.0

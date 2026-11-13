@@ -45,11 +45,12 @@ class JointSettings:
     # How hard a unit is driven is a DECISION, not a rule: a running unit's setpoint sits `gap` F past its reading in the direction
     # it works, and the search picks the gap per unit and block from these levels (the model's output rises with the gap, the
     # cost charges the energy). Nothing says which gap a situation calls for: the cost does.
-    # AUTO as the actuator (heating plans): the planner picks each unit's SETPOINT, as an offset from the target of the rooms the
-    # unit serves, and the unit holds it with its own controller in its AUTO mode (no on/off or fan commands from us: one start per
-    # stretch instead of switching it by hand). Cooling plans keep the explicit run / stop options below.
-    auto_actuator: bool = True
-    auto_levels: tuple = (-3.0, -1.5, 0.0, 1.5, 3.0)
+    # The planner's actuator is each unit's SETPOINT, as an offset from the target of the rooms it serves, with the hvac mode (heat or
+    # cool) set by us and the unit holding the setpoint with its own controller: no on/off or fan commands from us, so one start per
+    # stretch instead of switching it by hand. (The units' own AUTO mode does not switch between heating and cooling, so the
+    # mode is ours to set.) Off: the run / stop / gap options below.
+    setpoint_actuator: bool = True
+    sp_levels: tuple = (-3.0, -1.5, 0.0, 1.5, 3.0)
     gaps: tuple = (2.0, 4.0, 7.0)
     push_stop: float = 2.0  # F behind the reading: makes a unit stop (mechanical: any value that far behind does it; it idles ~1 F past its setpoint)
     population: int = 60
@@ -101,11 +102,11 @@ class JointPlanner:
         self.prev = None  # (time, mode, {unit: [option label per block]}) of the last plan, for warm starts
 
     # -- helpers --
-    def _options(self, m, u, fan_units, auto=False):
-        """Per unit: [(run?, fan, gap)]; the first is "off". With `auto`: [(None, "auto", offset from the target)] for each
-        auto level, then "sleep" (fully off): the unit is in AUTO and holds target + offset."""
-        if auto:
-            return [(None, "auto", dlt) for dlt in self.js.auto_levels] + ([(False, "sleep", None)] if self.js.sleep_option else [])
+    def _options(self, m, u, fan_units, setpoint=False):
+        """Per unit: [(run?, fan, gap)]; the first is "off". With `setpoint`: [(None, "sp", offset from the target)] for each
+        level, then "sleep" (fully off): the unit holds target + offset itself in the mode we set."""
+        if setpoint:
+            return [(None, "sp", dlt) for dlt in self.js.sp_levels] + ([(False, "sleep", None)] if self.js.sleep_option else [])
         fans = [None]
         if u.id in fan_units and u.id in m.units:
             sc = m.units[u.id].fan_scale
@@ -142,13 +143,13 @@ class JointPlanner:
         fan_units = {x.strip() for x in settings.fan_units.split(",")}
         def lab_of(o):
             r, f, g = o
-            return "sleep" if f == "sleep" else f"auto@{g:+g}" if r is None else "off" if not r else f"run:{f or '-'}@{g:g}"
+            return "sleep" if f == "sleep" else f"sp@{g:+g}" if r is None else "off" if not r else f"run:{f or '-'}@{g:g}"
         opts_run = {u.id: self._options(m, u, fan_units) for u in known}
-        opts_auto = {u.id: self._options(m, u, fan_units, auto=True) for u in known} if js.auto_actuator else opts_run
+        opts_auto = {u.id: self._options(m, u, fan_units, setpoint=True) for u in known} if js.setpoint_actuator else opts_run
         lab_run = {uid: [lab_of(o) for o in v] for uid, v in opts_run.items()}
         lab_auto = {uid: [lab_of(o) for o in v] for uid, v in opts_auto.items()}
-        opts_for = lambda md: opts_auto if (js.auto_actuator and md == "heat") else opts_run  # AUTO only when heating
-        labels_for = lambda md: lab_auto if (js.auto_actuator and md == "heat") else lab_run
+        opts_for = lambda md: opts_auto if (js.setpoint_actuator and md in ("heat", "cool")) else opts_run
+        labels_for = lambda md: lab_auto if (js.setpoint_actuator and md in ("heat", "cool")) else lab_run
         mid_of = lambda ol: next((k for k, (r_, f_, g_) in enumerate(ol) if r_ is None and g_ == 0.0), None) if ol and ol[0][0] is None else \
             next((k for k, (r_, f_, g_) in enumerate(ol) if r_ and g_ == js.gaps[len(js.gaps) // 2]), 0)
         nb = len(blocks)
@@ -162,7 +163,7 @@ class JointPlanner:
             prev = cmd_now.get(uid)
             if prev is None or prev == lab:
                 return 0.0
-            cls = lambda x: "run" if x.startswith("run") else "auto" if x.startswith("auto") else x
+            cls = lambda x: "run" if x.startswith("run") else "sp" if x.startswith("sp@") else x
             return js.hold_class_cost if cls(prev) != cls(lab) else js.hold_detail_cost
         zone = {u.id: [r for r in scored if r.unit == u.id] for u in known}
         evals = [0]
@@ -196,7 +197,7 @@ class JointPlanner:
                         if bi == 0:
                             first_sp[u.id], first_fan[u.id] = None, "sleep"
                         continue
-                    if runb is None:  # AUTO: the unit holds target + offset itself; whether it runs follows from the model
+                    if runb is None:  # setpoint option: the unit holds target + offset itself; whether it runs follows from the model
                         z = zone[u.id]
                         k_ = min(len(times) - 1, (a + b) // 2)
                         tgt_u = (sum(tw[r.id][k_][0] * tw[r.id][k_][1] for r in z) / sum(tw[r.id][k_][1] for r in z)) if z else hm.unit_reading(m, u.id, cur)
@@ -262,9 +263,10 @@ class JointPlanner:
             for u in known:
                 lab = fixed_pattern.get(u.id) or []
                 ol, ll = opts_for(md)[u.id], labels_for(md)[u.id]
-                mid = next((k for k, (r_, f_, g_) in enumerate(ol) if r_ is None and g_ == 1.5), None) if ol and ol[0][0] is None else None
+                eff = 1.5 if md == "heat" else -1.5  # the "run1" stand-in: some effort in the mode's direction
+                mid = next((k for k, (r_, f_, g_) in enumerate(ol) if r_ is None and g_ == eff), None) if ol and ol[0][0] is None else None
                 if mid is None:
-                    mid = mid_of(ol) or 0  # "run1": a run at the middle gap (in AUTO: its +1.5 level)
+                    mid = mid_of(ol) or 0  # "run1": a run at the middle gap (setpoint options: effort 1.5 in the mode's direction)
                 pat[u.id] = [(mid if lab[i] == "run1" else ll.index(lab[i]) if lab[i] in ll else 0)
                              if i < len(lab) else 0 for i in range(nb)]
             c, traj, _, _ = evaluate(md, pat)

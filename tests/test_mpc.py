@@ -280,16 +280,16 @@ def test_changing_what_a_unit_is_doing_now_costs_something():
     house = core.HouseState("heat", start - timedelta(hours=3))
     running = {u.id: False for u in units}
     ids = [u.id for u in units]
-    cur = {"air_handler": ["auto@+1.5"] * 6}  # heating plans use the AUTO setpoint options
+    cur = {"air_handler": ["sp@+1.5"] * 6}  # plans use the setpoint options
     new = {"air_handler": ["sleep"] * 6}
     def cost(prev, pattern):
         pl = joint.JointPlanner()
         pl.prev = prev
         return pl.plan(truth, rooms, units, temps, start, house, running, w.outdoor, w.sun, s, fixed_pattern=pattern, fixed_mode="heat").cost
     base = cost(None, new)
-    assert abs(cost((start, "heat", cur), new) - base - joint.JointSettings().hold_class_cost) < 1e-9  # auto -> sleep: the dear change
+    assert abs(cost((start, "heat", cur), new) - base - joint.JointSettings().hold_class_cost) < 1e-9  # setpoint -> sleep: the dear change
     assert abs(cost((start, "heat", cur), cur) - cost(None, cur)) < 1e-9  # keeping what it is doing costs nothing extra
-    detail = {"air_handler": ["auto@+0"] * 6}
+    detail = {"air_handler": ["sp@+0"] * 6}
     assert abs(cost((start, "heat", cur), detail) - cost(None, detail) - joint.JointSettings().hold_detail_cost) < 1e-9  # a gap change: the cheap one
 
 
@@ -324,26 +324,26 @@ def test_the_cycling_costs_come_from_the_settings():
     assert core.Settings().joint_unit_start_cost == 1.5 and core.Settings().joint_compressor_start_cost == 4.0
 
 
-def test_auto_actuator_is_used_for_heating_plans_only_while_it_is_cold_outside():
+def test_the_planner_sets_setpoints_in_the_mode_it_chooses_and_never_commands_auto_by_default():
     truth, rooms, units, s = _house()
     start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
-    temps = {r.id: 64.0 for r in rooms}
     actual = {u.id: {"mode": "heat", "setpoint": 66.0, "running": False} for u in units}
-    labs = {}
-    for out in (45.0, 70.0):
+    for out, temps0, mode in ((45.0, 64.0, "heat"), (95.0, 79.0, "cool")):
+        temps = {r.id: temps0 for r in rooms}
         sh = mpc.ShadowPlanner()
         sh.set_model(truth)
-        sh.jhouse = core.HouseState("heat", start - timedelta(hours=3))
+        sh.jhouse = core.HouseState(mode, start - timedelta(hours=3))
         sh.run(start, rooms, units, temps, actual, out, lambda t: 0.0, s)
         assert sh.jerror is None, sh.jerror
-        labs[out] = [l for v in sh.jplan.pattern.values() for l in v]
-    assert any(l.startswith("auto@") for l in labs[45.0]) and not any(l.startswith("auto@") for l in labs[70.0])
+        labs = [l for v in sh.jplan.pattern.values() for l in v]
+        assert any(l.startswith("sp@") for l in labs), (mode, labs)  # setpoint options in heating AND cooling
+        assert sh.jplan.mode == mode
     off = mpc.ShadowPlanner()
     off.set_model(truth)
     off.jhouse = core.HouseState("heat", start - timedelta(hours=3))
-    off.run(start, rooms, units, temps, actual, 45.0, lambda t: 0.0, dataclasses.replace(s, auto_actuator=False))
-    assert not any(l.startswith("auto@") for v in off.jplan.pattern.values() for l in v)
-
+    off.run(start, rooms, units, {r.id: 64.0 for r in rooms}, actual, 45.0, lambda t: 0.0, dataclasses.replace(s, setpoint_actuator=False))
+    assert not any(l.startswith("sp@") for v in off.jplan.pattern.values() for l in v)
+    assert not off.auto_hvac and core.Settings().auto_hvac is False
 
 if __name__ == "__main__":
     import traceback
