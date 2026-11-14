@@ -345,6 +345,29 @@ def test_the_planner_sets_setpoints_in_the_mode_it_chooses_and_never_commands_au
     assert not any(l.startswith("sp@") for v in off.jplan.pattern.values() for l in v)
     assert not off.auto_hvac and core.Settings().auto_hvac is False
 
+def test_the_optimizer_plan_does_not_touch_the_decision_while_the_joint_planner_decides():
+    truth, rooms, units, s = _house()
+    start = datetime.fromisoformat("2026-10-16T03:00:00-07:00")
+    w = coupled.Weather(start, 2, mean=50, seed=5)
+    temps = {r.id: 64.0 for r in rooms}
+    actual = {u.id: {"mode": "heat", "setpoint": 66.0, "running": False} for u in units}
+    sh = mpc.ShadowPlanner()
+    sh.set_model(truth)
+    sh.house = core.HouseState("heat", start - timedelta(hours=3))
+    sh.decision = {"sentinel": True}
+    sh._plan(start, rooms, units, temps, actual, w.outdoor(start), w.sun, s, set(), {}, {}, decide=False)
+    assert sh.decision == {"sentinel": True} and sh.house.mode == "heat" and sh.plan is not None and sh.plan_at == start
+    sh._plan(start, rooms, units, temps, actual, w.outdoor(start), w.sun, s, set(), {}, {})  # default: it decides, as before
+    assert set(sh.decision) == {u.id for u in units}
+    live = dataclasses.replace(s, model_planner="joint")  # run(): while joint is live, the optimizer's decision never appears
+    sh2 = mpc.ShadowPlanner()
+    sh2.set_model(truth)
+    sh2.house = core.HouseState("heat", start - timedelta(hours=3))
+    sh2.jhouse = core.HouseState("heat", start - timedelta(hours=3))
+    sh2.run(start, rooms, units, temps, actual, w.outdoor(start), w.sun, live)
+    assert sh2.live_reason and sh2.live_reason.startswith("joint") and all("setpoint" in d for d in sh2.decision.values())
+
+
 if __name__ == "__main__":
     import traceback
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

@@ -435,7 +435,8 @@ class ShadowPlanner:
             return
         self.next_plan = now + self.plan_every
         try:
-            self._plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {}, drives or {})
+            self._plan(now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed or {}, drives or {},
+                       decide=settings.model_planner != "joint")
             self._project(now, temps, actual, outdoor, sun_at)
             self.error = None
         except Exception as e:  # never let the model take the integration down; show it instead
@@ -528,7 +529,10 @@ class ShadowPlanner:
         self.projection = {"at": now.isoformat(), "temps": {
             r: [[t.isoformat(), round(step[r], 2)] for t, step in zip(times, traj)] for r in start}}
 
-    def _plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed, drives):
+    def _plan(self, now, rooms, units, temps, actual, outdoor, sun_at, settings, ignore, fixed, drives, decide=True):
+        """The optimizer's plan. `decide` False (the joint planner is the one deciding): the plan is kept for the readiness check and
+        the Model page, but the house mode and the units' decision are left alone: writing them here for a few seconds each plan
+        made the integration's ticks command the optimizer's setpoints between the joint planner's (the units short-cycled)."""
         ps = self.ps
         n = int(round(ps.horizon_h * 60 / ps.step_min))
         times = [now + timedelta(minutes=ps.step_min * k) for k in range(n)]
@@ -544,6 +548,10 @@ class ShadowPlanner:
                            drives=drives if settings.drive else None, lagged=dict(self.lagged),
                            fans={u: a.get("fan") for u, a in actual.items()}, masses=dict(self.masses),
                            comp=dict(self.comp), **self.corrections())
+        if not decide:
+            self.plan, self.plan_at = p, now
+            self.plan_ms = round((time.perf_counter() - t0) * 1000, 1)
+            return
         setpoints, first = p.setpoints, p.first
         forced = next((f[0] for f in fixed.values() if f[0] in ("heat", "cool")), None)
         if forced and self.house.mode != forced:
