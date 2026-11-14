@@ -1233,6 +1233,106 @@ class Manager:
                         "wants": None if last is None else {"mode": last.mode, "setpoint": last.setpoint, "fan": last.fan, "reason": last.reason}}
         return out
 
+    # ---- for the admin page: what needs attention, what isn't at its default, what the planner is doing, daily metrics ----
+    def health(self, now) -> list:
+        """[{"level": "bad"|"warn"|"info", "text"}] of what needs attention now."""
+        out = []
+        for r in self.data["rooms"]:
+            s = r.get("sensor")
+            if not s:
+                continue
+            st = self.hass.states.get(s)
+            if st is None or st.state in BAD_STATES:
+                since = st.last_changed.astimezone().strftime("%b %d %H:%M") if st is not None else "unknown"
+                out.append({"level": "bad", "text": f"{r.get('name', r['id'])}: no reading from {s} (since {since})"})
+        names = {u["id"]: u.get("name") or u["id"] for u in self.data["units"]}
+        for u in self.data["units"]:
+            st = self.hass.states.get(u["entity"])
+            if st is None or st.state in BAD_STATES:
+                out.append({"level": "bad", "text": f"{names[u['id']]} is unavailable"})
+            elif u.get("control", THERMOSTAT) == THERMOSTAT:
+                out.append({"level": "warn", "text": f"{names[u['id']]} runs on its own thermostat (not Room Climate)"})
+        if self.fit_state.get("error"):
+            out.append({"level": "warn", "text": f"Last model fit failed: {self.fit_state['error']}"})
+        m = self.shadow.model
+        if m is not None and not (m.meta or {}).get("usable"):
+            out.append({"level": "info", "text": "The latest model fit doesn't beat 'nothing changes' on every room"
+                        + (" (the gate skips this check)" if core.settings_from(self.data.get("settings")).model_gate_skip_fit else "")})
+        if self.shadow.jerror:
+            out.append({"level": "warn", "text": f"Planner: {self.shadow.jerror}"})
+        if self.shadow.error:
+            out.append({"level": "warn", "text": f"Model: {self.shadow.error}"})
+        return out
+
+    def nondefault(self) -> list:
+        """Settings that are not at their default: [{"key", "value", "default"}] (temporary changes are easy to forget)."""
+        cur = dataclasses.asdict(core.settings_from(self.data.get("settings")))
+        dflt = dataclasses.asdict(core.Settings())
+        skip = {"outdoor_entity"}
+        return [{"key": k, "value": v, "default": dflt[k]} for k, v in cur.items() if k in dflt and v != dflt[k] and k not in skip]
+
+    def planner_summary(self) -> dict:
+        sh = self.shadow
+        p = sh.jplan
+        if p is None:
+            return None
+        return {"at": sh.jplan_at.isoformat() if sh.jplan_at else None, "house": sh.jhouse.mode, "reason": p.reason, "pattern": p.pattern,
+                "ms": sh.jplan_ms, "flips_24h": len(sh.jflips), "block_min": list(sh.joint.js.block_min),
+                "decision": {u: {k: d.get(k) for k in ("mode", "setpoint", "hvac", "sleep")} for u, d in (sh.decision or {}).items()}}
+
+    def day_metrics(self, rows: list) -> dict:
+        """Starts, median run, share of runs under 5 min per unit, the mean house error and heat/cool flips for one day's rows."""
+        units = {}
+        for uid in [u["id"] for u in self.data["units"]]:
+            prev, n, runs, cur = False, 0, [], 0
+            for r in rows:
+                a = ((r.get("units") or {}).get(uid) or {}).get("action") in ("heating", "cooling")
+                if a and not prev:
+                    n += 1
+                if a:
+                    cur += 1
+                elif cur:
+                    runs.append(cur)
+                    cur = 0
+                prev = a
+            if cur:
+                runs.append(cur)
+            runs.sort()
+            units[uid] = {"starts": n, "median_run": runs[len(runs) // 2] if runs else None,
+                          "short_pct": round(100 * sum(1 for x in runs if x < 5) / len(runs)) if runs else None,
+                          "run_min": sum(runs)}
+        flips, last = 0, None
+        for r in rows:
+            md = r.get("house")
+            if md in ("heat", "cool"):
+                flips += 1 if last and md != last else 0
+                last = md
+        sc = [r["score"] for r in rows if r.get("score") is not None]
+        return {"minutes": len(rows), "units": units, "flips": flips, "house_error": round(sum(sc) / len(sc), 2) if sc else None}
+
+    async def async_metrics(self, days: int = 7) -> list:
+        cache = getattr(self, "_metrics_cache", None)
+        if cache is None:
+            cache = self._metrics_cache = {}
+        logdir = self.hass.config.path("room_climate_data")
+        today = dt_util.now().strftime("%Y-%m-%d")
+        want = [(dt_util.now() - timedelta(days=k)).strftime("%Y-%m-%d") for k in range(days - 1, -1, -1)]
+
+        def work(day):
+            rows = [r for r in datalog.read_rows(logdir, day) if r.get("t", "")[:10] == day]
+            return self.day_metrics(rows)
+        out = []
+        for day in want:
+            hit = cache.get(day)
+            if hit is None or (day == today and (dt_util.now() - hit[0]).total_seconds() > 600):
+                try:
+                    m = await self.hass.async_add_executor_job(work, day)
+                except OSError:
+                    continue
+                cache[day] = (dt_util.now(), m)
+            out.append({"day": day, **cache[day][1]})
+        return out
+
     def _feed_entity(self, uid: str):
         ents = getattr(self, "_diag_ents", None)
         if not ents or uid not in ents:
@@ -1371,6 +1471,10 @@ class Manager:
                 "state": cur.state, "setpoint": cur.attributes.get("temperature"),
                 "action": cur.attributes.get("hvac_action"), "temp": self._unit_temp(ud["entity"])}
         out["house"] = self.house_info
+        try:
+            out["health"], out["nondefault"], out["planner"] = self.health(now), self.nondefault(), self.planner_summary()
+        except Exception:  # noqa: BLE001 - display extras must never break the snapshot
+            out["health"], out["nondefault"], out["planner"] = [], [], None
         ok, reasons = self.model_ready(strict=True)
         out["model_ready"] = {"ok": ok, "why": reasons}
         out["live"] = {}
@@ -1507,6 +1611,27 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         await mgr.async_save()
         connection.send_result(msg["id"], mgr.snapshot())
 
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/metrics", vol.Optional("days", default=7): vol.All(int, vol.Range(min=1, max=30))})
+    @websocket_api.async_response
+    async def ws_metrics(hass, connection, msg):
+        connection.send_result(msg["id"], await mgr.async_metrics(msg["days"]))
+
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/note_add", vol.Required("text"): vol.All(str, vol.Length(min=1, max=300))})
+    @websocket_api.async_response
+    async def ws_note_add(hass, connection, msg):
+        """A note on the admin page (e.g. a temporary change to undo later)."""
+        notes = mgr.data.setdefault("notes", [])
+        notes.append({"id": f"n{int(dt_util.now().timestamp())}{len(notes)}", "text": msg["text"], "at": dt_util.now().isoformat()})
+        await mgr.async_save()
+        connection.send_result(msg["id"], mgr.snapshot())
+
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/note_remove", vol.Required("id"): str})
+    @websocket_api.async_response
+    async def ws_note_remove(hass, connection, msg):
+        mgr.data["notes"] = [n for n in mgr.data.get("notes", []) if n["id"] != msg["id"]]
+        await mgr.async_save()
+        connection.send_result(msg["id"], mgr.snapshot())
+
     @websocket_api.websocket_command({"type": f"{DOMAIN}/opening_confirm", vol.Required("ids"): [str]})
     @websocket_api.async_response
     async def ws_opening_confirm(hass, connection, msg):
@@ -1618,7 +1743,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         hass.async_create_task(mgr.async_fit())
         connection.send_result(msg["id"], {"started": True})
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_opening_save, ws_opening_confirm, ws_opening_delete, ws_fit_model, ws_reload_ml,
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_opening_save, ws_opening_confirm, ws_opening_delete, ws_metrics, ws_note_add, ws_note_remove, ws_fit_model, ws_reload_ml,
                ws_experiment_start, ws_experiment_stop):
         websocket_api.async_register_command(hass, fn)
 

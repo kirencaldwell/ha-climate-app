@@ -142,6 +142,9 @@ const CSS = `
 }
 `;
 
+const isOurs = c => c === "room_climate" || c === "model";  // Room Climate drives the unit (directly or through the planner)
+const planLabel = l => !l ? "—" : l === "sleep" ? "off" : l === "off" ? "idle" : l.startsWith("sp@") ? (l.slice(3) === "+0" ? "target" : `${l.slice(3)}°`)
+  : l.startsWith("run") ? `run ${l.split("@")[1] || ""}` : l;  // a planner option, in words
 const FLOOR_NAMES = { 1: "Basement", 2: "First Floor", 3: "Second Floor" };
 
 class RoomMapCard extends HTMLElement {
@@ -218,6 +221,7 @@ class RoomMapCard extends HTMLElement {
     this._wrap = this.querySelector(".rc");
     this._wrap.addEventListener("click", e => this._click(e));
     this._wrap.addEventListener("change", e => this._opChange(e));
+    this._wrap.addEventListener("toggle", e => { if (e.target.dataset && e.target.dataset.adv) this._advOpen = e.target.open; }, true);
     this._wrap.addEventListener("focusin", e => { if (e.target.matches && e.target.matches("input,select")) this._opEditing = true; });
     this._wrap.addEventListener("focusout", () => { this._opEditing = false; });
   }
@@ -234,6 +238,15 @@ class RoomMapCard extends HTMLElement {
     if (t.dataset.act === "ctl") { this._setControl(t.dataset.u, t.dataset.c); return; }
     if (t.dataset.act === "exp-start") { this._experiment(+t.dataset.h); return; }
     if (t.dataset.act === "exp-stop") { this._experiment(0); return; }
+    if (t.dataset.act === "note-add" && this._admin) {
+      const inp = this._wrap.querySelector("input[data-note]"), text = inp && inp.value.trim();
+      if (text) this._hass.callWS({ type: "room_climate/note_add", text }).then(r => { this._data = r; this._render(); }).catch(e => this._fail("note_add", e));
+      return;
+    }
+    if (t.dataset.act === "note-del" && this._admin) {
+      this._hass.callWS({ type: "room_climate/note_remove", id: t.dataset.id }).then(r => { this._data = r; this._render(); }).catch(e => this._fail("note_remove", e));
+      return;
+    }
     const room = this._data.rooms.find(r => r.id === this._sel);
     const live = room ? this._data.live[room.id] || {} : {};
     if (t.dataset.floor) { this._floor = +t.dataset.floor; this._sel = null; this._render(); return; }
@@ -288,7 +301,7 @@ class RoomMapCard extends HTMLElement {
       const sel = r.id === this._sel;
       const ctl = !!r.unit;
       const col = tech ? (live.temp == null ? palette.none : ctl ? GREEN : BLUE) : this._color(live.temp, live.target);
-      const active = tech && ((d.units_live || {})[r.unit] || {}).control === "room_climate" && (live.mode === "heat" || live.mode === "cool");
+      const active = tech && isOurs(((d.units_live || {})[r.unit] || {}).control) && (live.mode === "heat" || live.mode === "cool");
       const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
       const txt = live.temp == null ? "no sensor" : live.temp.toFixed(1) + "°";
       if (!tech) return `<g data-room="${r.id}" style="cursor:pointer">
@@ -499,26 +512,29 @@ class RoomMapCard extends HTMLElement {
     const today = todayOf(room.schedule, e => `${e.temp}°`);
     const ptoday = todayOf(room.priority_schedule, e => `w${fmtW(e.priority)}`);
     const pnow = live.priority ?? room.priority;
+    const ctlU = ((this._data.units_live || {})[room.unit] || {}).control;
     el.innerHTML = `<h3>${room.name}</h3>
-      <p class="rc-sub">${reading}${live.rh != null ? ` · ${Math.round(live.rh)}% RH${live.dew != null ? ` (dew point ${Math.round(live.dew)}°)` : ""}` : ""} · target ${live.target}° · ${((this._data.units_live || {})[room.unit] || {}).control === "room_climate"
-        ? `Room Climate in control · unit ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}`
-        : `<span style="color:#ffd166">thermostat in control</span> · Room Climate would ${live.mode}${live.reason ? " (" + live.reason + ")" : ""}`}</p>
-      <div class="rc-row"><span class="rc-lbl">Default temp</span>${step("def", room.default_temp)}</div>
-      <div class="rc-row"><span class="rc-lbl">${(room.priority_schedule || []).length ? "Default weight" : "Weight"}</span>
-        <div class="rc-chips" title="Exchange rate between rooms' errors; allowed error is about 1/√weight °F">${LADDER.map(n => `<button data-act="prio" data-v="${n}" class="${n === +room.priority ? "on" : ""}">${n}</button>`).join("")}</div></div>
-      <p class="rc-sub" style="margin:0 0 6px">Weight now ${fmtW(pnow)} → allowed error ±${allowable(pnow)}°</p>
+      <p class="rc-sub">${reading}${live.rh != null ? ` · ${Math.round(live.rh)}% RH${live.dew != null ? ` (dew point ${Math.round(live.dew)}°)` : ""}` : ""}</p>
+      <div class="rc-row" style="margin:4px 0 2px"><span class="rc-lbl">Target now</span><b style="font-size:1.6em">${live.target}°</b></div>
+      <p class="rc-sub" style="margin:0 0 6px">${isOurs(ctlU)
+        ? `Room Climate in control · unit ${live.mode === "off" ? "idle" : live.mode}`
+        : `<span style="color:#ffd166">its own thermostat is in control</span>`}</p>
       <div class="rc-sect"><h4>Hold${holding ? " · active" : ""}</h4>
         <div class="rc-row"><span class="rc-lbl">Hold at</span>${step("hold-step", holdVal)}</div>
         <div class="rc-row"><span class="rc-lbl">For</span><div class="rc-chips">
           ${[1, 2, 4, 8].map(h => `<button data-act="hold" data-h="${h}">${h} h</button>`).join("")}
           ${holding ? `<button data-act="hold-clear">Clear</button>` : ""}</div></div></div>
+      <div class="rc-sect"><h4>Temperature vs target</h4>${this._roomChart(room)}</div>
       <div class="rc-sect"><h4>Schedule</h4>
-        <p class="rc-sub" style="margin:8px 0">${today || "No schedule for today — using default temp."}</p>
+        <p class="rc-sub" style="margin:8px 0">${today || "No schedule for today — using the default temperature."}</p>
         <button data-act="sched" style="width:100%">Edit schedule…</button></div>
-      <div class="rc-sect"><h4>Priority schedule · now P${pnow}</h4>
-        <p class="rc-sub" style="margin:8px 0">${ptoday || "No priority schedule for today — using the default priority."}</p>
-        <button data-act="psched" style="width:100%">Edit priority schedule…</button></div>
-      <div class="rc-sect"><h4>Temperature vs target</h4>${this._roomChart(room)}</div>`;
+      <details class="rc-sect"${this._advOpen ? " open" : ""} data-adv="1"><summary style="cursor:pointer;padding:10px 0;color:var(--secondary-text-color,#9aa7b8)">Advanced: default temperature and weight</summary>
+        <div class="rc-row"><span class="rc-lbl">Default temp</span>${step("def", room.default_temp)}</div>
+        <div class="rc-row"><span class="rc-lbl">${(room.priority_schedule || []).length ? "Default weight" : "Weight"}</span>
+          <div class="rc-chips" title="How much this room's comfort counts against the others'; allowed error is about 1/√weight °F">${LADDER.map(n => `<button data-act="prio" data-v="${n}" class="${n === +room.priority ? "on" : ""}">${n}</button>`).join("")}</div></div>
+        <p class="rc-sub" style="margin:0 0 6px">Weight now ${fmtW(pnow)} → allowed error ±${allowable(pnow)}°</p>
+        <p class="rc-sub" style="margin:8px 0">Weight schedule today: ${ptoday || "none — the default weight applies"}</p>
+        <button data-act="psched" style="width:100%">Edit weight schedule…</button></details>`;
     this._roomHist(room.id);
   }
 
@@ -672,12 +688,88 @@ class RoomMapCard extends HTMLElement {
           <div class="rc-chips" style="display:flex;gap:6px">${[4, 6, 8, 10].map(h => `<button data-act="exp-start" data-h="${h}" style="flex:1">${h} h</button>`).join("")}</div></div>`;
     // An experiment shows on the everyday view too (rooms may be off target), just without the controls.
     const expUser = ex ? `<div class="rc-sect"><p class="rc-sub" style="margin:4px 0"><b>Learning run</b> until ${hm(ex.end)}: rooms may be a few degrees off.</p></div>` : "";
-    return `<h3>Heat pumps</h3>${house}<div class="rc-units">${tiles}</div>
+    return `${this._statusLine()}${this._admin ? this._adminTop() : ""}<h3>Heat pumps</h3>${house}<div class="rc-units">${tiles}</div>
+      ${this._admin ? this._plannerHtml() + this._metricsHtml() : ""}
       ${this._admin ? expSect : expUser}
-      ${pr ? `<div class="rc-sect"><h4>Highest priority</h4>${pr}</div>` : ""}
+      ${pr ? `<div class="rc-sect"><h4>Most important rooms now</h4>${pr}</div>` : ""}
       <p class="rc-sub" style="margin:12px 0">Tap a room to adjust it.</p>
       ${this._admin ? `<div class="rc-chips" style="display:flex;gap:8px"><button data-act="diag" style="flex:1">Diagnostics</button>
         <button data-act="model" style="flex:1">Model</button></div>` : ""}`;
+  }
+
+  // One line for everyone: what the house is doing, how close it is, and the next scheduled change.
+  _statusLine() {
+    const d = this._data, h = d.house || {}, sc = d.score;
+    const mode = h.mode === "heat" ? "Heating" : h.mode === "cool" ? "Cooling" : "Idle";
+    const err = sc ? sc.weighted_rms_F : null;
+    const how = err == null ? "" : err <= 0.8 ? ` · on target (within ${err.toFixed(1)}°)` : err <= 1.5 ? ` · close (within ${err.toFixed(1)}°)` : ` · catching up (${err.toFixed(1)}° off)`;
+    // the soonest schedule change today among rooms with a unit
+    const now = new Date(), nowMin = now.getHours() * 60 + now.getMinutes();
+    let next = null;
+    for (const r of d.rooms || []) {
+      if (!r.unit) continue;
+      for (const e of r.schedule || []) {
+        if (!e.days.includes(todayIdx())) continue;
+        const m = toMin(e.start);
+        if (m > nowMin && (!next || m < next.m)) next = { m, name: r.name, t: e.temp };
+      }
+    }
+    return `<div class="rc-banner" style="background:#3fa9ff14;color:inherit;font-weight:500;margin-bottom:10px">${mode}${how}${next ? ` · ${next.name} → ${next.t}° at ${fmtTime(next.m)}` : ""}</div>`;
+  }
+
+  // Admin: what needs attention, settings that aren't at their default, and notes (temporary changes to undo later).
+  _adminTop() {
+    const d = this._data, esc = t => String(t).replace(/[<&]/g, "");
+    const col = { bad: "#ff8a5c", warn: "#ffd166", info: "#9aa7b8" };
+    const hl = (d.health || []).map(x => `<div style="color:${col[x.level] || "inherit"};margin:3px 0">${x.level === "bad" ? "●" : x.level === "warn" ? "▲" : "ℹ"} ${esc(x.text)}</div>`).join("");
+    const nd = (d.nondefault || []).map(x => `<span title="default ${esc(JSON.stringify(x.default))}" style="display:inline-block;margin:2px 8px 2px 0">${esc(x.key)} = <b>${esc(JSON.stringify(x.value))}</b></span>`).join("");
+    const notes = (d.notes || []).map(n => `<div style="margin:3px 0">${esc(n.text)} <small style="opacity:.6">${new Date(n.at).toLocaleDateString()}</small>
+      <button data-act="note-del" data-id="${n.id}" style="min-height:28px;padding:0 8px;margin-left:6px">✓ done</button></div>`).join("");
+    return `<div class="rc-sect" style="border:none;margin-top:0">
+      ${hl ? `<h4>Needs attention</h4><div style="margin:4px 0 8px">${hl}</div>` : `<p class="rc-sub" style="margin:0 0 6px;color:#3de0a5">✓ Nothing needs attention</p>`}
+      <h4>Temporary changes and notes</h4><div style="margin:4px 0">${notes || `<span class="rc-sub">No notes.</span>`}</div>
+      <div class="rc-row" style="margin:4px 0"><input class="rc-in" data-note="1" placeholder="Add a note (e.g. a temporary change to undo)" style="flex:1 1 200px"/><button data-act="note-add" class="rc-mid">Add</button></div>
+      ${nd ? `<details><summary class="rc-sub" style="cursor:pointer">${(d.nondefault || []).length} settings not at their default</summary><div class="rc-sub" style="margin:4px 0">${nd}</div></details>` : ""}</div>`;
+  }
+
+  // Admin: what the joint planner is doing for the next two hours, per unit and block.
+  _plannerHtml() {
+    const p = this._data.planner;
+    if (!p) return `<div class="rc-sect"><h4>Planner now</h4><p class="rc-sub">No plan yet.</p></div>`;
+    const names = Object.fromEntries((this._data.units || []).map(u => [u.id, (u.name || u.id).replace(/ (air handler|minisplit)$/i, "")]));
+    let acc = 0;
+    const heads = (p.block_min || []).map(m => { const h = acc; acc += m; return `+${h}`; });
+    const cell = l => { const c = l === "sleep" ? "#667085" : l === "off" ? "#98a2b3" : l.startsWith("sp@-") ? "#3fa9ff" : l.startsWith("sp@+0") ? "#3de0a5" : "#ff8a5c";
+      return `<td style="text-align:center"><span style="display:inline-block;min-width:44px;padding:2px 4px;border-radius:6px;background:${c}26;color:${c}">${planLabel(l)}</span></td>`; };
+    const rows = Object.entries(p.pattern || {}).map(([u, pat]) => `<tr><td>${names[u] || u}</td>${pat.map(cell).join("")}</tr>`).join("");
+    const when = p.at ? new Date(p.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+    return `<div class="rc-sect"><h4>Planner now · ${p.house === "off" ? "idle" : p.house}</h4>
+      <p class="rc-sub" style="margin:4px 0">Setpoint per unit for the next two hours, relative to its rooms' target (minutes from now). Planned at ${when}, ${p.flips_24h} heat/cool switches in 24 h.</p>
+      <table class="rc-tbl"><tr><th>Unit</th>${heads.map(h => `<th style="text-align:center">${h}</th>`).join("")}</tr>${rows}</table></div>`;
+  }
+
+  // Admin: the numbers we judge the controller by, one row per day.
+  _metricsHtml() {
+    if (!this._metrics || Date.now() - (this._metricsAt || 0) > 600000) this._metricsLoad();
+    const m = this._metrics;
+    if (!m) return `<div class="rc-sect"><h4>This week</h4><p class="rc-sub">Loading…</p></div>`;
+    const ids = (this._data.units || []).map(u => u.id);
+    const names = Object.fromEntries((this._data.units || []).map(u => [u.id, (u.name || u.id).replace(/ (air handler|minisplit)$/i, "")]));
+    const head = `<tr><th>Day</th><th>House error</th><th>Flips</th>${ids.map(u => `<th>${names[u]}<br><small>starts · median run</small></th>`).join("")}</tr>`;
+    const rows = m.map(r => `<tr><td>${r.day.slice(5)}${r.minutes < 1400 ? ` <small>(${Math.round(r.minutes / 60)} h)</small>` : ""}</td><td>${r.house_error == null ? "—" : r.house_error.toFixed(2) + "°"}</td><td>${r.flips}</td>${ids.map(u => {
+      const x = (r.units || {})[u] || {};
+      return `<td class="${x.short_pct > 50 ? "bad" : x.short_pct > 25 ? "warn" : "ok"}">${x.starts ?? "—"} · ${x.median_run == null ? "—" : x.median_run + " min"}</td>`; }).join("")}</tr>`).join("");
+    return `<div class="rc-sect"><h4>This week</h4><table class="rc-tbl">${head}${rows}</table>
+      <p class="rc-sub" style="margin:4px 0 0">Cell colour: share of runs shorter than 5 minutes (green under 25%, amber to 50%, red above).</p></div>`;
+  }
+  async _metricsLoad() {
+    if (this._metricsBusy) return;
+    this._metricsBusy = true;
+    try {
+      this._metrics = await this._hass.callWS({ type: "room_climate/metrics", days: 7 });
+      this._metricsAt = Date.now();
+      if (!this._sel && !this._modal && this._config.page !== "openings") this._panel();
+    } catch (e) { /* keep the old numbers */ } finally { this._metricsBusy = false; }
   }
 
   _openDiag() {
@@ -791,7 +883,7 @@ class RoomMapCard extends HTMLElement {
     const mon = monRooms.map(r => { const l = (d.live || {})[r.id] || {};
       const dup = monRooms.some(o => o !== r && o.name === r.name);  // disambiguate e.g. two baths
       return `<button data-room="${r.id}">${r.name}${dup ? ` · ${this._floorName(r.floor || 1)}` : ""}<b>${l.temp == null ? "—" : l.temp.toFixed(0) + "°"}</b></button>`; }).join("");
-    const ctlN = units.filter(u => (ul[u.id] || {}).control === "room_climate").length;
+    const ctlN = units.filter(u => isOurs((ul[u.id] || {}).control)).length;
     return `<p class="rc-sub" style="margin:0 0 6px">Room Climate controls <b>${ctlN} of ${units.length}</b> units${ctlN < units.length ? " · the rest run on their own thermostats" : ""}</p>
       ${d.house && d.house.mode ? `<p class="rc-sub" style="margin:0 0 4px">House mode: <b>${d.house.mode}</b> · ${d.house.reason || ""}</p>` : ""}
       <p class="rc-sub" style="margin:0">${running} of ${units.length} units running</p>
@@ -883,7 +975,7 @@ class RoomMapCard extends HTMLElement {
     // With the outer loop the setpoint follows the room; the target is what the rooms are being brought to.
     const aim = (mode, tgt) => tgt == null || mode == null || mode === "off" ? "" : ` <small>(rooms to ${(+tgt).toFixed(1)}°)</small>`;
     const unitRows = Object.entries(d.today || {}).map(([u, t]) => `<tr><td>${t.name.replace(/ (air handler|minisplit)$/i, "")}</td>
-        <td><b>${md((dec[u] || {}).mode, (dec[u] || {}).setpoint, true)}</b>${aim((dec[u] || {}).mode, (dec[u] || {}).target)}</td><td>${md(t.mode, t.setpoint, true)}${aim(t.mode, t.target)}${t.control === "room_climate" ? "" : " <small>(thermostat in control)</small>"}</td>
+        <td><b>${md((dec[u] || {}).mode, (dec[u] || {}).setpoint, true)}</b>${aim((dec[u] || {}).mode, (dec[u] || {}).target)}</td><td>${md(t.mode, t.setpoint, true)}${aim(t.mode, t.target)}${isOurs(t.control) ? "" : " <small>(thermostat in control)</small>"}</td>
         <td>${md(t.actual_mode, t.actual_setpoint)}</td></tr>`).join("");
     const costs = plan ? Object.entries(plan.by_mode).map(([k, v]) => `${k} ${(+v.cost).toFixed(2)}`).join(" · ") : "";
     const would = `<div class="rc-sect"><h4>Would do vs today</h4>
@@ -933,7 +1025,7 @@ class RoomMapCard extends HTMLElement {
         ${skipped ? `<p class="rc-sub" style="margin:6px 0 0">Not fitted yet: ${skipped}</p>` : ""}
         ${fits ? `<h4 style="margin-top:12px">Recent fits</h4><table class="rc-tbl"><tr><th>When</th><th>Minutes</th><th></th></tr>${fits}</table>` : ""}</div>`;
     }
-    return status + would + accuracy + chart + learned;
+    return status + this._plannerHtml() + accuracy + chart + learned;
   }
 
   // One time-series chart. series: [{pts: [[ms, v]], color, width, dash, dots, step}]; band: [[ms, lo, hi]];
