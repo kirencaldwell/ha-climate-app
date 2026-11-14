@@ -1242,9 +1242,12 @@ class Manager:
             if not s:
                 continue
             st = self.hass.states.get(s)
-            if st is None or st.state in BAD_STATES:
-                since = st.last_changed.astimezone().strftime("%b %d %H:%M") if st is not None else "unknown"
-                out.append({"level": "bad", "text": f"{r.get('name', r['id'])}: no reading from {s} (since {since})"})
+            if st is None:
+                if r.get("unit"):  # a placeholder sensor matters only in a room a unit serves
+                    out.append({"level": "warn", "text": f"{r.get('name', r['id'])}: its sensor {s} doesn't exist in Home Assistant"})
+                continue
+            if st.state in BAD_STATES:
+                out.append({"level": "bad", "text": f"{r.get('name', r['id'])}: no reading from {s} (check its battery)"})
         names = {u["id"]: u.get("name") or u["id"] for u in self.data["units"]}
         for u in self.data["units"]:
             st = self.hass.states.get(u["entity"])
