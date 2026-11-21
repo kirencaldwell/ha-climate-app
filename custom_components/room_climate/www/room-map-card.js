@@ -11,6 +11,7 @@
  *                                                 # the Model page (left out of the everyday view)
  *               floors: all                       # every floor side by side (wraps on a phone) instead of floor tabs
  *               floor_order: [2, 3, 1]            # order for floors: all (default ascending by floor number)
+ *               room_popup: true                  # a tapped room opens in a pop-up card (default on with compact)
  *               compact: true                     # everyday view without the Heat pumps tiles / Most important rooms; a tapped room still opens
  *               overlays: [{entity, kind: button|contact, floor, label}]   # read-only markers placed from the admin view
  * Rooms without a `unit` are monitor-only (shown in blue on the tech theme).
@@ -184,6 +185,7 @@ class RoomMapCard extends HTMLElement {
       if (!this._modal && !this._opEditing) this._render();  // don't rebuild the page under an open editor (or a field being typed in)
       else if (this._diag) this._diagUpdate();  // diagnostics stay live
       else if (this._unitOpen) this._unitUpdate();
+      else if (this._roomPop) this._panel();  // the room pop-up stays live
     } catch (e) { this._fail("refresh", e); }
     finally { this._loading = false; }
   }
@@ -601,9 +603,16 @@ class RoomMapCard extends HTMLElement {
 
   _panel() {
     const room = this._data.rooms.find(r => r.id === this._sel);
-    const el = this._wrap.querySelector(".rc-panel");
-    if (this._mainOp) { const h = this._mainOpHtml(); if (h) { el.innerHTML = h + (room ? "" : this._overview()); if (!room) return; } }
-    if (!room) { el.innerHTML = (this._mainOp ? this._mainOpHtml() : "") + this._overview(); return; }
+    let el = this._wrap.querySelector(".rc-panel");
+    if (this._popup()) {  // the room opens as a pop-up card over the page; the page itself keeps the overview
+      if (el) el.innerHTML = (this._mainOp ? this._mainOpHtml() : "") + this._overview();
+      if (!room) { this._closePop(); return; }
+      el = this._popEl(room);
+      if (!el) return;
+    } else {
+      if (this._mainOp) { const h = this._mainOpHtml(); if (h) { el.innerHTML = h + (room ? "" : this._overview()); if (!room) return; } }
+      if (!room) { el.innerHTML = (this._mainOp ? this._mainOpHtml() : "") + this._overview(); return; }
+    }
     const live = this._data.live[room.id] || {};
     const reading = live.temp == null ? "No sensor reading" : live.temp.toFixed(1) + "°F";
     if (!room.unit) {
@@ -621,7 +630,7 @@ class RoomMapCard extends HTMLElement {
     const ptoday = todayOf(room.priority_schedule, e => `w${fmtW(e.priority)}`);
     const pnow = live.priority ?? room.priority;
     const ctlU = ((this._data.units_live || {})[room.unit] || {}).control;
-    el.innerHTML = `${this._config.compact ? `<button data-act="close-room" style="float:right">Close</button>` : ""}<h3>${room.name}</h3>
+    el.innerHTML = `${this._config.compact && !this._popup() ? `<button data-act="close-room" style="float:right">Close</button>` : ""}<h3>${room.name}</h3>
       <p class="rc-sub">${reading}${live.rh != null ? ` · ${Math.round(live.rh)}% RH${live.dew != null ? ` (dew point ${Math.round(live.dew)}°)` : ""}` : ""}</p>
       <div class="rc-row" style="margin:4px 0 2px"><span class="rc-lbl">Target now</span><b style="font-size:1.6em">${live.target}°</b></div>
       <p class="rc-sub" style="margin:0 0 6px">${isOurs(ctlU)
@@ -647,6 +656,30 @@ class RoomMapCard extends HTMLElement {
   }
 
   // Fetch (at most once a minute per room and span) the selected room's reading vs target; redraw only its chart.
+  // Room pop-up (card config `room_popup: true`, on by default with `compact`): a tapped room's temperature info in a card over the page.
+  _popup() { return this._config.page !== "openings" && (this._config.room_popup ?? this._config.compact) === true; }
+  _popEl(room) {
+    if (!this._roomPop) {
+      if (this._modal) return null;  // another editor is open: leave it alone
+      const m = this._modal = document.createElement("div");
+      m.className = "rc-modal";
+      m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="${room.name.replace(/[<&"]/g, "")}">
+        <header><h3>${room.name.replace(/[<&]/g, "")}</h3><button data-x="close" aria-label="Close">✕</button></header>
+        <div class="rc-body"><div class="rc-panel" data-slot="room"></div></div></div>`;
+      document.body.append(m);
+      this._roomPop = true;
+      m.addEventListener("click", e => {
+        if (e.target.closest("[data-x]") || e.target.classList.contains("rc-modal")) { this._closePop(); this._sel = null; this._render(); return; }
+        this._click(e);
+      });
+      m.addEventListener("toggle", e => { if (e.target.dataset && e.target.dataset.adv) this._advOpen = e.target.open; }, true);
+      this._onKey = e => { if (e.key === "Escape") { this._closePop(); this._sel = null; this._render(); } };
+      document.addEventListener("keydown", this._onKey);
+    }
+    return this._modal.querySelector('[data-slot="room"]');
+  }
+  _closePop() { if (this._roomPop) this._closeSchedule(); }
+
   async _roomHist(id, force = false) {
     const hours = this._rhHours || 24, c = this._rh;
     if (!force && c && c.id === id && c.hours === hours && Date.now() - c.at < 60000) return;
@@ -655,7 +688,7 @@ class RoomMapCard extends HTMLElement {
     try {
       const d = await this._hass.callWS({ type: "room_climate/room_history", room_id: id, hours });
       this._rh = { id, hours, at: Date.now(), points: d.points, pred: d.pred || {}, hum: await this._humHist(id, hours) };
-      const el = this._wrap && this._wrap.querySelector(".rc-hist");
+      const el = ((this._roomPop && this._modal) || this._wrap || document).querySelector(".rc-hist");
       if (el && this._sel === id) el.outerHTML = this._roomChart(this._data.rooms.find(r => r.id === id));
     } catch (e) { this._rh = { id, hours, at: Date.now(), points: [] }; }
     finally { this._rhBusy = false; }
@@ -1348,7 +1381,7 @@ class RoomMapCard extends HTMLElement {
   _closeSchedule() {
     if (this._modal) { this._modal.remove(); this._modal = null; }
     if (this._onKey) { document.removeEventListener("keydown", this._onKey); this._onKey = null; }
-    this._ed = null; this._diag = false;
+    this._ed = null; this._diag = false; this._roomPop = false;
     if (this._mTimer) { clearInterval(this._mTimer); this._mTimer = null; }
     this._mOpen = false;
   }
