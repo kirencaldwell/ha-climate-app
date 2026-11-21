@@ -9,6 +9,9 @@
  *               north: left                       # up | down | left | right: draws a north arrow
  *               admin: true                       # the admin view: unit control buttons, experiments, Diagnostics and
  *                                                 # the Model page (left out of the everyday view)
+ *               floors: all                       # every floor side by side (wraps on a phone) instead of floor tabs
+ *               compact: true                     # everyday view without the Heat pumps tiles / Most important rooms; a tapped room still opens
+ *               overlays: [{entity, kind: button|contact, floor, label}]   # read-only markers placed from the admin view
  * Rooms without a `unit` are monitor-only (shown in blue on the tech theme).
  */
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -63,6 +66,10 @@ const CSS = `
 .rc-map { flex: 1 1 340px; min-width: 0; }
 .rc-map svg { display: block; width: 100%; height: auto; max-height: 72vh; margin: 0 auto; touch-action: manipulation; }
 .rc-panel { flex: 1 1 320px; min-width: 0; }
+.rc-maps { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+.rc-maps .rc-map { flex: 1 1 260px; }
+.rc-all .rc-panel { flex: 1 1 100%; }
+.rc-all .rc-map svg { max-height: 60vh; }
 .rc-panel h3 { margin: 0 0 4px; font-size: 1.3em; }
 .rc-sub { color: var(--secondary-text-color, #9aa7b8); margin: 0 0 12px; }
 .rc-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 0; flex-wrap: wrap; }
@@ -235,10 +242,10 @@ class RoomMapCard extends HTMLElement {
     if (this._config.page === "openings") { this._opClick(e); return; }
     // overlays: placing one (admin), or tapping a button overlay (opens that entity's more-info dialog)
     if (this._ovPlace && e.target.closest("svg[data-map]") && !e.target.closest("[data-act]")) {
-      const svg = this._wrap.querySelector("svg[data-map]"), pt = svg.createSVGPoint();
+      const svg = e.target.closest("svg[data-map]"), pt = svg.createSVGPoint();
       pt.x = e.clientX; pt.y = e.clientY;
       const q = pt.matrixTransform(svg.getScreenCTM().inverse()), ent = this._ovPlace; this._ovPlace = null;
-      this._hass.callWS({ type: "room_climate/overlay_place", entity: ent, floor: this._floor, x: +q.x.toFixed(1), y: +q.y.toFixed(1) })
+      this._hass.callWS({ type: "room_climate/overlay_place", entity: ent, floor: +svg.dataset.fl, x: +q.x.toFixed(1), y: +q.y.toFixed(1) })
         .then(r => { this._data = r; this._render(); }).catch(err => this._fail("overlay_place", err));
       return;
     }
@@ -258,6 +265,7 @@ class RoomMapCard extends HTMLElement {
     if (!t || !this._data) return;
     if (["diag", "model", "ctl", "exp-start", "exp-stop"].includes(t.dataset.act) && !this._admin) return;  // admin view only
     if (t.dataset.act === "toggle-ops") { this._showOpenings = !this._showOpenings; if (!this._showOpenings) this._mainOp = null; this._render(); return; }
+    if (t.dataset.act === "close-room") { this._sel = null; this._render(); return; }
     if (t.dataset.act === "op-close") { this._mainOp = null; this._render(); return; }
     if (t.dataset.act === "ov-place" && this._admin) { this._ovPlace = this._ovPlace === t.dataset.e ? null : t.dataset.e; this._render(); return; }
     if (t.dataset.act === "ov-cancel") { this._ovPlace = null; this._render(); return; }
@@ -301,8 +309,30 @@ class RoomMapCard extends HTMLElement {
     if (this._config.page === "openings") { this._renderOpenings(); return; }
     const floors = [...new Set(d.rooms.map(r => r.floor || 1))].sort();
     if (!floors.includes(this._floor)) this._floor = floors[0];
-    const rooms = d.rooms.filter(r => (r.floor || 1) === this._floor);
-    let view = (this._config.floor_views || {})[this._floor];
+    const all = this._config.floors === "all" && floors.length > 1;  // every floor side by side, no tabs
+    const ovs = this._config.overlays || [];
+    const pos = d.overlay_pos || {};
+    const where = o => pos[o.entity] || (o.x != null ? { floor: o.floor, x: o.x, y: o.y } : null);
+    const svgs = (all ? floors : [this._floor]).map(f => this._floorSvg(f, ovs, where));
+    const tabs = !all && floors.length > 1 ? `<div class="rc-seg">${floors.map(f =>
+      `<button data-floor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
+    const chips = [];
+    if ((d.openings || []).length) chips.push(`<button data-act="toggle-ops" class="${this._showOpenings ? "on" : ""}">Doors &amp; registers</button>`);
+    if (this._admin) for (const o of ovs) chips.push(`<button data-act="ov-place" data-e="${o.entity}" class="${this._ovPlace === o.entity ? "on" : ""}">${where(o) ? "Move" : "Place"}: ${(o.label || o.entity).replace(/[<&]/g, "")}</button>`);
+    const bar = chips.length ? `<div class="rc-chips" style="margin:0 0 8px">${chips.join("")}</div>` : "";
+    const hint = this._ovPlace ? `<div class="rc-banner">Tap the plan where ${(((ovs.find(o => o.entity === this._ovPlace)) || {}).label || this._ovPlace).replace(/[<&]/g, "")} goes<button data-act="ov-cancel">Cancel</button></div>` : "";
+    const maps = all
+      ? `<div class="rc-maps">${svgs.map((m, i) => `<div class="rc-map"><div class="rc-sub" style="margin:0 0 4px;text-align:center">${this._floorName(floors[i])}</div>${m}</div>`).join("")}</div>`
+      : `<div class="rc-map">${svgs[0]}</div>`;
+    this._wrap.innerHTML = `${tabs}${bar}${hint}<div class="rc-main${all ? " rc-all" : ""}">${maps}<div class="rc-panel"></div></div>`;
+    this._panel();
+  }
+
+  // One floor's plan as an <svg> string: rooms, optional openings, unit markers (admin) and the overlays placed on this floor.
+  _floorSvg(F, ovs, where) {
+    const d = this._data;
+    const rooms = d.rooms.filter(r => (r.floor || 1) === F);
+    let view = (this._config.floor_views || {})[F];
     const [iw, ih] = this._config.image_size || [100, 100];
     if (!view && this._config.theme === "tech") view = this._fit(rooms);  // no geometry needed in the card config
     const vb = view ? [view.x, view.y, view.w, view.h] : [0, 0, 100, 100];
@@ -348,7 +378,7 @@ class RoomMapCard extends HTMLElement {
         <text x="${cx}" y="${cy + (small ? 3.5 : 5.5) * k}" text-anchor="middle" font-size="${(small ? 4 : 6) * k}" font-weight="600" fill="${col}">${txt}</text>
         ${small ? "" : `<text x="${cx}" y="${cy + 10 * k}" text-anchor="middle" font-size="${2.6 * k}" fill="${ink}" fill-opacity=".55">${ctl ? "TARGET " + live.target + "°" : "MONITOR ONLY"}${live.rh != null ? " · " + Math.round(live.rh) + "% RH" : ""}</text>`}</g>`;
     }).join("");
-    const unitMarks = !this._admin ? "" : (d.unit_markers || []).filter(m => m.floor === this._floor).map(m => {
+    const unitMarks = !this._admin ? "" : (d.unit_markers || []).filter(m => m.floor === F).map(m => {
       const ud = (d.units || []).find(x => x.id === m.unit) || {}, live = (d.units_live || {})[m.unit] || {};
       const c = live.mode === "heat" ? palette.hot : live.mode === "cool" ? palette.cold : "#3de0a5", w = Math.max(m.w, 12), h = Math.max(m.h, 12);
       return `<g data-unit="${m.unit}" style="cursor:pointer"><circle cx="${m.x}" cy="${m.y}" r="${Math.max(w, h) * 0.9}" fill="#000" fill-opacity="0.001"/>
@@ -359,29 +389,16 @@ class RoomMapCard extends HTMLElement {
     const compass = rot == null ? "" : `<g transform="translate(${vb[0] + vb[2] - 8 * k} ${vb[1] + 8 * k}) rotate(${rot})" fill="${ink}" opacity=".7">
         <path d="M0 -6 L2.5 2 L0 0.5 L-2.5 2 Z" transform="scale(${k})"/>
         <text y="${-7 * k}" text-anchor="middle" font-size="${3.5 * k}" transform="rotate(${-rot} 0 ${-7 * k})">N</text></g>`;
-    const tabs = floors.length > 1 ? `<div class="rc-seg">${floors.map(f =>
-      `<button data-floor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
-    const ovs = this._config.overlays || [];
-    const pos = d.overlay_pos || {};
-    const where = o => pos[o.entity] || (o.x != null ? { floor: o.floor, x: o.x, y: o.y } : null);
-    const chips = [];
-    if ((d.openings || []).length) chips.push(`<button data-act="toggle-ops" class="${this._showOpenings ? "on" : ""}">Doors &amp; registers</button>`);
-    if (this._admin) for (const o of ovs) chips.push(`<button data-act="ov-place" data-e="${o.entity}" class="${this._ovPlace === o.entity ? "on" : ""}">${where(o) ? "Move" : "Place"}: ${(o.label || o.entity).replace(/[<&]/g, "")}</button>`);
-    const bar = chips.length ? `<div class="rc-chips" style="margin:0 0 8px">${chips.join("")}</div>` : "";
-    const hint = this._ovPlace ? `<div class="rc-banner">Tap the plan where ${(((ovs.find(o => o.entity === this._ovPlace)) || {}).label || this._ovPlace).replace(/[<&]/g, "")} goes<button data-act="ov-cancel">Cancel</button></div>` : "";
-    this._wrap.innerHTML = `${tabs}${bar}${hint}<div class="rc-main">
-      <div class="rc-map"><svg viewBox="${vb.join(" ")}" data-map="1" style="${tech ? "border-radius:10px;" : ""}${this._ovPlace ? "cursor:crosshair" : ""}">${bg}${shapes}${this._showOpenings ? this._openingMarks(k) : ""}${unitMarks}${this._overlayMarks(ovs, where, k)}${compass}</svg></div>
-      <div class="rc-panel"></div></div>`;
-    this._panel();
+    return `<svg viewBox="${vb.join(" ")}" data-map="1" data-fl="${F}" style="${tech ? "border-radius:10px;" : ""}${this._ovPlace ? "cursor:crosshair" : ""}">${bg}${shapes}${this._showOpenings ? this._openingMarks(k, F) : ""}${unitMarks}${this._overlayMarks(ovs, where, k, F)}${compass}</svg>`;
   }
 
   // Overlays from the card config: read-only markers for other entities, drawn where the owner placed them. kind "contact" (a door
   // contact: open / closed) or "button" (e.g. the alarm panel: tap opens its keypad in HA's more-info dialog).
-  _overlayMarks(ovs, where, k) {
+  _overlayMarks(ovs, where, k, F) {
     const st = (this._hass || {}).states || {};
     return ovs.map(o => {
       const p = where(o);
-      if (!p || p.floor !== this._floor) return "";
+      if (!p || p.floor !== F) return "";
       const s = (st[o.entity] || {}).state, z = k;
       const label = String(o.label || o.entity).replace(/[<&"]/g, "");
       if (o.kind === "button") {
@@ -402,10 +419,10 @@ class RoomMapCard extends HTMLElement {
   }
 
   // The registers and doors from the Openings data on the main plan (the "Doors & registers" toggle): same colours as that page, tap to set.
-  _openingMarks(k) {
+  _openingMarks(k, F) {
     const d = this._data, LV = { register: { closed: 0, partial: .5, open: 1 }, door: { closed: 0, cracked: .15, open: .6, wide: 1 } };
     const col = l => l == null ? "#8a94a6" : l < .1 ? "#ff7a45" : l < .8 ? "#ffd166" : "#3de0a5";
-    return (d.openings || []).filter(o => o.floor === this._floor).map(o => {
+    return (d.openings || []).filter(o => o.floor === F).map(o => {
       const l = LV[o.kind][o.state], c = col(l), z = k, on = this._mainOp === o.id;
       const ring = on ? `<circle cx="${o.x}" cy="${o.y}" r="${6 * z}" fill="none" stroke="#fff" stroke-width="${.7 * z}"/>` : "";
       const icon = o.kind === "register"
@@ -600,7 +617,7 @@ class RoomMapCard extends HTMLElement {
     const ptoday = todayOf(room.priority_schedule, e => `w${fmtW(e.priority)}`);
     const pnow = live.priority ?? room.priority;
     const ctlU = ((this._data.units_live || {})[room.unit] || {}).control;
-    el.innerHTML = `<h3>${room.name}</h3>
+    el.innerHTML = `${this._config.compact ? `<button data-act="close-room" style="float:right">Close</button>` : ""}<h3>${room.name}</h3>
       <p class="rc-sub">${reading}${live.rh != null ? ` · ${Math.round(live.rh)}% RH${live.dew != null ? ` (dew point ${Math.round(live.dew)}°)` : ""}` : ""}</p>
       <div class="rc-row" style="margin:4px 0 2px"><span class="rc-lbl">Target now</span><b style="font-size:1.6em">${live.target}°</b></div>
       <p class="rc-sub" style="margin:0 0 6px">${isOurs(ctlU)
@@ -775,6 +792,7 @@ class RoomMapCard extends HTMLElement {
           <div class="rc-chips" style="display:flex;gap:6px">${[4, 6, 8, 10].map(h => `<button data-act="exp-start" data-h="${h}" style="flex:1">${h} h</button>`).join("")}</div></div>`;
     // An experiment shows on the everyday view too (rooms may be off target), just without the controls.
     const expUser = ex ? `<div class="rc-sect"><p class="rc-sub" style="margin:4px 0"><b>Learning run</b> until ${hm(ex.end)}: rooms may be a few degrees off.</p></div>` : "";
+    if (this._config.compact && !this._admin) return `${this._statusLine()}${expUser}<p class="rc-sub" style="margin:12px 0">Tap a room to adjust it.</p>`;
     return `${this._statusLine()}${this._admin ? this._adminTop() : ""}<h3>Heat pumps</h3>${house}<div class="rc-units">${tiles}</div>
       ${this._admin ? this._plannerHtml() + this._metricsHtml() : ""}
       ${this._admin ? expSect : expUser}
