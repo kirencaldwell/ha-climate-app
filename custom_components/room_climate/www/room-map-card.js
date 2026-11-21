@@ -296,6 +296,7 @@ class RoomMapCard extends HTMLElement {
     switch (t.dataset.act) {
       case "def": this._set({ default_temp: room.default_temp + d }); break;
       case "hold-step": this._holdTemp = (this._holdTemp ?? room.hold_temp ?? live.target) + d; this._panel(); break;
+      case "rpred": this._rhPred = t.dataset.v; this._panel(); break;
       case "rh": this._rhHours = +t.dataset.h; this._roomHist(room.id, true); this._panel(); break;
       case "prio": this._set({ priority: +t.dataset.v }); break;
       case "hold": this._set({ hold_temp: this._holdTemp ?? room.hold_temp ?? live.target, hold_hours: +t.dataset.h }); break;
@@ -653,7 +654,7 @@ class RoomMapCard extends HTMLElement {
     this._rhBusy = true;
     try {
       const d = await this._hass.callWS({ type: "room_climate/room_history", room_id: id, hours });
-      this._rh = { id, hours, at: Date.now(), points: d.points, hum: await this._humHist(id, hours) };
+      this._rh = { id, hours, at: Date.now(), points: d.points, pred: d.pred || {}, hum: await this._humHist(id, hours) };
       const el = this._wrap && this._wrap.querySelector(".rc-hist");
       if (el && this._sel === id) el.outerHTML = this._roomChart(this._data.rooms.find(r => r.id === id));
     } catch (e) { this._rh = { id, hours, at: Date.now(), points: [] }; }
@@ -722,6 +723,8 @@ class RoomMapCard extends HTMLElement {
       const d = new Date(t), lbl = tick >= 24 ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()] : `${d.getHours() % 12 || 12}${d.getHours() < 12 ? "a" : "p"}`;
       g += `<text x="${x(t)}" y="${H - 5}" text-anchor="middle" font-size="10" fill="currentColor" fill-opacity=".6">${lbl}</text>`;
     }
+    const prd = (c.pred && c.pred[this._rhPred || "60"]) || [];
+    const predPath = prd.filter(p => Date.parse(p[0]) >= t0).map((p, i) => `${i ? "L" : "M"}${x(Date.parse(p[0])).toFixed(1)},${y(Math.max(lo, Math.min(hi, p[1]))).toFixed(1)}`).join("");
     const ok = pts.filter(p => p[1] != null && p[2] != null);
     const seg = (f) => ok.map((p, i) => `${i ? "L" : "M"}${x(Date.parse(p[0])).toFixed(1)},${y(f(p)).toFixed(1)}`).join("");
     const stepPath = ok.map((p, i) => `${i ? `H${x(Date.parse(p[0])).toFixed(1)}V` : "M"}${i ? "" : x(Date.parse(p[0])).toFixed(1) + ","}${y(p[2]).toFixed(1)}`).join("");
@@ -730,8 +733,10 @@ class RoomMapCard extends HTMLElement {
     const last = ok[ok.length - 1];
     return `<div class="rc-hist">${head}<svg viewBox="0 0 ${W} ${H}" style="width:100%;display:block">${g}${band}` +
       `<path d="${stepPath}" fill="none" stroke="currentColor" stroke-opacity=".7" stroke-width="1.5" stroke-dasharray="4 3"/>` +
+      (predPath ? `<path d="${predPath}" fill="none" stroke="#ffb454" stroke-width="1.6" stroke-linejoin="round"/>` : "") +
       `<path d="${seg(p => p[1])}" fill="none" stroke="var(--primary-color, #03a9f4)" stroke-width="2" stroke-linejoin="round"/></svg>` +
-      `<div class="rc-legend"><span><b style="color:var(--primary-color, #03a9f4)">━</b> temperature ${last ? last[1] + "°" : ""}</span><span>┅ target ${last ? last[2] + "°" : ""}</span><span>▒ allowed error</span></div>${this._humChart(c.hum, hours)}</div>`;
+      `<div class="rc-legend"><span><b style="color:var(--primary-color, #03a9f4)">━</b> temperature ${last ? last[1] + "°" : ""}</span><span>┅ target ${last ? last[2] + "°" : ""}</span><span>▒ allowed error</span>${predPath ? `<span><b style="color:#ffb454">━</b> model's guess ${this._rhPred === "120" ? "2 h" : "1 h"} earlier</span>` : ""}</div>
+      ${prd.length ? `<div class="rc-chips" style="margin:4px 0"><button data-act="rpred" data-v="60" class="${this._rhPred !== "120" ? "on" : ""}">1 h ahead</button><button data-act="rpred" data-v="120" class="${this._rhPred === "120" ? "on" : ""}">2 h ahead</button></div>` : ""}${this._humChart(c.hum, hours)}</div>`;
   }
 
   // A unit's real state (from HA) next to what the controller wants. Shared by the home panel and diagnostics.

@@ -79,6 +79,7 @@ class ShadowPlanner:
         self.ps = ps or optimizer.PlanSettings()
         self.plan_every, self.track_every = timedelta(seconds=plan_every_s), timedelta(seconds=track_every_s)
         self.keep = timedelta(hours=keep_h)
+        self.points_keep = max(self.keep, timedelta(hours=72))  # the room chart's longest view
         self.house = core.HouseState()
         self.sent: dict = {}  # unit id -> (Command, when): what it would have sent
         self.decision: dict = {}  # unit id -> {"mode", "setpoint"}
@@ -419,7 +420,7 @@ class ShadowPlanner:
                     self.errors.append((now, rid, h, pred - real, rec["start"][rid] - real))
                     self.points.append((now, rid, h, round(pred, 2)))
                     self._ml_log(rec, rid, h, pred, real, now)
-        while self.points and now - self.points[0][0] > self.keep:
+        while self.points and now - self.points[0][0] > self.points_keep:
             self.points.popleft()
 
     def due(self, now: datetime) -> bool:
@@ -643,7 +644,7 @@ class ShadowPlanner:
         if not d or d.get("version") != 1:
             return
         p = datetime.fromisoformat
-        keep_since = chart_since = now - self.keep
+        keep_since, chart_since = now - self.keep, now - self.points_keep
         self.errors = deque((p(t), r, h, e, b) for t, r, h, e, b in d.get("errors", []) if p(t) >= keep_since)
         self.points = deque((p(t), r, h, v) for t, r, h, v in d.get("points", []) if p(t) >= chart_since)
         self.readings = {r: deque((p(t), v) for t, v in pts if p(t) >= keep_since) for r, pts in d.get("readings", {}).items()}

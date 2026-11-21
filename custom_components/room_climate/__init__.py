@@ -341,7 +341,12 @@ class Manager:
         """One room's reading against its target (and weight) from the 5-minute samples: [[iso, temp, target, weight], ...]."""
         since = (dt_util.now() - timedelta(hours=hours)).isoformat()
         pts = [[x["t"], *x["r"][room_id]] for x in self.hist5 if x["t"] >= since and room_id in x["r"]]
-        return {"room": room_id, "hours": hours, "points": pts}
+        # What the model predicted for this room, as of 1 h and 2 h before each moment: [[iso time, F], ...] (only from when it was logged)
+        pred = {"60": [], "120": []}
+        for t, rid, h, v in self.shadow.points:
+            if rid == room_id and str(h) in pred and t.isoformat() >= since:
+                pred[str(h)].append([t.isoformat(), v])
+        return {"room": room_id, "hours": hours, "points": pts, "pred": pred}
 
     def model_history(self, hours: float) -> dict:
         """What the Model page's charts plot: samples, comfort score (actual vs the model's prediction), prediction

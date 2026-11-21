@@ -148,7 +148,11 @@ def test_scores_survive_a_restart():
     assert not back.records  # in-progress predictions aren't restored
     later = mpc.ShadowPlanner()
     later.load_state(saved, sim.now + timedelta(hours=25))  # a day later: all of it has aged out
-    assert not later.errors and not later.points and all(not d for d in later.readings.values())
+    assert not later.errors and all(not d for d in later.readings.values())
+    assert later.points  # the chart's predictions are kept 72 h
+    much_later = mpc.ShadowPlanner()
+    much_later.load_state(saved, sim.now + timedelta(hours=73))
+    assert not much_later.points
     later.load_state({"version": 99}, sim.now)  # an unknown format is ignored, not an error
 
 
