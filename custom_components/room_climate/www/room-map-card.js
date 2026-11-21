@@ -10,6 +10,7 @@
  *               admin: true                       # the admin view: unit control buttons, experiments, Diagnostics and
  *                                                 # the Model page (left out of the everyday view)
  *               floors: all                       # every floor side by side (wraps on a phone) instead of floor tabs
+ *               floor_order: [2, 3, 1]            # order for floors: all (default ascending by floor number)
  *               compact: true                     # everyday view without the Heat pumps tiles / Most important rooms; a tapped room still opens
  *               overlays: [{entity, kind: button|contact, floor, label}]   # read-only markers placed from the admin view
  * Rooms without a `unit` are monitor-only (shown in blue on the tech theme).
@@ -313,7 +314,9 @@ class RoomMapCard extends HTMLElement {
     const ovs = this._config.overlays || [];
     const pos = d.overlay_pos || {};
     const where = o => pos[o.entity] || (o.x != null ? { floor: o.floor, x: o.x, y: o.y } : null);
-    const svgs = (all ? floors : [this._floor]).map(f => this._floorSvg(f, ovs, where));
+    // side-by-side order: config `floor_order` (e.g. [2, 3, 1]: first floor, second floor, basement last); floors not listed follow
+    const order = all ? [...(this._config.floor_order || []).filter(f => floors.includes(f)), ...floors.filter(f => !(this._config.floor_order || []).includes(f))] : [this._floor];
+    const svgs = order.map(f => this._floorSvg(f, ovs, where));
     const tabs = !all && floors.length > 1 ? `<div class="rc-seg">${floors.map(f =>
       `<button data-floor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
     const chips = [];
@@ -322,7 +325,7 @@ class RoomMapCard extends HTMLElement {
     const bar = chips.length ? `<div class="rc-chips" style="margin:0 0 8px">${chips.join("")}</div>` : "";
     const hint = this._ovPlace ? `<div class="rc-banner">Tap the plan where ${(((ovs.find(o => o.entity === this._ovPlace)) || {}).label || this._ovPlace).replace(/[<&]/g, "")} goes<button data-act="ov-cancel">Cancel</button></div>` : "";
     const maps = all
-      ? `<div class="rc-maps">${svgs.map((m, i) => `<div class="rc-map"><div class="rc-sub" style="margin:0 0 4px;text-align:center">${this._floorName(floors[i])}</div>${m}</div>`).join("")}</div>`
+      ? `<div class="rc-maps">${svgs.map((m, i) => `<div class="rc-map"><div class="rc-sub" style="margin:0 0 4px;text-align:center">${this._floorName(order[i])}</div>${m}</div>`).join("")}</div>`
       : `<div class="rc-map">${svgs[0]}</div>`;
     this._wrap.innerHTML = `${tabs}${bar}${hint}<div class="rc-main${all ? " rc-all" : ""}">${maps}<div class="rc-panel"></div></div>`;
     this._panel();
