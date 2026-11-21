@@ -1614,6 +1614,24 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         await mgr.async_save()
         connection.send_result(msg["id"], mgr.snapshot())
 
+    @websocket_api.websocket_command({
+        "type": f"{DOMAIN}/overlay_place", vol.Required("entity"): vol.Match(r"^[a-z_]+\.[a-z0-9_]+$"), vol.Required("floor"): int,
+        vol.Required("x"): vol.Coerce(float), vol.Required("y"): vol.Coerce(float)})
+    @websocket_api.async_response
+    async def ws_overlay_place(hass, connection, msg):
+        """Where an overlay (the alarm keypad button, an exterior door contact: card config `overlays`) sits on the floor plan.
+        Stored only for the card to draw: nothing here feeds the model, the openings or the log."""
+        mgr.data.setdefault("overlay_pos", {})[msg["entity"]] = {"floor": msg["floor"], "x": round(msg["x"], 1), "y": round(msg["y"], 1)}
+        await mgr.async_save()
+        connection.send_result(msg["id"], mgr.snapshot())
+
+    @websocket_api.websocket_command({"type": f"{DOMAIN}/overlay_unplace", vol.Required("entity"): str})
+    @websocket_api.async_response
+    async def ws_overlay_unplace(hass, connection, msg):
+        mgr.data.setdefault("overlay_pos", {}).pop(msg["entity"], None)
+        await mgr.async_save()
+        connection.send_result(msg["id"], mgr.snapshot())
+
     @websocket_api.websocket_command({"type": f"{DOMAIN}/metrics", vol.Optional("days", default=7): vol.All(int, vol.Range(min=1, max=30))})
     @websocket_api.async_response
     async def ws_metrics(hass, connection, msg):
@@ -1746,7 +1764,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         hass.async_create_task(mgr.async_fit())
         connection.send_result(msg["id"], {"started": True})
 
-    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_opening_save, ws_opening_confirm, ws_opening_delete, ws_metrics, ws_note_add, ws_note_remove, ws_fit_model, ws_reload_ml,
+    for fn in (ws_get, ws_set_room, ws_set_control, ws_set_settings, ws_log_client, ws_model, ws_model_history, ws_room_history, ws_opening_save, ws_opening_confirm, ws_opening_delete, ws_metrics, ws_note_add, ws_note_remove, ws_overlay_place, ws_overlay_unplace, ws_fit_model, ws_reload_ml,
                ws_experiment_start, ws_experiment_stop):
         websocket_api.async_register_command(hass, fn)
 

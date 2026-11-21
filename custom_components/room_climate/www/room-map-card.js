@@ -156,6 +156,11 @@ class RoomMapCard extends HTMLElement {
   }
   set hass(hass) {
     this._hass = hass;
+    const ov = this._config && this._config.overlays;
+    if (ov && ov.length && this._data && !this._modal && !this._ovPlace && this._config.page !== "openings") {
+      const sig = ov.map(o => (hass.states[o.entity] || {}).state).join("|");
+      if (sig !== this._ovSig) { this._ovSig = sig; this._render(); }
+    }
     if (!this._data && !this._loading) this._refresh();
     const now = Date.now();
     if (!this._last || now - this._last > 15000) { this._last = now; this._refresh(); }
@@ -228,11 +233,34 @@ class RoomMapCard extends HTMLElement {
 
   _click(e) {
     if (this._config.page === "openings") { this._opClick(e); return; }
+    // overlays: placing one (admin), or tapping a button overlay (opens that entity's more-info dialog)
+    if (this._ovPlace && e.target.closest("svg[data-map]") && !e.target.closest("[data-act]")) {
+      const svg = this._wrap.querySelector("svg[data-map]"), pt = svg.createSVGPoint();
+      pt.x = e.clientX; pt.y = e.clientY;
+      const q = pt.matrixTransform(svg.getScreenCTM().inverse()), ent = this._ovPlace; this._ovPlace = null;
+      this._hass.callWS({ type: "room_climate/overlay_place", entity: ent, floor: this._floor, x: +q.x.toFixed(1), y: +q.y.toFixed(1) })
+        .then(r => { this._data = r; this._render(); }).catch(err => this._fail("overlay_place", err));
+      return;
+    }
+    const ovt = e.target.closest("[data-ov]");
+    if (ovt) { this.dispatchEvent(new CustomEvent("hass-more-info", { bubbles: true, composed: true, detail: { entityId: ovt.dataset.ov } })); return; }
+    const opm = e.target.closest("[data-opmk]");
+    if (opm) { this._mainOp = opm.dataset.opmk; this._sel = null; this._panel(); this._render(); return; }
+    const ops = e.target.closest("[data-opset]");
+    if (ops && this._data) {
+      const o = (this._data.openings || []).find(x => x.id === ops.dataset.opset);
+      if (o) { const { changed, ...rest } = o; this._hass.callWS({ type: "room_climate/opening_save", item: { ...rest, state: ops.dataset.st } }).then(r => { this._data = r; this._render(); }).catch(err => this._fail("opening_save", err)); }
+      return;
+    }
     const ut = e.target.closest("[data-unit]");
     if (ut && this._admin) { this._openUnit(ut.dataset.unit); return; }
     const t = e.target.closest("[data-act],[data-room],[data-floor]");
     if (!t || !this._data) return;
     if (["diag", "model", "ctl", "exp-start", "exp-stop"].includes(t.dataset.act) && !this._admin) return;  // admin view only
+    if (t.dataset.act === "toggle-ops") { this._showOpenings = !this._showOpenings; if (!this._showOpenings) this._mainOp = null; this._render(); return; }
+    if (t.dataset.act === "op-close") { this._mainOp = null; this._render(); return; }
+    if (t.dataset.act === "ov-place" && this._admin) { this._ovPlace = this._ovPlace === t.dataset.e ? null : t.dataset.e; this._render(); return; }
+    if (t.dataset.act === "ov-cancel") { this._ovPlace = null; this._render(); return; }
     if (t.dataset.act === "diag") { this._openDiag(); return; }
     if (t.dataset.act === "model") { this._openModel(); return; }
     if (t.dataset.act === "ctl") { this._setControl(t.dataset.u, t.dataset.c); return; }
@@ -333,10 +361,68 @@ class RoomMapCard extends HTMLElement {
         <text y="${-7 * k}" text-anchor="middle" font-size="${3.5 * k}" transform="rotate(${-rot} 0 ${-7 * k})">N</text></g>`;
     const tabs = floors.length > 1 ? `<div class="rc-seg">${floors.map(f =>
       `<button data-floor="${f}" class="${f === this._floor ? "on" : ""}">${this._floorName(f)}</button>`).join("")}</div>` : "";
-    this._wrap.innerHTML = `${tabs}<div class="rc-main">
-      <div class="rc-map"><svg viewBox="${vb.join(" ")}" style="${tech ? "border-radius:10px" : ""}">${bg}${shapes}${unitMarks}${compass}</svg></div>
+    const ovs = this._config.overlays || [];
+    const pos = d.overlay_pos || {};
+    const where = o => pos[o.entity] || (o.x != null ? { floor: o.floor, x: o.x, y: o.y } : null);
+    const chips = [];
+    if ((d.openings || []).length) chips.push(`<button data-act="toggle-ops" class="${this._showOpenings ? "on" : ""}">Doors &amp; registers</button>`);
+    if (this._admin) for (const o of ovs) chips.push(`<button data-act="ov-place" data-e="${o.entity}" class="${this._ovPlace === o.entity ? "on" : ""}">${where(o) ? "Move" : "Place"}: ${(o.label || o.entity).replace(/[<&]/g, "")}</button>`);
+    const bar = chips.length ? `<div class="rc-chips" style="margin:0 0 8px">${chips.join("")}</div>` : "";
+    const hint = this._ovPlace ? `<div class="rc-banner">Tap the plan where ${(((ovs.find(o => o.entity === this._ovPlace)) || {}).label || this._ovPlace).replace(/[<&]/g, "")} goes<button data-act="ov-cancel">Cancel</button></div>` : "";
+    this._wrap.innerHTML = `${tabs}${bar}${hint}<div class="rc-main">
+      <div class="rc-map"><svg viewBox="${vb.join(" ")}" data-map="1" style="${tech ? "border-radius:10px;" : ""}${this._ovPlace ? "cursor:crosshair" : ""}">${bg}${shapes}${this._showOpenings ? this._openingMarks(k) : ""}${unitMarks}${this._overlayMarks(ovs, where, k)}${compass}</svg></div>
       <div class="rc-panel"></div></div>`;
     this._panel();
+  }
+
+  // Overlays from the card config: read-only markers for other entities, drawn where the owner placed them. kind "contact" (a door
+  // contact: open / closed) or "button" (e.g. the alarm panel: tap opens its keypad in HA's more-info dialog).
+  _overlayMarks(ovs, where, k) {
+    const st = (this._hass || {}).states || {};
+    return ovs.map(o => {
+      const p = where(o);
+      if (!p || p.floor !== this._floor) return "";
+      const s = (st[o.entity] || {}).state, z = k;
+      const label = String(o.label || o.entity).replace(/[<&"]/g, "");
+      if (o.kind === "button") {
+        const c = s === "triggered" ? "#ff4d4f" : s === "arming" || s === "pending" ? "#ffd166" : /^armed/.test(s || "") ? "#5db3ff" : s === "disarmed" ? "#3de0a5" : "#8a94a6";
+        const armed = /^armed|^arming|^pending|^triggered/.test(s || "");
+        const pulse = s === "triggered" ? `<animate attributeName="opacity" values="1;.35;1" dur="0.9s" repeatCount="indefinite"/>` : "";
+        return `<g data-ov="${o.entity}" style="cursor:pointer"><title>${label}: ${s || "unknown"}</title><circle cx="${p.x}" cy="${p.y}" r="${8 * z}" fill="#000" fill-opacity="0.001"/>
+          <circle cx="${p.x}" cy="${p.y}" r="${5.4 * z}" fill="${c}" fill-opacity=".2" stroke="${c}" stroke-width="${1.1 * z}">${pulse}</circle>
+          <rect x="${p.x - 2.6 * z}" y="${p.y - 0.2 * z}" width="${5.2 * z}" height="${3.6 * z}" rx="${.6 * z}" fill="${c}"/>
+          <path d="M${p.x - 1.7 * z} ${p.y - 0.2 * z}V${p.y - 1.8 * z}a${1.7 * z} ${1.7 * z} 0 0 1 ${3.4 * z} 0${armed ? `V${p.y - 0.2 * z}` : `V${p.y - 1.2 * z}`}" fill="none" stroke="${c}" stroke-width="${.9 * z}" stroke-linecap="round"/></g>`;
+      }
+      const open = s === "on", gone = !s || s === "unavailable" || s === "unknown";
+      const c = gone ? "#8a94a6" : open ? "#ff8a5c" : "#3de0a5";
+      const leaf = open ? `<line x1="${p.x - 2 * z}" y1="${p.y + 3.4 * z}" x2="${p.x - 2 * z + 4.6 * z * Math.cos(1.2)}" y2="${p.y + 3.4 * z - 4.6 * z * Math.sin(1.2)}" stroke="${c}" stroke-width="${1.2 * z}" stroke-linecap="round"/>`
+        : `<line x1="${p.x - 2.6 * z}" y1="${p.y + 3.4 * z}" x2="${p.x + 2.6 * z}" y2="${p.y + 3.4 * z}" stroke="${c}" stroke-width="${1.4 * z}" stroke-linecap="round"/>`;
+      return `<g><title>${label}: ${gone ? "no reading" : open ? "open" : "closed"}</title><circle cx="${p.x}" cy="${p.y}" r="${4.8 * z}" fill="${c}" fill-opacity=".14" stroke="${c}" stroke-width="${.6 * z}"/>${leaf}</g>`;
+    }).join("");
+  }
+
+  // The registers and doors from the Openings data on the main plan (the "Doors & registers" toggle): same colours as that page, tap to set.
+  _openingMarks(k) {
+    const d = this._data, LV = { register: { closed: 0, partial: .5, open: 1 }, door: { closed: 0, cracked: .15, open: .6, wide: 1 } };
+    const col = l => l == null ? "#8a94a6" : l < .1 ? "#ff7a45" : l < .8 ? "#ffd166" : "#3de0a5";
+    return (d.openings || []).filter(o => o.floor === this._floor).map(o => {
+      const l = LV[o.kind][o.state], c = col(l), z = k, on = this._mainOp === o.id;
+      const ring = on ? `<circle cx="${o.x}" cy="${o.y}" r="${6 * z}" fill="none" stroke="#fff" stroke-width="${.7 * z}"/>` : "";
+      const icon = o.kind === "register"
+        ? `<rect x="${o.x - 2.4 * z}" y="${o.y - 2.4 * z}" width="${4.8 * z}" height="${4.8 * z}" rx="${.6 * z}" fill="${c}" fill-opacity=".25" stroke="${c}" stroke-width="${.7 * z}"/>`
+        : `<line x1="${o.x}" y1="${o.y}" x2="${o.x + 5 * z * Math.cos((l == null ? .5 : l) * 1.4)}" y2="${o.y - 5 * z * Math.sin((l == null ? .5 : l) * 1.4)}" stroke="${c}" stroke-width="${1.3 * z}" stroke-linecap="round"/><circle cx="${o.x}" cy="${o.y}" r="${.9 * z}" fill="${c}"/>`;
+      return `<g data-opmk="${o.id}" style="cursor:pointer"><circle cx="${o.x}" cy="${o.y}" r="${6.5 * z}" fill="#000" fill-opacity="0.001"/>${ring}${icon}</g>`;
+    }).join("");
+  }
+
+  // The small editor for a register or door picked on the main plan.
+  _mainOpHtml() {
+    const o = (this._data.openings || []).find(x => x.id === this._mainOp);
+    if (!o) return "";
+    const LBL = { register: { closed: "Closed", partial: "Half open", open: "Fully open" }, door: { closed: "Closed", cracked: "Cracked", open: "Open", wide: "Wide open" } };
+    const btns = Object.keys(LBL[o.kind]).map(st => `<button data-opset="${o.id}" data-st="${st}" class="${o.state === st ? "on" : ""}" style="min-height:52px">${LBL[o.kind][st]}</button>`).join("");
+    return `<div class="rc-sect" style="border:1px solid var(--divider-color,#ffffff30);border-radius:10px;padding:8px 10px;margin-bottom:10px"><h4>${o.kind === "register" ? "Register" : "Door"}: ${o.name.replace(/[<&]/g, "")}</h4>
+      <div class="rc-seg" style="margin:6px 0">${btns}</div><button data-act="op-close" style="width:100%">Done</button></div>`;
   }
 
   // ---- Openings page (card config `page: openings`): the registers and doors, their positions and how open each one is ----
@@ -495,7 +581,8 @@ class RoomMapCard extends HTMLElement {
   _panel() {
     const room = this._data.rooms.find(r => r.id === this._sel);
     const el = this._wrap.querySelector(".rc-panel");
-    if (!room) { el.innerHTML = this._overview(); return; }
+    if (this._mainOp) { const h = this._mainOpHtml(); if (h) { el.innerHTML = h + (room ? "" : this._overview()); if (!room) return; } }
+    if (!room) { el.innerHTML = (this._mainOp ? this._mainOpHtml() : "") + this._overview(); return; }
     const live = this._data.live[room.id] || {};
     const reading = live.temp == null ? "No sensor reading" : live.temp.toFixed(1) + "°F";
     if (!room.unit) {
