@@ -38,6 +38,12 @@ def test_no_schedule_uses_default():
     assert core.scheduled_temp(Room("r", "R", "u", default_temp=67), MON) == 67
 
 
+def test_hold_priority_overrides_weight_until_expiry():
+    r = sched_room(hold_priority=7, hold_until=MON + timedelta(hours=1))
+    assert core.room_priority(r, MON) == 7
+    assert core.room_priority(r, MON + timedelta(hours=2)) == core.room_priority(sched_room(), MON + timedelta(hours=2))
+
+
 def test_hold_overrides_until_expiry():
     r = sched_room(hold_temp=72, hold_until=MON + timedelta(hours=1))
     assert core.target_temp(r, MON) == 72

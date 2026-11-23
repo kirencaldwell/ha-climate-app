@@ -52,6 +52,7 @@ class Room:
     priority_schedule: list[PriorityEntry] = field(default_factory=list)  # e.g. bedrooms low during the day
     hold_temp: Optional[float] = None  # manual override ...
     hold_until: Optional[datetime] = None  # ... until this time (None = until next schedule change)
+    hold_priority: Optional[float] = None  # a manual weight, held for the same time as hold_temp
     floor: int = 1
     shape: dict = field(default_factory=dict)  # {"x","y","w","h"} on a 0-100 map grid
 
@@ -251,10 +252,14 @@ def elapsed(later: datetime, earlier: datetime) -> float:
     return later.timestamp() - earlier.timestamp()
 
 
+def _hold_live(room: Room, now: datetime) -> bool:
+    return room.hold_until is None or now < room.hold_until
+
+
 def _hold_active(room: Room, now: datetime) -> bool:
     if room.hold_temp is None:
         return False
-    return room.hold_until is None or now < room.hold_until
+    return _hold_live(room, now)
 
 
 SCHEDULE_RAMP_S = 3600  # glide into each schedule change over this long instead of stepping
@@ -331,8 +336,11 @@ def house_error(rooms: list, temps: dict, now: datetime, settings: "Settings" = 
 def room_priority(room: Room, now: datetime) -> int:
     """Priority (weight) in force now: the latest priority-schedule entry at or before `now` (looking back up to a week),
     else the room's fixed priority. Clamped to MIN_PRIORITY..MAX_PRIORITY."""
-    past = [x for x in _entry_times(room, now, range(8), room.priority_schedule, lambda e: e.priority) if x[0] <= now]
-    p = max(past)[1] if past else room.priority
+    if room.hold_priority is not None and _hold_live(room, now):
+        p = room.hold_priority
+    else:
+        past = [x for x in _entry_times(room, now, range(8), room.priority_schedule, lambda e: e.priority) if x[0] <= now]
+        p = max(past)[1] if past else room.priority
     p = max(MIN_PRIORITY, min(MAX_PRIORITY, float(p)))
     return int(p) if p == int(p) else p  # whole weights stay ints, as when they were priorities 1-5
 

@@ -82,6 +82,7 @@ def _room_from_dict(d: dict) -> core.Room:
                            for e in d.get("priority_schedule", [])],
         hold_temp=d.get("hold_temp"),
         hold_until=dt_util.parse_datetime(d["hold_until"]) if d.get("hold_until") else None,
+        hold_priority=None if d.get("hold_priority") is None else _weight(d["hold_priority"]),
         floor=int(d.get("floor", 1)), shape=d.get("shape", {}))
 
 
@@ -1554,6 +1555,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             vol.Required("start"): vol.Match(r"^\d{2}:\d{2}$"),
             vol.Required("priority"): vol.All(vol.Coerce(float), vol.Range(min=core.MIN_PRIORITY, max=core.MAX_PRIORITY))})],
         vol.Optional("hold_temp"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("hold_priority"): vol.Any(None, vol.All(vol.Coerce(float), vol.Range(min=core.MIN_PRIORITY, max=core.MAX_PRIORITY))),
         vol.Optional("hold_hours"): vol.Any(None, vol.Coerce(float)),
         vol.Optional("sensor"): vol.Any(None, vol.Match(r"^(sensor|climate)\.[a-z0-9_]+$")),
         vol.Optional("fit_since"): vol.Any(None, str),  # learn from this room's readings from then on (sensor moved)
@@ -1575,14 +1577,14 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             room["fit_since"] = dt_util.now().isoformat()  # a different sensor: learn from its readings only
             mgr.last_good.pop(room["id"], None)  # a different sensor: don't bridge from the old one's reading
             mgr.hist.pop(room["id"], None)
-        for k in ("priority", "default_temp", "schedule", "priority_schedule", "hold_temp", "sensor", "fit_since"):
+        for k in ("priority", "default_temp", "schedule", "priority_schedule", "hold_temp", "hold_priority", "sensor", "fit_since"):
             if k in msg:
                 room[k] = msg[k]
         if "hold_hours" in msg:
             h = msg["hold_hours"]
             room["hold_until"] = None if not h else (dt_util.utcnow() + timedelta(hours=h)).isoformat()  # real hours, even across DST
-        if msg.get("hold_temp", 1) is None:
-            room.pop("hold_until", None)
+        if ("hold_temp" in msg or "hold_priority" in msg) and room.get("hold_temp") is None and room.get("hold_priority") is None:
+            room.pop("hold_until", None)  # nothing held any more
         await mgr.async_save()
         await mgr.async_tick()
         connection.send_result(msg["id"], mgr.snapshot())

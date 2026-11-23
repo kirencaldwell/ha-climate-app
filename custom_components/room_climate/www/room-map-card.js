@@ -28,9 +28,9 @@ const fmtW = w => `${+(+w).toFixed(2)}`;
 const pipsOn = w => Math.min(5, Math.ceil(Math.log2(w + 1)));
 const pipsHtml = w => `<span class="rc-pips" title="Weight ${fmtW(w)} · allowed error ±${allowable(w)}°">${[1, 2, 3, 4, 5].map(n => `<b class="${n <= pipsOn(w) ? "on" : ""}"></b>`).join("")}</span>`;
 const SCHED_KINDS = {
-  temp: { key: "schedule", field: "temp", title: "Schedule", lo: TEMP_MIN, hi: TEMP_MAX, grid: 5, fmt: v => `${v}°`, def: r => r.default_temp,
+  temp: { key: "schedule", field: "temp", title: "Schedule", color: "#3fa9ff", lo: TEMP_MIN, hi: TEMP_MAX, grid: 5, fmt: v => `${v}°`, def: r => r.default_temp,
           hint: "The temperature holds until the next point" },
-  prio: { key: "priority_schedule", field: "priority", title: "Weight schedule", lo: 0, hi: LADDER.length - 1, grid: 1, fmt: v => `w${LADDER[v]}`, def: r => nearestRung(r.priority),
+  prio: { key: "priority_schedule", field: "priority", title: "Weight schedule", color: "#b692f6", lo: 0, hi: LADDER.length - 1, grid: 1, fmt: v => `w${LADDER[v]}`, def: r => nearestRung(r.priority),
           enc: w => nearestRung(w), dec: v => LADDER[v],
           hint: "The weight holds until the next point. A room of weight w is allowed about 1/√w °F of error (1 → 1°, 4 → 0.5°, 25 → 0.2°); the planner trades errors between rooms at that rate" },
 };
@@ -71,6 +71,10 @@ const CSS = `
 .rc-maps { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
 .rc-maps .rc-map { flex: 1 1 260px; }
 .rc-all .rc-panel { flex: 1 1 100%; }
+.rc-dial { width: 100%; max-width: 340px; display: block; margin: 0 auto; touch-action: none; user-select: none; -webkit-user-select: none; }
+.rc-dkey { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin: 2px 0 6px; }
+.rc-dkey .rc-step { background: #ffffff0d; border-radius: 12px; padding: 2px 4px; }
+.rc-dkey .rc-step span { min-width: 3.4em; text-align: center; }
 .rc-all .rc-map svg { max-height: 60vh; }
 .rc-panel h3 { margin: 0 0 4px; font-size: 1.3em; }
 .rc-sub { color: var(--secondary-text-color, #9aa7b8); margin: 0 0 12px; }
@@ -185,7 +189,7 @@ class RoomMapCard extends HTMLElement {
       if (!this._modal && !this._opEditing) this._render();  // don't rebuild the page under an open editor (or a field being typed in)
       else if (this._diag) this._diagUpdate();  // diagnostics stay live
       else if (this._unitOpen) this._unitUpdate();
-      else if (this._roomPop) this._panel();  // the room pop-up stays live
+      else if (this._roomPop) { if (!this._dialDrag) this._panel(); }  // the room pop-up stays live (not under a finger)
     } catch (e) { this._fail("refresh", e); }
     finally { this._loading = false; }
   }
@@ -297,6 +301,16 @@ class RoomMapCard extends HTMLElement {
     const d = +t.dataset.d;
     switch (t.dataset.act) {
       case "def": this._set({ default_temp: room.default_temp + d }); break;
+      case "dial-t": { const P = this._pending(room, live); P.t = clamp(Math.round(P.t) + d, TEMP_MIN, TEMP_MAX); this._dialRefresh(room); break; }
+      case "dial-w": { const P = this._pending(room, live); P.w = clamp(P.w + d, 0, LADDER.length - 1); this._dialRefresh(room); break; }
+      case "dhold": {
+        const P = this._pending(room, live), dT = Math.abs(P.t - live.target) > 0.01, dW = P.w !== nearestRung(live.priority ?? room.priority);
+        const body = { hold_hours: +t.dataset.h };
+        if (dT || room.hold_temp != null) body.hold_temp = dT ? P.t : room.hold_temp;
+        if (dW || room.hold_priority != null) body.hold_priority = dW ? LADDER[P.w] : room.hold_priority;
+        this._pend = null; this._set(body); break;
+      }
+      case "dclear": this._pend = null; this._set({ hold_temp: null, hold_priority: null, hold_hours: null }); break;
       case "hold-step": this._holdTemp = (this._holdTemp ?? room.hold_temp ?? live.target) + d; this._panel(); break;
       case "rpred": this._rhPred = t.dataset.v; this._panel(); break;
       case "rh": this._rhHours = +t.dataset.h; this._roomHist(room.id, true); this._panel(); break;
@@ -619,6 +633,7 @@ class RoomMapCard extends HTMLElement {
       el.innerHTML = `<h3>${room.name}</h3><p class="rc-sub">${reading} · monitor only (no heating/cooling unit)</p>`;
       return;
     }
+    if (this._roomPop) { el.innerHTML = this._dialPanel(room, live); this._dialBind(el, room); this._roomHist(room.id); return; }
     const step = (act, val) => `<div class="rc-step"><button data-act="${act}" data-d="-1" aria-label="Lower">−</button>
       <span>${val}°</span><button data-act="${act}" data-d="1" aria-label="Raise">+</button></div>`;
     const holding = room.hold_temp != null;
@@ -653,6 +668,96 @@ class RoomMapCard extends HTMLElement {
         <p class="rc-sub" style="margin:8px 0">Weight schedule today: ${ptoday || "none — the default weight applies"}</p>
         <button data-act="psched" style="width:100%">Edit weight schedule…</button></details>`;
     this._roomHist(room.id);
+  }
+
+
+  // ---------- the pop-up's thermostat view: two concentric dials (outer: temperature, inner: weight), how long to hold, the schedule ----------
+  _pending(room, live) {
+    if (!this._pend || this._pend.id !== room.id) this._pend = { id: room.id, t: live.target, w: nearestRung(live.priority ?? room.priority) };
+    return this._pend;
+  }
+  static _pol(r, f) { const a = (-135 + 270 * f) * Math.PI / 180; return [150 + r * Math.sin(a), 150 - r * Math.cos(a)]; }
+  static _arc(r, f0, f1) {
+    const [x0, y0] = RoomMapCard._pol(r, f0), [x1, y1] = RoomMapCard._pol(r, f1);
+    return `M${x0.toFixed(1)} ${y0.toFixed(1)}A${r} ${r} 0 ${(f1 - f0) * 270 > 180 ? 1 : 0} 1 ${x1.toFixed(1)} ${y1.toFixed(1)}`;
+  }
+  _dialInner(room, live) {
+    const P = this._pending(room, live), A = RoomMapCard._arc, pol = RoomMapCard._pol, rT = 128, rW = 92;
+    const fT = v => clamp((v - TEMP_MIN) / (TEMP_MAX - TEMP_MIN), 0, 1), fW = i => i / (LADDER.length - 1);
+    const dT = Math.abs(P.t - live.target) > 0.01, dW = P.w !== nearestRung(live.priority ?? room.priority);
+    const CT = "#3fa9ff", CW = "#b692f6", ring = (r, c, f, fnow, fread, dirty) => {
+      const [tx, ty] = pol(r, f), [nx, ny] = pol(r, fnow);
+      return `<path d="${A(r, 0, 1)}" fill="none" stroke="#ffffff1f" stroke-width="16" stroke-linecap="round"/>
+        ${f > 0 ? `<path d="${A(r, 0, f)}" fill="none" stroke="${c}" stroke-width="16" stroke-linecap="round" opacity="${dirty ? 1 : .8}"/>` : ""}
+        ${dirty ? `<circle cx="${nx.toFixed(1)}" cy="${ny.toFixed(1)}" r="5" fill="none" stroke="#fff" stroke-opacity=".7" stroke-width="2"/>` : ""}
+        ${fread != null ? `<circle cx="${pol(r, fread)[0].toFixed(1)}" cy="${pol(r, fread)[1].toFixed(1)}" r="3.5" fill="#fff"/>` : ""}
+        <circle cx="${tx.toFixed(1)}" cy="${ty.toFixed(1)}" r="14" fill="${c}" stroke="#fff" stroke-width="3"/>`;
+    };
+    const w = LADDER[P.w], read = live.temp;
+    const lbl = (x, y, t, c) => `<text x="${x}" y="${y}" text-anchor="middle" font-size="11" fill="${c}" fill-opacity=".8">${t}</text>`;
+    return ring(rT, CT, fT(P.t), fT(live.target), read == null ? null : fT(read), dT) + ring(rW, CW, fW(P.w), fW(nearestRung(live.priority ?? room.priority)), null, dW) +
+      lbl(60, 262, `${TEMP_MIN}°`, CT) + lbl(240, 262, `${TEMP_MAX}°`, CT) + lbl(86, 238, `w${LADDER[0]}`, CW) + lbl(214, 238, `w${LADDER[LADDER.length - 1]}`, CW) +
+      `<text x="150" y="146" text-anchor="middle" font-size="44" font-weight="600" fill="currentColor">${read == null ? "—" : read.toFixed(1) + "°"}</text>
+       <text x="150" y="170" text-anchor="middle" font-size="15" fill="${dT ? CT : "currentColor"}" fill-opacity="${dT ? 1 : .7}">target ${Math.round(P.t)}°${dT ? " (new)" : ""}</text>
+       <text x="150" y="190" text-anchor="middle" font-size="13" fill="${dW ? CW : "currentColor"}" fill-opacity="${dW ? 1 : .7}">weight ${fmtW(w)} · ±${allowable(w)}°${dW ? " (new)" : ""}</text>`;
+  }
+  _holdBox(room, live) {
+    const P = this._pending(room, live), dT = Math.abs(P.t - live.target) > 0.01, dW = P.w !== nearestRung(live.priority ?? room.priority);
+    const hu = room.hold_until ? Date.parse(room.hold_until) : null;
+    const active = (room.hold_temp != null || room.hold_priority != null) && (hu == null || hu > Date.now());
+    const what = [dT ? `${Math.round(P.t)}°` : "", dW ? `weight ${fmtW(LADDER[P.w])}` : ""].filter(Boolean).join(" · ");
+    const left = active ? `<div class="rc-banner" style="background:#3fa9ff14;color:inherit;margin:0 0 8px">Holding ${[room.hold_temp != null ? room.hold_temp + "°" : "", room.hold_priority != null ? "weight " + fmtW(room.hold_priority) : ""].filter(Boolean).join(" · ")}${hu ? ` until ${new Date(hu).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}<button data-act="dclear">Clear hold</button></div>` : "";
+    return `${left}<div class="rc-sub" style="margin:6px 0 4px">${what ? `Hold ${what} for` : "Turn a dial, then choose how long to hold it"}</div>
+      <div class="rc-chips" style="display:flex;gap:6px">${[1, 2, 4, 8].map(h => `<button data-act="dhold" data-h="${h}" style="flex:1" ${what ? "" : "disabled"}>${h} h</button>`).join("")}</div>`;
+  }
+  _dialPanel(room, live) {
+    const P = this._pending(room, live), ctlU = ((this._data.units_live || {})[room.unit] || {}).control;
+    const pnow = live.priority ?? room.priority;
+    const step = (act, val) => `<div class="rc-step"><button data-act="${act}" data-d="-1" aria-label="Lower">−</button><span>${val}</span><button data-act="${act}" data-d="1" aria-label="Raise">+</button></div>`;
+    const stepT = (act, val) => `<div class="rc-step"><button data-act="${act}" data-d="-1" aria-label="Lower">−</button><span>${val}°</span><button data-act="${act}" data-d="1" aria-label="Raise">+</button></div>`;
+    return `<p class="rc-sub" style="text-align:center;margin:0">${live.rh != null ? `${Math.round(live.rh)}% RH · ` : ""}${isOurs(ctlU) ? `unit ${live.mode === "off" ? "idle" : live.mode}` : `<span style="color:#ffd166">its own thermostat is in control</span>`}</p>
+      <svg class="rc-dial" viewBox="0 0 300 275" data-dial="1">${this._dialInner(room, live)}</svg>
+      <div class="rc-dkey" data-slot="dkey"><span style="color:#3fa9ff;align-self:center">Temp</span>${stepT("dial-t", Math.round(P.t))}<span style="color:#b692f6;align-self:center">Weight</span>${step("dial-w", "w" + fmtW(LADDER[P.w]))}</div>
+      <div data-slot="hold">${this._holdBox(room, live)}</div>
+      <button data-act="sched" style="width:100%;margin-top:12px">Temperature &amp; weight schedule…</button>
+      <details class="rc-sect"><summary style="cursor:pointer;padding:10px 0;color:var(--secondary-text-color,#9aa7b8)">History: temperature vs target</summary>${this._roomChart(room)}</details>
+      <details class="rc-sect"${this._advOpen ? " open" : ""} data-adv="1"><summary style="cursor:pointer;padding:10px 0;color:var(--secondary-text-color,#9aa7b8)">Advanced: default temperature and weight</summary>
+        <div class="rc-row"><span class="rc-lbl">Default temp</span>${stepT("def", room.default_temp)}</div>
+        <div class="rc-row"><span class="rc-lbl">${(room.priority_schedule || []).length ? "Default weight" : "Weight"}</span>
+          <div class="rc-chips" title="How much this room's comfort counts against the others'; allowed error is about 1/√weight °F">${LADDER.map(n => `<button data-act="prio" data-v="${n}" class="${n === +room.priority ? "on" : ""}">${n}</button>`).join("")}</div></div>
+        <p class="rc-sub" style="margin:0 0 6px">Weight now ${fmtW(pnow)} → allowed error ±${allowable(pnow)}°</p></details>`;
+  }
+  // Redraw the dials, their steppers and the hold box in place (the dial element itself stays, so a drag keeps its pointer).
+  _dialRefresh(room) {
+    const m = this._modal; if (!m) return;
+    const live = this._data.live[room.id] || {}, P = this._pending(room, live);
+    const svg = m.querySelector("svg[data-dial]"); if (svg) svg.innerHTML = this._dialInner(room, live);
+    const k = m.querySelector('[data-slot="dkey"]');
+    if (k) { const sp = k.querySelectorAll(".rc-step span"); if (sp[0]) sp[0].textContent = Math.round(P.t) + "°"; if (sp[1]) sp[1].textContent = "w" + fmtW(LADDER[P.w]); }
+    const h = m.querySelector('[data-slot="hold"]'); if (h) h.innerHTML = this._holdBox(room, live);
+  }
+  _dialBind(el, room) {
+    const svg = el.querySelector("svg[data-dial]"); if (!svg) return;
+    const set = (e, ring) => {
+      const p = this._svgPt(e, svg), dx = p.x - 150, dy = p.y - 150;
+      let a = Math.atan2(dx, -dy) * 180 / Math.PI;  // 0 at 12 o'clock, clockwise
+      a = a > 135 ? 135 : a < -135 ? -135 : a;      // the gap at the bottom clamps to the nearer end
+      const f = (a + 135) / 270, live = this._data.live[room.id] || {}, P = this._pending(room, live);
+      if (ring === "t") P.t = clamp(Math.round(TEMP_MIN + f * (TEMP_MAX - TEMP_MIN)), TEMP_MIN, TEMP_MAX);
+      else P.w = clamp(Math.round(f * (LADDER.length - 1)), 0, LADDER.length - 1);
+      this._dialRefresh(room);
+    };
+    svg.addEventListener("pointerdown", e => {
+      const p = this._svgPt(e, svg), r = Math.hypot(p.x - 150, p.y - 150);
+      const ring = r > 110 ? "t" : r > 55 ? "w" : null;
+      if (!ring) return;
+      this._dialDrag = ring;
+      try { svg.setPointerCapture(e.pointerId); } catch (_) { /* synthetic events in tests */ }
+      set(e, ring);
+    });
+    svg.addEventListener("pointermove", e => { if (this._dialDrag) set(e, this._dialDrag); });
+    const end = () => { this._dialDrag = null; };
+    svg.addEventListener("pointerup", end); svg.addEventListener("pointercancel", end);
   }
 
   // Fetch (at most once a minute per room and span) the selected room's reading vs target; redraw only its chart.
@@ -1346,19 +1451,26 @@ class RoomMapCard extends HTMLElement {
   /* ---------- schedule editor (modal) ---------- */
   _openSchedule(room, kind = "temp") {
     this._closeSchedule();
-    const k = SCHED_KINDS[kind];
-    const days = DAYS.map((_, d) => (room[k.key] || []).filter(e => e.days.includes(d))
-      .map(e => ({ m: toMin(e.start), t: k.enc ? k.enc(e[k.field]) : e[k.field] })).sort((a, b) => a.m - b.m));
-    // Every day gets an explicit 12:00 AM point (fixed in time) so the ends of the curve don't depend on other points.
-    // Seeded with the temperature already in force, so existing behavior is unchanged. A day's end is the next day's start.
-    const starts = days.map((_, d) => RoomMapCard._carryFor(days, d, k.def(room)));
-    days.forEach((pts, d) => { if (!pts.length || pts[0].m !== 0) pts.unshift({ m: 0, t: starts[d] }); });
-    this._ed = { room, k, days, day: todayIdx(), sel: null, selEnd: false, drag: false };
+    // Both schedules on one chart (temperature on the left axis, weight on the right); one is edited at a time.
+    const mk = kk => {
+      const k = SCHED_KINDS[kk];
+      const days = DAYS.map((_, d) => (room[k.key] || []).filter(e => e.days.includes(d))
+        .map(e => ({ m: toMin(e.start), t: k.enc ? k.enc(e[k.field]) : e[k.field] })).sort((a, b) => a.m - b.m));
+      // Every day gets an explicit 12:00 AM point (fixed in time) so the ends of the curve don't depend on other points.
+      // Seeded with the value already in force, so existing behavior is unchanged. A day's end is the next day's start.
+      const starts = days.map((_, d) => RoomMapCard._carryFor(days, d, k.def(room)));
+      days.forEach((pts, d) => { if (!pts.length || pts[0].m !== 0) pts.unshift({ m: 0, t: starts[d] }); });
+      return { k, days };
+    };
+    const sets = { temp: mk("temp"), prio: mk("prio") };
+    this._ed = { room, sets, cur: kind, k: sets[kind].k, days: sets[kind].days, day: todayIdx(), sel: null, selEnd: false, drag: false,
+                 orig: { temp: JSON.stringify(sets.temp.days), prio: JSON.stringify(sets.prio.days) } };
     const m = this._modal = document.createElement("div");
     m.className = "rc-modal";
-    m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="${k.title}">
-      <header><h3>${k.title} · ${room.name}</h3><button data-x="cancel" aria-label="Close">✕</button></header>
+    m.innerHTML = `<style>${CSS}</style><div class="rc-sheet" role="dialog" aria-label="Schedule">
+      <header><h3>Schedule · ${room.name}</h3><button data-x="cancel" aria-label="Close">✕</button></header>
       <div class="rc-body">
+        <div class="rc-seg" data-slot="series" style="margin-bottom:6px"></div>
         <div class="rc-seg" data-slot="days"></div>
         <svg class="rc-chart" viewBox="0 0 640 320"></svg>
         <div data-slot="readout"></div>
@@ -1374,10 +1486,11 @@ class RoomMapCard extends HTMLElement {
     svg.addEventListener("pointermove", e => this._edMove(e, svg));
     svg.addEventListener("pointerup", () => { this._ed.drag = false; });
     svg.addEventListener("pointercancel", () => { this._ed.drag = false; });
-    this._onKey = e => { if (e.key === "Escape") this._closeSchedule(); };
+    this._onKey = e => { if (e.key === "Escape") this._closeEd(); };
     document.addEventListener("keydown", this._onKey);
     this._edRender();
   }
+  _closeEd() { this._closeSchedule(); if (this._popup()) this._render(); }  // the room pop-up comes back behind a closed editor
   _closeSchedule() {
     if (this._modal) { this._modal.remove(); this._modal = null; }
     if (this._onKey) { document.removeEventListener("keydown", this._onKey); this._onKey = null; }
@@ -1398,13 +1511,17 @@ class RoomMapCard extends HTMLElement {
 
   _edRender() {
     const ed = this._ed, m = this._modal; if (!ed) return;
-    const k = ed.k, W = 640, H = 320, L = 46, R = 14, T = 14, B = 30;
-    const x = mn => L + (W - L - R) * mn / 1440, y = t => T + (H - T - B) * (1 - (t - k.lo) / (k.hi - k.lo));
+    const k = ed.k, W = 640, H = 320, L = 46, R = 46, T = 14, B = 30;
+    const x = mn => L + (W - L - R) * mn / 1440, yk = kk => t => T + (H - T - B) * (1 - (t - kk.lo) / (kk.hi - kk.lo)), y = yk(k);
     const pts = ed.days[ed.day], endP = ed.days[(ed.day + 1) % 7][0];
+    const TK = ed.sets.temp.k, WK = ed.sets.prio.k, yT = yk(TK), yW = yk(WK);
     let grid = "";
     for (let t = k.lo; t <= k.hi; t += k.grid)
-      grid += `<line x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}" stroke="currentColor" stroke-opacity=".12"/>
-               <text x="${L - 8}" y="${y(t) + 4}" text-anchor="end" font-size="12" fill="currentColor" fill-opacity=".6">${k.fmt(t)}</text>`;
+      grid += `<line x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}" stroke="currentColor" stroke-opacity=".12"/>`;
+    for (let t = TK.lo; t <= TK.hi; t += TK.grid)
+      grid += `<text x="${L - 8}" y="${yT(t) + 4}" text-anchor="end" font-size="12" fill="${TK.color}" fill-opacity=".85">${TK.fmt(t)}</text>`;
+    for (let t = WK.lo; t <= WK.hi; t += WK.grid)
+      grid += `<text x="${W - R + 8}" y="${yW(t) + 4}" text-anchor="start" font-size="11" fill="${WK.color}" fill-opacity=".85">${WK.fmt(t)}</text>`;
     ["12a", "3a", "6a", "9a", "12p", "3p", "6p", "9p", "12a"].forEach((l, i) => {
       grid += `<line y1="${T}" y2="${H - B}" x1="${x(i * 180)}" x2="${x(i * 180)}" stroke="currentColor" stroke-opacity=".12"/>
                <text x="${x(i * 180)}" y="${H - 10}" text-anchor="middle" font-size="12" fill="currentColor" fill-opacity=".6">${l}</text>`;
@@ -1413,15 +1530,21 @@ class RoomMapCard extends HTMLElement {
     pts.slice(1).forEach(p => { line += `H${x(p.m)}V${y(p.t)}`; });
     line += `H${x(1440)}V${y(endP.t)}`;  // step to tomorrow's start temp at midnight
     const area = `${line}V${y(k.lo)}H${x(0)}Z`;
+    // the series not being edited, faint, on its own axis
+    const oc = ed.cur === "temp" ? "prio" : "temp", ok = ed.sets[oc].k, yo = yk(ok), od = ed.sets[oc].days;
+    const op = od[ed.day], oe = od[(ed.day + 1) % 7][0];
+    let other = `M${x(0)} ${yo(op[0].t)}`;
+    op.slice(1).forEach(p => { other += `H${x(p.m)}V${yo(p.t)}`; });
+    other += `H${x(1440)}V${yo(oe.t)}`;
     // Start/end handles are squares (vertical-only); interior points are circles.
     const sq = (attr, px, py, on) => `<g ${attr}><circle cx="${px}" cy="${py}" r="26" fill="transparent"/>
         <rect x="${px - (on ? 12 : 10)}" y="${py - (on ? 12 : 10)}" width="${on ? 24 : 20}" height="${on ? 24 : 20}" rx="5"
-              fill="${on ? "#3de0a5" : "#3fa9ff"}" stroke="#fff" stroke-width="${on ? 3 : 2}"/></g>`;
+              fill="${on ? "#3de0a5" : k.color}" stroke="#fff" stroke-width="${on ? 3 : 2}"/></g>`;
     const dots = pts.map((p, i) => {
       const on = !ed.selEnd && p === ed.sel;
       if (p.m === 0) return sq(`data-i="${i}"`, x(0), y(p.t), on);
       return `<g data-i="${i}"><circle cx="${x(p.m)}" cy="${y(p.t)}" r="26" fill="transparent"/>
-        <circle cx="${x(p.m)}" cy="${y(p.t)}" r="${on ? 13 : 10}" fill="${on ? "#3de0a5" : "#3fa9ff"}" stroke="#fff" stroke-width="${on ? 3 : 2}"/></g>`;
+        <circle cx="${x(p.m)}" cy="${y(p.t)}" r="${on ? 13 : 10}" fill="${on ? "#3de0a5" : k.color}" stroke="#fff" stroke-width="${on ? 3 : 2}"/></g>`;
     }).join("") + sq(`data-end="1"`, x(1440), y(endP.t), ed.selEnd);
     let tip = "";
     if (ed.sel) {
@@ -1429,8 +1552,11 @@ class RoomMapCard extends HTMLElement {
       tip = `<text x="${tx}" y="${ty}" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">${ed.selEnd ? "End of day" : fmtTime(ed.sel.m)} · ${k.fmt(ed.sel.t)}</text>`;
     }
     m.querySelector("svg").innerHTML = `<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent" data-plot="1"/>
-      <g pointer-events="none">${grid}<path d="${area}" fill="#3fa9ff" fill-opacity=".15"/>
-      <path d="${line}" fill="none" stroke="#3fa9ff" stroke-width="3" stroke-linejoin="round"/></g>${dots}<g pointer-events="none">${tip}</g>`;
+      <g pointer-events="none">${grid}<path d="${other}" fill="none" stroke="${ok.color}" stroke-opacity=".55" stroke-width="2" stroke-dasharray="6 4" stroke-linejoin="round"/>
+      <path d="${area}" fill="${k.color}" fill-opacity=".15"/>
+      <path d="${line}" fill="none" stroke="${k.color}" stroke-width="3" stroke-linejoin="round"/></g>${dots}<g pointer-events="none">${tip}</g>`;
+    m.querySelector('[data-slot="series"]').innerHTML = [["temp", "Temperature"], ["prio", "Weight"]].map(([id, n]) =>
+      `<button data-x="series" data-s="${id}" class="${ed.cur === id ? "on" : ""}" style="${ed.cur === id ? "" : `color:${ed.sets[id].k.color}`}">Editing: ${n}</button>`).join("");
     m.querySelector('[data-slot="days"]').innerHTML = DAYS.map((n, d) =>
       `<button data-x="day" data-d="${d}" class="${d === ed.day ? "on" : ""}">${n}</button>`).join("");
     const sel = ed.sel, fixed = sel && (ed.selEnd || sel.m === 0), dis = fixed ? "disabled" : "";
@@ -1448,7 +1574,7 @@ class RoomMapCard extends HTMLElement {
     return p.matrixTransform(svg.getScreenCTM().inverse());
   }
   _fromChart(p) {
-    const k = this._ed.k, W = 640, H = 320, L = 46, R = 14, T = 14, B = 30;
+    const k = this._ed.k, W = 640, H = 320, L = 46, R = 46, T = 14, B = 30;
     const m = clamp(Math.round((p.x - L) / (W - L - R) * 1440 / 15) * 15, 0, 1425);
     const t = clamp(Math.round(k.lo + (1 - (p.y - T) / (H - T - B)) * (k.hi - k.lo)), k.lo, k.hi);
     return { m, t };
@@ -1480,17 +1606,22 @@ class RoomMapCard extends HTMLElement {
   }
   _edClick(e) {
     const ed = this._ed;
-    if (e.target.classList.contains("rc-modal")) { this._closeSchedule(); return; }
+    if (e.target.classList.contains("rc-modal")) { this._closeEd(); return; }
     const b = e.target.closest("[data-x]"); if (!b) return;
     const pts = ed.days[ed.day], d = +b.dataset.d;
     switch (b.dataset.x) {
-      case "cancel": this._closeSchedule(); return;
+      case "cancel": this._closeEd(); return;
       case "save": {
-        const k = ed.k, sched = this._toSchedule(ed.days, k.field, k.dec);
+        const body = {};  // only the schedules that were actually edited
+        for (const id of ["temp", "prio"]) {
+          const st = ed.sets[id];
+          if (JSON.stringify(st.days) !== ed.orig[id]) body[st.k.key] = this._toSchedule(st.days, st.k.field, st.k.dec);
+        }
         this._closeSchedule();
-        this._set({ [k.key]: sched });
+        if (Object.keys(body).length) this._set(body); else if (this._popup()) this._render();
         return;
       }
+      case "series": ed.cur = b.dataset.s; ed.k = ed.sets[ed.cur].k; ed.days = ed.sets[ed.cur].days; ed.sel = null; ed.selEnd = false; break;
       case "day": ed.day = d; ed.sel = null; ed.selEnd = false; break;
       case "t": ed.sel.t = clamp(ed.sel.t + d, ed.k.lo, ed.k.hi); break;
       case "m": {
