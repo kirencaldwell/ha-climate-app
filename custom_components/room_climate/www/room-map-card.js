@@ -189,7 +189,7 @@ class RoomMapCard extends HTMLElement {
       if (!this._modal && !this._opEditing) this._render();  // don't rebuild the page under an open editor (or a field being typed in)
       else if (this._diag) this._diagUpdate();  // diagnostics stay live
       else if (this._unitOpen) this._unitUpdate();
-      else if (this._roomPop) { if (!this._dialDrag) this._panel(); }  // the room pop-up stays live (not under a finger)
+      else if (this._roomPop) this._roomLive();  // the room pop-up stays live without being rebuilt (that closed the history section)
     } catch (e) { this._fail("refresh", e); }
     finally { this._loading = false; }
   }
@@ -720,12 +720,21 @@ class RoomMapCard extends HTMLElement {
       <div class="rc-dkey" data-slot="dkey"><span style="color:#3fa9ff;align-self:center">Temp</span>${stepT("dial-t", Math.round(P.t))}<span style="color:#b692f6;align-self:center">Weight</span>${step("dial-w", "w" + fmtW(LADDER[P.w]))}</div>
       <div data-slot="hold">${this._holdBox(room, live)}</div>
       <button data-act="sched" style="width:100%;margin-top:12px">Temperature &amp; weight schedule…</button>
-      <details class="rc-sect"><summary style="cursor:pointer;padding:10px 0;color:var(--secondary-text-color,#9aa7b8)">History: temperature vs target</summary>${this._roomChart(room)}</details>
+      <details class="rc-sect"${this._histOpen ? " open" : ""} data-hist="1"><summary style="cursor:pointer;padding:10px 0;color:var(--secondary-text-color,#9aa7b8)">History: temperature vs target</summary>${this._roomChart(room)}</details>
       <details class="rc-sect"${this._advOpen ? " open" : ""} data-adv="1"><summary style="cursor:pointer;padding:10px 0;color:var(--secondary-text-color,#9aa7b8)">Advanced: default temperature and weight</summary>
         <div class="rc-row"><span class="rc-lbl">Default temp</span>${stepT("def", room.default_temp)}</div>
         <div class="rc-row"><span class="rc-lbl">${(room.priority_schedule || []).length ? "Default weight" : "Weight"}</span>
           <div class="rc-chips" title="How much this room's comfort counts against the others'; allowed error is about 1/√weight °F">${LADDER.map(n => `<button data-act="prio" data-v="${n}" class="${n === +room.priority ? "on" : ""}">${n}</button>`).join("")}</div></div>
         <p class="rc-sub" style="margin:0 0 6px">Weight now ${fmtW(pnow)} → allowed error ±${allowable(pnow)}°</p></details>`;
+  }
+  // The 15 s refresh of an open room pop-up: update the dial, the hold box and the chart in place. Rebuilding the whole panel
+  // collapsed the history section and reset its scroll.
+  _roomLive() {
+    if (this._dialDrag) return;
+    const room = this._data.rooms.find(r => r.id === this._sel);
+    if (!room || !room.unit) return;
+    this._dialRefresh(room);
+    this._roomHist(room.id);
   }
   // Redraw the dials, their steppers and the hold box in place (the dial element itself stays, so a drag keeps its pointer).
   _dialRefresh(room) {
@@ -777,7 +786,10 @@ class RoomMapCard extends HTMLElement {
         if (e.target.closest("[data-x]") || e.target.classList.contains("rc-modal")) { this._closePop(); this._sel = null; this._render(); return; }
         this._click(e);
       });
-      m.addEventListener("toggle", e => { if (e.target.dataset && e.target.dataset.adv) this._advOpen = e.target.open; }, true);
+      m.addEventListener("toggle", e => {
+        if (e.target.dataset && e.target.dataset.adv) this._advOpen = e.target.open;
+        if (e.target.dataset && e.target.dataset.hist) this._histOpen = e.target.open;
+      }, true);
       this._onKey = e => { if (e.key === "Escape") { this._closePop(); this._sel = null; this._render(); } };
       document.addEventListener("keydown", this._onKey);
     }
