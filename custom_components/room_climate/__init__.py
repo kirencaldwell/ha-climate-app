@@ -138,6 +138,7 @@ class Manager:
         self.ml_state: dict = None  # the ML correction's last training / loading (mlmodel.py)
         self.moisture_state: dict = None  # the moisture model's last fit (moisture.py)
         self.ml_external = False  # an externally trained correction (ML_EXTERNAL_FILE) is in use
+        self._ml_ext_mtime = None  # that file's modification time when it was last loaded (a newer one is picked up by itself)
 
     async def async_load(self):
         loaded = await self.store.async_load()
@@ -214,11 +215,25 @@ class Manager:
             _LOGGER.warning("couldn't load the ML correction: %s", e)
             return
         self.ml_external = external and c is not None
+        try:
+            self._ml_ext_mtime = os.path.getmtime(self.hass.config.path(ML_EXTERNAL_FILE))
+        except OSError:
+            self._ml_ext_mtime = None
         if c is not None:
             self.shadow.set_corrector(c)
             self.ml_state = {"loaded": dt_util.now().isoformat(), "file": name, "kind": getattr(c, "kind", "ridge"),
                              "enabled": sum(c.enabled.values()), "of": len(c.enabled)}
             _LOGGER.info("ML correction loaded from %s (%s)", name, self.ml_state["kind"])
+
+    async def async_check_ml_external(self, _now=None):
+        """Load a newly trained external ML correction without anyone asking (the mini PC copies the file in each morning)."""
+        try:
+            m = await self.hass.async_add_executor_job(lambda: os.path.getmtime(self.hass.config.path(ML_EXTERNAL_FILE)))
+        except OSError:
+            return
+        if m != self._ml_ext_mtime:
+            _LOGGER.info("a new %s appeared: loading it", ML_EXTERNAL_FILE)
+            await self._load_ml()
 
     async def async_flush_ml(self, _now=None):
         """Append the training rows the shadow planner has logged since the last flush to the ML rows file."""
@@ -1801,6 +1816,7 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
     async_track_time_change(hass, mgr.async_train_ml, hour=3, minute=58, second=0)
     async_track_time_change(hass, mgr.async_fit_moisture, hour=4, minute=20, second=0)
     async_track_time_interval(hass, mgr.async_flush_ml, timedelta(hours=1))
+    async_track_time_interval(hass, mgr.async_check_ml_external, timedelta(minutes=5))
     age = mgr.model_age_h()
     if age is None or age > 26:
         async_call_later(hass, 180, mgr.async_fit)

@@ -15,7 +15,7 @@ rsync is ever added there (the add-on's `apks` option), use it instead. Nothing 
 """
 import argparse, hashlib, os, subprocess, sys, time
 
-KEY = os.path.expanduser("~/.ssh/homeassistant")
+KEY = os.path.expanduser(os.environ.get("HA_SSH_KEY", "~/.ssh/homeassistant"))
 HOST = "root@192.168.4.54"
 SSH = ["ssh", "-i", KEY, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", HOST]
 CONFIG = "/config"

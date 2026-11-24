@@ -12,7 +12,10 @@ import json, os, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.append(os.path.join(HERE, "..", "custom_components", "room_climate"))  # appended: select.py must not shadow stdlib
-import comfort_fix as cf  # noqa: E402  (needs the websockets package)
+try:
+    import comfort_fix as cf  # noqa: E402  (needs the websockets package)
+except ImportError:
+    cf = None
 import ha_sync  # noqa: E402
 import mlmodel  # noqa: E402
 
@@ -26,6 +29,9 @@ def main():
     if len(raw) > 8_000_000:
         raise SystemExit("model file is over 8 MB: refusing")
     subprocess.run(ha_sync.SSH + [f"cat > {DEST}.tmp && mv {DEST}.tmp {DEST}"], input=raw, check=True, timeout=120)
+    if not os.path.exists(os.path.expanduser("~/.config/ha-token")):  # e.g. the mini PC: no token, the Green notices the new file itself
+        print(f"pushed {len(raw) / 1024:.0f} KiB ({getattr(c, 'kind', 'ridge')}); the Green loads it within 5 minutes")
+        return
     state = cf.call({"type": "room_climate/reload_ml"})[0]
     print(f"pushed {len(raw) / 1024:.0f} KiB ({getattr(c, 'kind', 'ridge')}); the Green says: {state}")
 
