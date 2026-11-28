@@ -29,6 +29,16 @@ TEXT_SENSORS = """text_sensor:
             if (ws::n_rooms() > 0 && id(cur_room) >= ws::n_rooms()) id(cur_room) = 0;
         - script.execute: ui_refresh
   - platform: homeassistant
+    id: ha_shapes
+    entity_id: sensor.room_climate_wall_screen
+    attribute: shapes_json
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            ws::parse_shapes(x);
+        - script.execute: ui_refresh
+  - platform: homeassistant
     id: ha_config
     entity_id: sensor.room_climate_wall_screen
     attribute: config_json
@@ -325,6 +335,111 @@ script:
             static char b[24];
             snprintf(b, sizeof(b), "\u00b1%.2g\u00b0", ws::allowable(ws::rung(idx)));
             return b;
+      - lvgl.widget.update:
+          id: mr_0
+          hidden: !lambda 'return !ws::map_rect(0, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(0, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(0, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(0, id(cur_room)).w > 0 ? ws::map_rect(0, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(0, id(cur_room)).h > 0 ? ws::map_rect(0, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_1
+          hidden: !lambda 'return !ws::map_rect(1, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(1, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(1, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(1, id(cur_room)).w > 0 ? ws::map_rect(1, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(1, id(cur_room)).h > 0 ? ws::map_rect(1, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_2
+          hidden: !lambda 'return !ws::map_rect(2, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(2, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(2, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(2, id(cur_room)).w > 0 ? ws::map_rect(2, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(2, id(cur_room)).h > 0 ? ws::map_rect(2, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_3
+          hidden: !lambda 'return !ws::map_rect(3, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(3, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(3, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(3, id(cur_room)).w > 0 ? ws::map_rect(3, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(3, id(cur_room)).h > 0 ? ws::map_rect(3, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_4
+          hidden: !lambda 'return !ws::map_rect(4, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(4, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(4, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(4, id(cur_room)).w > 0 ? ws::map_rect(4, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(4, id(cur_room)).h > 0 ? ws::map_rect(4, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_5
+          hidden: !lambda 'return !ws::map_rect(5, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(5, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(5, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(5, id(cur_room)).w > 0 ? ws::map_rect(5, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(5, id(cur_room)).h > 0 ? ws::map_rect(5, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_6
+          hidden: !lambda 'return !ws::map_rect(6, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(6, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(6, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(6, id(cur_room)).w > 0 ? ws::map_rect(6, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(6, id(cur_room)).h > 0 ? ws::map_rect(6, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_7
+          hidden: !lambda 'return !ws::map_rect(7, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(7, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(7, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(7, id(cur_room)).w > 0 ? ws::map_rect(7, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(7, id(cur_room)).h > 0 ? ws::map_rect(7, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_8
+          hidden: !lambda 'return !ws::map_rect(8, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(8, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(8, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(8, id(cur_room)).w > 0 ? ws::map_rect(8, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(8, id(cur_room)).h > 0 ? ws::map_rect(8, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_9
+          hidden: !lambda 'return !ws::map_rect(9, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(9, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(9, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(9, id(cur_room)).w > 0 ? ws::map_rect(9, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(9, id(cur_room)).h > 0 ? ws::map_rect(9, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_10
+          hidden: !lambda 'return !ws::map_rect(10, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(10, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(10, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(10, id(cur_room)).w > 0 ? ws::map_rect(10, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(10, id(cur_room)).h > 0 ? ws::map_rect(10, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_11
+          hidden: !lambda 'return !ws::map_rect(11, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(11, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(11, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(11, id(cur_room)).w > 0 ? ws::map_rect(11, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(11, id(cur_room)).h > 0 ? ws::map_rect(11, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_12
+          hidden: !lambda 'return !ws::map_rect(12, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(12, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(12, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(12, id(cur_room)).w > 0 ? ws::map_rect(12, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(12, id(cur_room)).h > 0 ? ws::map_rect(12, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_13
+          hidden: !lambda 'return !ws::map_rect(13, id(cur_room)).ok;'
+          x: !lambda 'return ws::map_rect(13, id(cur_room)).x;'
+          y: !lambda 'return ws::map_rect(13, id(cur_room)).y;'
+          width: !lambda 'return ws::map_rect(13, id(cur_room)).w > 0 ? ws::map_rect(13, id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_rect(13, id(cur_room)).h > 0 ? ws::map_rect(13, id(cur_room)).h : 4;'
+      - lvgl.widget.update:
+          id: mr_hl
+          hidden: !lambda 'return !ws::map_sel(id(cur_room)).ok;'
+          x: !lambda 'return ws::map_sel(id(cur_room)).x;'
+          y: !lambda 'return ws::map_sel(id(cur_room)).y;'
+          width: !lambda 'return ws::map_sel(id(cur_room)).w > 0 ? ws::map_sel(id(cur_room)).w : 4;'
+          height: !lambda 'return ws::map_sel(id(cur_room)).h > 0 ? ws::map_sel(id(cur_room)).h : 4;'
       - if:
           condition:
             lambda: 'return id(pend_t) >= 0;'
@@ -486,6 +601,172 @@ lvgl:
                   align: CENTER
                   text_font: montserrat_28
                   text_color: 0xFFFFFF
+        - obj:
+            id: mr_0
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_1
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_2
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_3
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_4
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_5
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_6
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_7
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_8
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_9
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_10
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_11
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_12
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_13
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x2d3a4e
+            border_color: 0x5d6f8a
+            border_width: 1
+        - obj:
+            id: mr_hl
+            x: 0
+            y: 0
+            width: 4
+            height: 4
+            hidden: true
+            radius: 3
+            bg_color: 0x5cc0ff
+            bg_opa: 80%
+            border_color: 0xFFFFFF
+            border_width: 2
         - label:
             id: room_label
             text: "Room"

@@ -137,7 +137,10 @@ class WallScreenSensor(SensorEntity):
     @property
     def extra_state_attributes(self):
         rooms, cfg = self._build()
-        return {"rooms_json": json.dumps({"rooms": rooms}, separators=(",", ":")), "config_json": json.dumps(cfg, separators=(",", ":"))}
+        shapes = [{"id": rd["id"], "f": int(rd.get("floor", 1)), "x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"]}
+                  for rd in self._mgr.data["rooms"] if (s := rd.get("shape")) and all(k in s for k in ("x", "y", "w", "h"))]
+        return {"rooms_json": json.dumps({"rooms": rooms}, separators=(",", ":")), "config_json": json.dumps(cfg, separators=(",", ":")),
+                "shapes_json": json.dumps({"shapes": shapes}, separators=(",", ":"))}
 
     async def async_added_to_hass(self) -> None:
         @callback
