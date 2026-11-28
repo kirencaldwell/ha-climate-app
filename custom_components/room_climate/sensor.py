@@ -144,7 +144,7 @@ class WallScreenSensor(SensorEntity):
         rooms, cfg = self._build()
         shapes = [{"id": rd["id"], "f": int(rd.get("floor", 1)), "x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"]}
                   for rd in self._mgr.data["rooms"] if (s := rd.get("shape")) and all(k in s for k in ("x", "y", "w", "h"))]
-        return {"rooms_json": json.dumps({"house": (getattr(mgr, "house_info", None) or {}).get("mode") or mgr.house.mode or "off", "rooms": rooms}, separators=(",", ":")), "config_json": json.dumps(cfg, separators=(",", ":")),
+        return {"rooms_json": json.dumps({"house": (getattr(self._mgr, "house_info", None) or {}).get("mode") or self._mgr.house.mode or "off", "rooms": rooms}, separators=(",", ":")), "config_json": json.dumps(cfg, separators=(",", ":")),
                 "shapes_json": json.dumps({"shapes": shapes}, separators=(",", ":"))}
 
     async def async_added_to_hass(self) -> None:
