@@ -109,6 +109,7 @@ class WallScreenSensor(SensorEntity):
         now = dt_util.now()
         st = core.settings_from(mgr.data.get("settings"))
         rooms = []
+        ent = {u["id"]: u["entity"] for u in mgr.data["units"]}
         for rd in mgr.data["rooms"]:
             if not rd.get("unit"):
                 continue
@@ -120,8 +121,12 @@ class WallScreenSensor(SensorEntity):
                 hold = -1  # held with no end time
             else:
                 hold = max(0, round(core.elapsed(r.hold_until, now) / 60))
+            unit = mgr.hass.states.get(ent.get(r.unit)) if r.unit in ent else None  # the unit that serves this room
+            mode = unit.state if unit else "unavailable"
+            act = (unit.attributes.get("hvac_action") or "") if unit and unit.state not in ("unavailable", "unknown") else ""
             rooms.append({"id": r.id, "name": r.name, "temp": None if val is None else round(val, 1),
-                          "target": round(core.target_temp(r, now), 1), "weight": core.room_priority(r, now), "hold": hold})
+                          "target": round(core.target_temp(r, now), 1), "weight": core.room_priority(r, now), "hold": hold,
+                          "mode": mode, "act": str(act)})
         try:
             hours = [float(x) for x in str(st.screen_hold_hours).split(",") if x.strip()][:4] or [1, 2, 4, 8]
         except ValueError:
@@ -139,7 +144,7 @@ class WallScreenSensor(SensorEntity):
         rooms, cfg = self._build()
         shapes = [{"id": rd["id"], "f": int(rd.get("floor", 1)), "x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"]}
                   for rd in self._mgr.data["rooms"] if (s := rd.get("shape")) and all(k in s for k in ("x", "y", "w", "h"))]
-        return {"rooms_json": json.dumps({"rooms": rooms}, separators=(",", ":")), "config_json": json.dumps(cfg, separators=(",", ":")),
+        return {"rooms_json": json.dumps({"house": (getattr(mgr, "house_info", None) or {}).get("mode") or mgr.house.mode or "off", "rooms": rooms}, separators=(",", ":")), "config_json": json.dumps(cfg, separators=(",", ":")),
                 "shapes_json": json.dumps({"shapes": shapes}, separators=(",", ":"))}
 
     async def async_added_to_hass(self) -> None:

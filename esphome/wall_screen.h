@@ -10,6 +10,7 @@ namespace ws {
 struct Room {
   std::string id, name;
   float temp = NAN, target = NAN, weight = NAN, hold = NAN;
+  std::string mode, act;  // the serving unit's mode and what it is doing (heat / cool / dry / off ...; heating / cooling / idle ...)
 };
 struct Shape {
   std::string id;
@@ -19,6 +20,7 @@ struct Shape {
 struct State {
   std::vector<Room> rooms;
   std::vector<Shape> shapes;
+  std::string house;
   std::vector<float> ladder{0.5f, 1.f, 2.f, 3.f, 4.f, 5.f, 10.f, 25.f, 100.f};
   std::vector<float> hours{1.f, 2.f, 4.f, 8.f};
   int tmin = 55, tmax = 85;
@@ -40,8 +42,11 @@ inline void parse_rooms(const std::string &text) {
       r.weight = num(o["weight"]);
       float h = num(o["hold"]);
       r.hold = h;
+      r.mode = o["mode"] | "";
+      r.act = o["act"] | "";
       out.push_back(r);
     }
+    S.house = root["house"] | "";
     if (!out.empty()) S.rooms = out;
     return true;
   });
@@ -148,5 +153,22 @@ inline Rect map_sel(int cur) {
   std::string id = room_id(cur);
   for (auto &sh : S.shapes) if (sh.id == id) return rect_of(sh, minx, miny, sc, ox, oy);
   return Rect();
+}
+
+// ---- what the selected room's unit is doing, as an icon and a word ----
+struct View { const char *glyph; const char *text; int cls; };   // cls: 0 heating 1 cooling 2 drying 3 fan 4 idle 5 off 6 no unit
+inline View view(int cur) {
+  auto r = room(cur);
+  if (!r || r->mode == "unavailable" || r->mode == "unknown" || r->mode.empty()) return {"\U000F05D6", "No unit", 6};
+  const std::string &a = r->act, &m = r->mode;
+  if (a == "heating") return {"\U000F0238", "Heating", 0};
+  if (a == "cooling") return {"\U000F0717", "Cooling", 1};
+  if (a == "drying" || m == "dry") return {"\U000F058E", "Drying", 2};
+  if (a == "fan" || m == "fan_only") return {"\U000F0210", "Fan", 3};
+  if (m == "off" || a == "off") return {"\U000F0425", "Off", 5};
+  static std::string idle;
+  idle = "Idle";
+  if (m == "heat") idle += " (heat)"; else if (m == "cool") idle += " (cool)"; else if (m == "heat_cool" || m == "auto") idle += " (auto)";
+  return {"\U000F03E6", idle.c_str(), 4};
 }
 }  // namespace ws

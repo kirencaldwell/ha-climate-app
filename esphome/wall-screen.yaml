@@ -170,7 +170,7 @@ font:
     id: mdi_36
     size: 36
     bpp: 4
-    glyphs: ["󰣉", "󰗑"]   # bullseye-arrow (target), scale-balance (weight)
+    glyphs: ["󰣉", "󰗑", "󰈸", "󰜗", "󰖎", "󰈐", "󰐥", "󰏦", "󰗖"]   # target, weight, then fire / snowflake / water / fan / power / pause / alert for the unit state
 
 globals:
   - id: cur_room
@@ -259,6 +259,54 @@ script:
             static char b[24];
             snprintf(b, sizeof(b), "±%.2g°", ws::allowable(ws::rung(idx)));
             return b;
+      - lvgl.label.update:
+          id: mode_icon
+          text: !lambda 'return std::string(ws::view(id(cur_room)).glyph);'
+      - lvgl.label.update:
+          id: mode_label
+          text: !lambda 'return std::string(ws::view(id(cur_room)).text);'
+      - if:
+          condition:
+            lambda: 'return ws::view(id(cur_room)).cls == 0;'
+          then:
+            - lvgl.widget.update: {id: mode_icon, text_color: 0xff9a4d}
+            - lvgl.widget.update: {id: mode_label, text_color: 0xff9a4d}
+      - if:
+          condition:
+            lambda: 'return ws::view(id(cur_room)).cls == 1;'
+          then:
+            - lvgl.widget.update: {id: mode_icon, text_color: 0x5cc0ff}
+            - lvgl.widget.update: {id: mode_label, text_color: 0x5cc0ff}
+      - if:
+          condition:
+            lambda: 'return ws::view(id(cur_room)).cls == 2;'
+          then:
+            - lvgl.widget.update: {id: mode_icon, text_color: 0x4fd1c5}
+            - lvgl.widget.update: {id: mode_label, text_color: 0x4fd1c5}
+      - if:
+          condition:
+            lambda: 'return ws::view(id(cur_room)).cls == 3;'
+          then:
+            - lvgl.widget.update: {id: mode_icon, text_color: 0xc8d2e0}
+            - lvgl.widget.update: {id: mode_label, text_color: 0xc8d2e0}
+      - if:
+          condition:
+            lambda: 'return ws::view(id(cur_room)).cls == 4;'
+          then:
+            - lvgl.widget.update: {id: mode_icon, text_color: 0x8d99ad}
+            - lvgl.widget.update: {id: mode_label, text_color: 0x8d99ad}
+      - if:
+          condition:
+            lambda: 'return ws::view(id(cur_room)).cls == 5;'
+          then:
+            - lvgl.widget.update: {id: mode_icon, text_color: 0x8d99ad}
+            - lvgl.widget.update: {id: mode_label, text_color: 0x8d99ad}
+      - if:
+          condition:
+            lambda: 'return ws::view(id(cur_room)).cls == 6;'
+          then:
+            - lvgl.widget.update: {id: mode_icon, text_color: 0xffd166}
+            - lvgl.widget.update: {id: mode_label, text_color: 0xffd166}
       - lvgl.widget.update:
           id: mr_0
           hidden: !lambda 'return !ws::map_rect(0, id(cur_room)).ok;'
@@ -848,12 +896,19 @@ lvgl:
             text_font: montserrat_48
             text_color: 0xFFFFFF
         - label:
-            text: "now"
-            x: 160
+            id: mode_icon
+            text: "󰏦"
+            x: 174
+            y: 254
+            text_font: mdi_36
+            text_color: 0x8d99ad
+        - label:
+            id: mode_label
+            text: ""
+            x: 216
             y: 262
-            width: 160
-            text_align: CENTER
-            text_font: montserrat_20
+            width: 106
+            text_font: montserrat_18
             text_color: 0x8d99ad
         - label:
             id: hold_label
