@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate wall-screen.yaml: an ESPHome config for the Waveshare ESP32-S3-Touch-LCD-4 (rev 4.0: 480x480, ST7701S, GT911,
-CH32V003 expander at 0x24) that shows a Room Climate thermostat: pick a room, drag the outer arc (target temperature) and the
-inner arc (weight), then hold it for 1/2/4/8 h. It reads the room_climate sensors and calls room_climate.set_hold / clear_hold.
+CH32V003 expander at 0x24) that shows a Room Climate thermostat: pick a room, press + / - for the target temperature (left) and
+the weight (right), then hold it for the configured hours. It reads the room_climate sensors and calls room_climate.set_hold / clear_hold.
 
     python3 esphome/gen_wall_screen.py > esphome/wall-screen.yaml
 
@@ -274,10 +274,10 @@ globals:
   - id: cur_room
     type: int
     initial_value: "0"
-  - id: pend_t          # temperature picked on the dial (-1: not changed)
+  - id: pend_t          # temperature picked with + / - (-1: not changed)
     type: int
     initial_value: "-1"
-  - id: pend_w          # weight rung picked on the dial (-1: not changed)
+  - id: pend_w          # weight step picked with + / - (-1: not changed)
     type: int
     initial_value: "-1"
   - id: apply_hours
@@ -368,7 +368,7 @@ script:
           text: !lambda |-
             float m = {pick('hold')};
             static char b[48];
-            if (std::isnan(m) || m <= 0) {{ return id(pend_t) >= 0 || id(pend_w) >= 0 ? "Hold the new values for:" : "No hold. Turn a dial, then pick a time."; }}
+            if (std::isnan(m) || m <= 0) {{ return id(pend_t) >= 0 || id(pend_w) >= 0 ? "Hold the new values for:" : "No hold. Press + or - then pick a time."; }}
             if (m >= 60) snprintf(b, sizeof(b), "Holding: %d h %d min left", (int)(m / 60), (int)m % 60);
             else snprintf(b, sizeof(b), "Holding: %d min left", (int)m);
             return b;

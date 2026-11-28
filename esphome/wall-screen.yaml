@@ -176,10 +176,10 @@ globals:
   - id: cur_room
     type: int
     initial_value: "0"
-  - id: pend_t          # temperature picked on the dial (-1: not changed)
+  - id: pend_t          # temperature picked with + / - (-1: not changed)
     type: int
     initial_value: "-1"
-  - id: pend_w          # weight rung picked on the dial (-1: not changed)
+  - id: pend_w          # weight step picked with + / - (-1: not changed)
     type: int
     initial_value: "-1"
   - id: apply_hours
@@ -292,7 +292,7 @@ script:
           text: !lambda |-
             float m = ws::cur_hold(id(cur_room));
             static char b[48];
-            if (std::isnan(m) || m <= 0) { return id(pend_t) >= 0 || id(pend_w) >= 0 ? "Hold the new values for:" : "No hold. Turn a dial, then pick a time."; }
+            if (std::isnan(m) || m <= 0) { return id(pend_t) >= 0 || id(pend_w) >= 0 ? "Hold the new values for:" : "No hold. Press + or - then pick a time."; }
             if (m >= 60) snprintf(b, sizeof(b), "Holding: %d h %d min left", (int)(m / 60), (int)m % 60);
             else snprintf(b, sizeof(b), "Holding: %d min left", (int)m);
             return b;
