@@ -7,6 +7,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.util import dt as dt_util
 
+import json
+
 from . import DOMAIN, SIGNAL_STATE, _room_from_dict
 from . import core
 
@@ -19,6 +21,7 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_entities, 
     for rd in mgr.data["rooms"]:
         if rd.get("unit"):  # rooms a unit serves
             ents += [RoomSensor(mgr, rd, kind) for kind in ("temperature", "target", "weight", "hold")]
+    ents.append(WallScreenSensor(mgr))
     async_add_entities(ents)
 
 
@@ -79,6 +82,62 @@ class RoomSensor(SensorEntity):
         if self._kind == "weight":
             return {"allowable_error_f": round(core.allowable_error(core.room_priority(r, dt_util.now())), 2)}
         return {}
+
+    async def async_added_to_hass(self) -> None:
+        @callback
+        def _changed() -> None:
+            self.async_write_ha_state()
+
+        self.async_on_remove(async_dispatcher_connect(self.hass, SIGNAL_STATE, _changed))
+
+
+class WallScreenSensor(SensorEntity):
+    """Everything a wall screen needs in one entity, so it never has to be recompiled when something here changes: the rooms
+    (id, name, reading, target, weight, hold minutes left) and the screen's settings (weight steps, hold hours, range).
+    Both attributes are JSON strings, which is what ESPHome's Home Assistant text sensors can read."""
+    _attr_should_poll = False
+    _attr_icon = "mdi:monitor-dashboard"
+
+    def __init__(self, mgr):
+        self._mgr = mgr
+        self._attr_unique_id = f"{DOMAIN}_wall_screen"
+        self.entity_id = f"sensor.{DOMAIN}_wall_screen"
+        self._attr_name = "Wall screen data"
+
+    def _build(self):
+        mgr = self._mgr
+        now = dt_util.now()
+        st = core.settings_from(mgr.data.get("settings"))
+        rooms = []
+        for rd in mgr.data["rooms"]:
+            if not rd.get("unit"):
+                continue
+            r = _room_from_dict(rd)
+            val, _ = mgr._f(r.sensor) if r.sensor else (None, None)
+            if r.hold_temp is None and r.hold_priority is None:
+                hold = 0
+            elif r.hold_until is None:
+                hold = -1  # held with no end time
+            else:
+                hold = max(0, round(core.elapsed(r.hold_until, now) / 60))
+            rooms.append({"id": r.id, "name": r.name, "temp": None if val is None else round(val, 1),
+                          "target": round(core.target_temp(r, now), 1), "weight": core.room_priority(r, now), "hold": hold})
+        try:
+            hours = [float(x) for x in str(st.screen_hold_hours).split(",") if x.strip()][:4] or [1, 2, 4, 8]
+        except ValueError:
+            hours = [1, 2, 4, 8]
+        cfg = {"ladder": list(core.WEIGHT_LADDER), "hours": hours, "tmin": st.screen_temp_min, "tmax": st.screen_temp_max,
+               "ref": st.allowable_ref_f}
+        return rooms, cfg
+
+    @property
+    def native_value(self):
+        return len(self._build()[0])
+
+    @property
+    def extra_state_attributes(self):
+        rooms, cfg = self._build()
+        return {"rooms_json": json.dumps({"rooms": rooms}, separators=(",", ":")), "config_json": json.dumps(cfg, separators=(",", ":"))}
 
     async def async_added_to_hass(self) -> None:
         @callback

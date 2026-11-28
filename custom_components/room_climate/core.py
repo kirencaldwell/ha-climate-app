@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 MIN_PRIORITY, MAX_PRIORITY = 0.1, 100.0  # a room's weight: the exchange rate between rooms' errors (was 1..5)
+WEIGHT_LADDER = (0.5, 1, 2, 3, 4, 5, 10, 25, 100)  # the steps the wall screen offers for a weight (the card has its own copy of this)
 
 
 @dataclass
@@ -133,6 +134,9 @@ class Settings:
     vote_exclude_coast: bool = False  # the older patch: rooms coasting after their unit stops sit out the vote
     model_fallback: bool = True  # hand units under model control back to Room Climate when the model stops predicting well
     # (off: they stay on the model, and a notification says it isn't ready; the owner's call)
+    screen_hold_hours: str = "1,2,4,8"  # the wall screen's four hold buttons (comma-separated hours)
+    screen_temp_min: float = 55.0  # the wall screen's temperature range
+    screen_temp_max: float = 85.0
     allowable_ref_f: float = 1.0  # the error (F) a weight-1 room may have: larger counts comfort for less against cycling/energy
     min_cost: float = 0.05  # demand below this counts as comfortable
     start_cost: float = 1.0  # demand needed to leave "off" (then confirmed for switch_confirm_s like any mode switch)
