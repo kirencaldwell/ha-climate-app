@@ -13,6 +13,7 @@ from collections import deque
 from datetime import datetime, timedelta
 
 import voluptuous as vol
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.components import persistent_notification, websocket_api
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.climate import ATTR_HVAC_MODE, DOMAIN as CLIMATE, SERVICE_SET_HVAC_MODE, SERVICE_SET_TEMPERATURE
@@ -45,6 +46,7 @@ CONFIG_SCHEMA = vol.Schema({DOMAIN: vol.Schema({vol.Optional("enabled"): bool})}
 ROOM_CLIMATE, THERMOSTAT, MODEL = "room_climate", "thermostat", "model"
 OURS = (ROOM_CLIMATE, MODEL)
 SIGNAL_CONTROL = f"{DOMAIN}_control"  # dispatched (unit id) when a unit's control changes
+SIGNAL_STATE = f"{DOMAIN}_state"  # dispatched every tick and after a hold changes: the per-room sensors re-read their values
 RECONNECT_GRACE_S = 300  # a unit that just came back (reboot, firmware install, wifi) reports its own mode and setpoint
 #                          for a while: that is not someone using the thermostat, and the next ticks re-send ours
 # Registers and doors the owner sets by hand (the card's Openings page): state name -> how open it is (0..1), logged each
@@ -775,7 +777,34 @@ class Manager:
         cur = st.attributes.get("current_temperature") if st else None
         return None if cur is None else TemperatureConverter.convert(float(cur), self.hass.config.units.temperature_unit, F)
 
+    async def async_set_hold(self, room_id: str, temperature=None, weight=None, hours=None) -> None:
+        """Hold a room at a temperature and/or a weight for `hours` (service room_climate.set_hold; the wall screen uses it).
+        Whatever is not given keeps its current hold, if any; no hours means until it is cleared."""
+        room = next((r for r in self.data["rooms"] if r["id"] == room_id), None)
+        if room is None:
+            raise ValueError(f"unknown room {room_id}")
+        if temperature is not None:
+            room["hold_temp"] = float(temperature)
+        if weight is not None:
+            room["hold_priority"] = _weight(max(core.MIN_PRIORITY, min(core.MAX_PRIORITY, float(weight))))
+        if temperature is not None or weight is not None:
+            room["hold_until"] = (dt_util.utcnow() + timedelta(hours=float(hours))).isoformat() if hours else None
+        _LOGGER.info("hold on %s: temp=%s weight=%s hours=%s", room_id, room.get("hold_temp"), room.get("hold_priority"), hours)
+        await self.async_save()
+        await self.async_tick()
+
+    async def async_clear_hold(self, room_id: str) -> None:
+        room = next((r for r in self.data["rooms"] if r["id"] == room_id), None)
+        if room is None:
+            raise ValueError(f"unknown room {room_id}")
+        for k in ("hold_temp", "hold_priority", "hold_until"):
+            room.pop(k, None)
+        _LOGGER.info("hold on %s cleared", room_id)
+        await self.async_save()
+        await self.async_tick()
+
     async def async_tick(self, _now=None):
+        async_dispatcher_send(self.hass, SIGNAL_STATE)
         # Decide for every unit, but send only to units under our control; for the rest the decision is shown as what
         # Room Climate would do.
         states = self.states
@@ -1795,6 +1824,25 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         async_track_state_change_event(hass, unit_entities, mgr.async_unit_changed)
     # One "Room Climate / Thermostat" control select per unit, for placing next to its thermostat card.
     hass.async_create_task(discovery.async_load_platform(hass, "select", DOMAIN, {}, config))
+    hass.async_create_task(discovery.async_load_platform(hass, "sensor", DOMAIN, {}, config))
+
+    async def _svc_set_hold(call):
+        try:
+            await mgr.async_set_hold(call.data["room_id"], call.data.get("temperature"), call.data.get("weight"), call.data.get("hours"))
+        except ValueError as e:
+            raise HomeAssistantError(str(e)) from e
+
+    async def _svc_clear_hold(call):
+        try:
+            await mgr.async_clear_hold(call.data["room_id"])
+        except ValueError as e:
+            raise HomeAssistantError(str(e)) from e
+
+    hass.services.async_register(DOMAIN, "set_hold", _svc_set_hold, schema=vol.Schema({
+        vol.Required("room_id"): str, vol.Optional("temperature"): vol.Coerce(float),
+        vol.Optional("weight"): vol.All(vol.Coerce(float), vol.Range(min=core.MIN_PRIORITY, max=core.MAX_PRIORITY)),
+        vol.Optional("hours"): vol.All(vol.Coerce(float), vol.Range(min=0.25, max=72))}))
+    hass.services.async_register(DOMAIN, "clear_hold", _svc_clear_hold, schema=vol.Schema({vol.Required("room_id"): str}))
 
     async def _on_sensor(event):
         await mgr.async_tick()
